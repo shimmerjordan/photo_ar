@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from photoar import features as F
-from photoar.descstore import SLOT_STRIDE, DescStore, DescStoreWriter
+from photoar.descstore import IncompleteWrite, SLOT_STRIDE, DescStore, DescStoreWriter
 
 
 def test_slot_stride_matches_documented_budget():
@@ -56,16 +56,21 @@ def test_handles_empty_features(tmp_path):
 def test_truncates_when_over_capacity_features(tmp_path):
     """超过 N_FEATURES 的输入被截断而不是越界写坏邻居 slot。"""
     n = F.N_FEATURES + 17
+    # 逐行取不同的值（而非全零），这样才能断言保留的确实是前 N_FEATURES 行，
+    # 而不是随便某 N_FEATURES 行零值——全零输入下两者无法区分。
     big = F.Features(
-        pts=np.zeros((n, 2), np.float32),
-        desc=np.zeros((n, 32), np.uint8),
+        pts=np.arange(n * 2, dtype=np.float32).reshape(n, 2),
+        desc=(np.arange(n * 32, dtype=np.int64) % 256).astype(np.uint8).reshape(n, 32),
     )
     path = tmp_path / "big.bin"
     with DescStoreWriter(path, capacity=2) as w:
         w.append(big)
         w.append(F.Features(np.ones((1, 2), np.float32), np.ones((1, 32), np.uint8)))
     with DescStore(path) as store:
-        assert len(store.read(0)) == F.N_FEATURES
+        got = store.read(0)
+        assert len(got) == F.N_FEATURES
+        assert np.allclose(got.pts, big.pts[: F.N_FEATURES])
+        assert np.array_equal(got.desc, big.desc[: F.N_FEATURES])
         second = store.read(1)
         assert len(second) == 1
         assert np.array_equal(second.desc, np.ones((1, 32), np.uint8))
@@ -78,6 +83,50 @@ def test_append_beyond_capacity_raises(tmp_path):
         w.append(empty)
         with pytest.raises(IndexError):
             w.append(empty)
+
+
+def test_incomplete_write_raises_on_clean_exit(tmp_path):
+    """capacity=5 只 append 1 次就正常退出 with——半途结束的写入必须当场报错。"""
+    path = tmp_path / "incomplete.bin"
+    with pytest.raises(IncompleteWrite):
+        with DescStoreWriter(path, capacity=5) as w:
+            w.append(F.Features(np.zeros((0, 2), np.float32), np.zeros((0, 32), np.uint8)))
+
+
+def test_incomplete_write_does_not_mask_inflight_exception(tmp_path):
+    """最关键的一条：with 块内已经在抛异常时，__exit__ 不能用 IncompleteWrite 把它顶掉。
+
+    否则调用方看到的永远是"没写完"，而看不到真正导致中途失败的原因
+    （这里模拟的是一次崩溃/跳过导致的提前退出）。
+    """
+
+    class BoomError(Exception):
+        pass
+
+    path = tmp_path / "boom.bin"
+    with pytest.raises(BoomError):
+        with DescStoreWriter(path, capacity=5) as w:
+            w.append(F.Features(np.zeros((0, 2), np.float32), np.zeros((0, 32), np.uint8)))
+            raise BoomError("mid-loop failure")
+
+
+def test_incomplete_write_error_path_leaves_file_readable(tmp_path):
+    """守卫报错的路径不能损坏或截断文件：大小仍是 capacity*SLOT_STRIDE，slot 0 仍可读。"""
+    path = tmp_path / "boom2.bin"
+    first = F.Features(
+        pts=np.array([[1.0, 2.0]], np.float32),
+        desc=np.ones((1, 32), np.uint8),
+    )
+    with pytest.raises(RuntimeError):
+        with DescStoreWriter(path, capacity=5) as w:
+            w.append(first)
+
+    assert path.stat().st_size == 5 * SLOT_STRIDE
+    with DescStore(path) as store:
+        assert len(store) == 5
+        got = store.read(0)
+        assert np.array_equal(got.desc, first.desc)
+        assert np.allclose(got.pts, first.pts)
 
 
 def test_read_out_of_range_raises(tmp_path):

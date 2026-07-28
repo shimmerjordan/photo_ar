@@ -28,6 +28,14 @@ _PTS_OFFSET = _HEADER_BYTES
 _DESC_OFFSET = _HEADER_BYTES + _PTS_BYTES
 
 
+class IncompleteWrite(RuntimeError):
+    """写入的 slot 数少于声明的 capacity。
+
+    未写过的 slot 读出来是 count=0，与"这张照片确实零特征"无法区分，
+    所以半途结束的写入必须当场报错，不能留给读侧去猜。
+    """
+
+
 class DescStoreWriter:
     """顺序写入固定容量的描述子库。"""
 
@@ -62,15 +70,19 @@ class DescStoreWriter:
             raw[_DESC_OFFSET : _DESC_OFFSET + count * DESC_BYTES] = desc.ravel()
         return slot
 
-    def close(self) -> None:
+    def close(self, require_complete: bool = True) -> None:
         self._map.flush()
         del self._map
+        if require_complete and self._next < self._capacity:
+            raise IncompleteWrite(
+                f"只写入了 {self._next} 个 slot，声明的 capacity 是 {self._capacity}"
+            )
 
     def __enter__(self) -> "DescStoreWriter":
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close(require_complete=exc_type is None)
 
 
 class DescStore:
