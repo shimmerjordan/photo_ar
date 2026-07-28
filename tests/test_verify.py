@@ -47,6 +47,46 @@ def test_verify_pair_rejects_mirrored_match(textured_image):
     assert not r.ok or r.det > 0
 
 
+def test_mirrored_match_is_rejected_by_determinant_sign_not_inlier_count(textured_image):
+    """Isolate and directly test the signed-determinant rejection mechanism.
+
+    This test constructs a case where:
+    - Identical descriptors → BFMatcher matches every keypoint 1:1 → all become inliers
+    - Horizontally mirrored points → homography has negative determinant
+    - Inlier count is well above MIN_INLIERS
+
+    The three assertions below are ALL ESSENTIAL to prove the determinant sign is what
+    decides rejection. If any assertion is dropped, the test becomes vacuous:
+    1. r.inliers >= V.MIN_INLIERS  — proves the inlier count check did NOT reject it
+    2. r.det < 0  — proves we are genuinely in the mirrored (reflection) case
+    3. not r.ok  — proves the overall result is rejection
+
+    Dropping assertion 1 would let a low-inlier match pass through; dropping assertion 2
+    loses the mirror-specificity; dropping assertion 3 inverts the test logic.
+    Without all three, the test could pass for the wrong reason and fail to catch a
+    regression to abs(det).
+    """
+    img = textured_image(seed=3, w=800, h=600)
+    query = F.extract(img)
+
+    # Get the resized image dimensions (extract() uses LONG_EDGE=640)
+    resized = F.resize_to_long_edge(img)
+    resized_w = resized.shape[1]
+
+    # Create reference with identical descriptors but points mirrored horizontally
+    # (mirrored in the 640-long-edge coordinate space, not the original)
+    mirrored_pts = query.pts.copy()
+    mirrored_pts[:, 0] = (resized_w - 1) - mirrored_pts[:, 0]
+    ref = F.Features(pts=mirrored_pts, desc=query.desc)
+
+    r = V.verify_pair(query, ref, "test_mirror")
+
+    # All three assertions are critical — see docstring
+    assert r.inliers >= V.MIN_INLIERS, f"Expected >= {V.MIN_INLIERS} inliers, got {r.inliers}"
+    assert r.det < 0, f"Expected negative determinant, got {r.det}"
+    assert not r.ok, "Expected rejection by determinant sign"
+
+
 def test_decide_returns_no_match_on_empty_results():
     d = V.decide([])
     assert not d.matched
