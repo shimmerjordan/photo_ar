@@ -2284,23 +2284,49 @@ git commit -m "feat: 两阶段检索编排，记录里程碑 0b 结果"
 - Produces:
   - 常量 `MIN_QUALITY_SCORE = 75`
   - `ArcoreimgMissing(RuntimeError)`、`QualityTooLow(ValueError)`（属性 `score: int`、`path: str`）
-  - `eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int`
-  - `build_single_target_db(image_path, name, out_path, arcoreimg="arcoreimg") -> int`（返回 `.imgdb` 字节数）
-  - `assert_quality(image_path, arcoreimg="arcoreimg") -> int`（低于阈值抛 `QualityTooLow`）
+  - `eval_img(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int`
+  - `build_single_target_db(image_path, name, print_width_m, out_path, arcoreimg=ARCOREIMG) -> int`（返回 `.imgdb` 字节数）
+  - `assert_quality(image_path, arcoreimg=ARCOREIMG) -> int`（低于阈值抛 `QualityTooLow`）
+  - 常量 `ARCOREIMG = "arcoreimg"`（默认值；仓库内已放置可用二进制于 `tools/arcoreimg`）
 
-- [ ] **Step 1: 先确认外部工具的真实接口**
+- [ ] **Step 1: 外部工具的真实接口（已实测，2026-07-28）**
 
-`arcoreimg` 的确切参数必须实测，不能凭记忆写。运行：
+二进制已获取并放在仓库内 `tools/arcoreimg`（已加入 `.gitignore`，不入库）：
 
-```bash
-arcoreimg --help
-arcoreimg eval-img --help
-arcoreimg build-db --help
+- 来源：`https://raw.githubusercontent.com/google-ar/arcore-android-sdk/master/tools/arcoreimg/linux/arcoreimg`
+- 5273584 字节，sha256 `2585423461c77c02d034ed5333c5054384a5d19ad212f581ad0274198ace60c0`
+- ELF 64-bit x86-64，已 `chmod +x`
+
+**实测到的接口（下面的实现必须匹配这个，而不是本计划早先版本里的猜测）：**
+
+```
+$ arcoreimg
+Available actions: help, version, build-db, eval-db, eval-img
+
+$ arcoreimg eval-img --help
+Usage: arcoreimg eval-image --input_image_path=<some_file_path>
+  --input_image_path:  Path of image to be evaluated. Currently only supports *.png, *.jpg and *.jpeg.
+
+$ arcoreimg build-db --help
+Usage: arcoreimg build-db --input_images_directory=<dir>|--input_image_list_path=<file> --output_db_path=<file>
+  --input_image_list_path:
+    Path of a text file where every line consists of the name, the absolute path and the
+    width in meters (optional) of an image, separated by a '|'. e.g.:
+        cat|path/to/cat_image.png|0.1
+        little dog|/path/to/dog_image.jpg
+  --input_images_directory:  所有图都用来建库
+  --output_db_path:          输出库文件路径
 ```
 
-把三段输出原文粘贴到 `src/photoar/quality.py` 顶部的 docstring 里作为契约记录。若 `arcoreimg` 不在 PATH，从 ARCore SDK for Android 的 `tools/arcoreimg/linux/` 取，并在 `docs/superpowers/plans/phase0-results.md` 记录获取路径。
+**⚠️ 计划早先版本猜错了一处**：`build-db` **没有** `--input_image_path` 参数。必须走 `--input_image_list_path`，写一个临时清单文件，每行 `名称|绝对路径|物理宽度(米)`。
 
-**实现必须匹配实测到的参数，而不是本计划下面示例代码里的猜测。** 若实测参数与示例不同，改实现并同步更新测试里 fake 脚本的行为。
+**这带来一个设计改进**：打印物理宽度是在**建库时烘进 `.imgdb`** 的，不需要客户端运行时用 `addImage(name, bitmap, widthInMeters)` 再传一遍。所以 `build_single_target_db` 必须接收 `print_width_m` 参数并写进清单行。
+
+`eval-img` 的输出就是一个裸数字（例如 `100`），没有前缀文字。
+
+**已实测的 `.imgdb` 体积（即里程碑 0c，见 `phase0-results.md`）**：单目标约 **4.2-4.4 KB**，3 目标库 12301 字节（≈4.1KB/目标，线性）。远低于原估的 30KB，也远低于 200KB 的「改架构」阈值 —— 所以下发 `.imgdb` 的方案成立，且 spec §4 的带宽估算可以往下修一个量级。
+
+**同时实测到一个反直觉行为，必须记住**：同一张图内容，分辨率越高 `eval-img` 分数越低（1200×800→100、2400×1600→20、4000×3000→0）。这是合成纹理图的产物（噪声从 1/8 尺寸上采样，放大后只剩低频），说明**合成图不能用来验证质量分闸门**，只有真实照片能。因此本任务的单元测试一律走 fake 脚本，质量分闸门的真实行为留到里程碑 0d 验证。
 
 - [ ] **Step 2: 写失败的测试**
 
@@ -2325,25 +2351,49 @@ def fake_arcoreimg(tmp_path):
     行为：eval-img 打印固定分数；build-db 写出一个固定大小的文件。
     """
 
-    def _make(score: int = 85, db_bytes: int = 30_000, exit_code: int = 0):
+    def _make(score: int = 85, db_bytes: int = 4_300, exit_code: int = 0):
         script = tmp_path / "arcoreimg"
         script.write_text(
             textwrap.dedent(f"""\
             #!/usr/bin/env python3
+            # 模拟真实 arcoreimg 的接口（已实测，见计划 Task 9 Step 1）：
+            #   eval-img --input_image_path=<path>        -> 打印裸数字
+            #   build-db --input_image_list_path=<file> --output_db_path=<file>
+            # 清单文件每行: 名称|绝对路径|物理宽度(米)
             import sys, pathlib
             argv = sys.argv[1:]
             if {exit_code} != 0:
                 sys.stderr.write("boom\\n"); sys.exit({exit_code})
-            if argv and argv[0] == "eval-img":
-                print("Image quality score: {score}")
-                sys.exit(0)
-            if argv and argv[0] == "build-db":
-                out = None
+
+            def opt(prefix):
                 for i, a in enumerate(argv):
-                    if a.startswith("--output_db_path"):
-                        out = a.split("=", 1)[1] if "=" in a else argv[i + 1]
+                    if a.startswith(prefix):
+                        return a.split("=", 1)[1] if "=" in a else argv[i + 1]
+                return None
+
+            if argv and argv[0] == "eval-img":
+                if not opt("--input_image_path"):
+                    sys.stderr.write("missing --input_image_path\\n"); sys.exit(2)
+                print({score})
+                sys.exit(0)
+
+            if argv and argv[0] == "build-db":
+                listing = opt("--input_image_list_path")
+                out = opt("--output_db_path")
+                if not listing or not out:
+                    sys.stderr.write("missing required option\\n"); sys.exit(2)
+                # 真实工具会因清单格式错误而失败；这里也校验，否则测试测不到格式
+                for line in pathlib.Path(listing).read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    parts = line.split("|")
+                    if len(parts) not in (2, 3):
+                        sys.stderr.write(f"bad list line: {{line}}\\n"); sys.exit(2)
+                    if not pathlib.Path(parts[1]).is_absolute():
+                        sys.stderr.write(f"path not absolute: {{parts[1]}}\\n"); sys.exit(2)
                 pathlib.Path(out).write_bytes(b"X" * {db_bytes})
                 sys.exit(0)
+
             sys.exit(2)
             """)
         )
@@ -2388,19 +2438,63 @@ def test_assert_quality_rejects_low_score(image_file, fake_arcoreimg):
 def test_build_single_target_db_returns_size(tmp_path, image_file, fake_arcoreimg):
     out = tmp_path / "p1.imgdb"
     size = Q.build_single_target_db(
-        image_file, name="p1", out_path=out, arcoreimg=fake_arcoreimg(db_bytes=31_234)
+        image_file, name="p1", print_width_m=0.152, out_path=out,
+        arcoreimg=fake_arcoreimg(db_bytes=4_312),
     )
     assert out.exists()
-    assert size == 31_234
+    assert size == 4_312
 
 
 def test_build_single_target_db_rejects_nonascii_name(tmp_path, image_file, fake_arcoreimg):
     """arcoreimg 只支持 ASCII 文件名/目标名，提前拦住而不是让它神秘失败。"""
     with pytest.raises(ValueError):
         Q.build_single_target_db(
-            image_file, name="外婆生日", out_path=tmp_path / "x.imgdb",
-            arcoreimg=fake_arcoreimg(),
+            image_file, name="外婆生日", print_width_m=0.152,
+            out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
         )
+
+
+def test_build_single_target_db_rejects_name_with_pipe(tmp_path, image_file, fake_arcoreimg):
+    """清单文件用 '|' 分隔，名称里带 '|' 会把行结构破坏掉。"""
+    with pytest.raises(ValueError):
+        Q.build_single_target_db(
+            image_file, name="a|b", print_width_m=0.152,
+            out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
+        )
+
+
+def test_build_single_target_db_rejects_nonpositive_width(tmp_path, image_file, fake_arcoreimg):
+    for bad in (0.0, -0.1):
+        with pytest.raises(ValueError):
+            Q.build_single_target_db(
+                image_file, name="p1", print_width_m=bad,
+                out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
+            )
+
+
+def test_build_single_target_db_writes_absolute_path_in_list(tmp_path, fake_arcoreimg, textured_image):
+    """物理宽度是建库时烘进 .imgdb 的，清单行必须是 名称|绝对路径|宽度。
+
+    fake 脚本会校验行格式与路径是否为绝对路径并在不合规时退出码非 0，
+    所以这个测试真的能测到清单的写法，而不是只测到"没抛异常"。
+    """
+    import os
+
+    sub = tmp_path / "photos"
+    sub.mkdir()
+    img_path = sub / "rel.jpg"
+    cv2.imwrite(str(img_path), textured_image(seed=3))
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)  # 用相对路径调用，验证实现会自己转成绝对路径
+    try:
+        size = Q.build_single_target_db(
+            "photos/rel.jpg", name="rel", print_width_m=0.089,
+            out_path=tmp_path / "rel.imgdb", arcoreimg=fake_arcoreimg(),
+        )
+    finally:
+        os.chdir(cwd)
+    assert size > 0
 ```
 
 - [ ] **Step 3: 运行测试确认失败**
@@ -2426,9 +2520,11 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'photoar.quality'`
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 MIN_QUALITY_SCORE = 75
+ARCOREIMG = "arcoreimg"  # 仓库内已放置可用二进制于 tools/arcoreimg
 
 _SCORE_RE = re.compile(r"(\d{1,3})")
 
@@ -2463,7 +2559,7 @@ def _run(arcoreimg: str, args: list[str]) -> str:
     return proc.stdout
 
 
-def eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
+def eval_img(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int:
     out = _run(arcoreimg, ["eval-img", f"--input_image_path={Path(image_path)}"])
     scores = _SCORE_RE.findall(out)
     if not scores:
@@ -2471,7 +2567,7 @@ def eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
     return int(scores[-1])
 
 
-def assert_quality(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
+def assert_quality(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int:
     score = eval_img(image_path, arcoreimg)
     if score < MIN_QUALITY_SCORE:
         raise QualityTooLow(str(image_path), score)
@@ -2481,24 +2577,43 @@ def assert_quality(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
 def build_single_target_db(
     image_path: str | Path,
     name: str,
+    print_width_m: float,
     out_path: str | Path,
-    arcoreimg: str = "arcoreimg",
+    arcoreimg: str = ARCOREIMG,
 ) -> int:
+    """建一个只含这一张参考图的 .imgdb，并把打印物理宽度烘进去。
+
+    物理宽度写在清单行里，所以客户端不需要在运行时再用
+    addImage(name, bitmap, widthInMeters) 传一遍——库里已经带着它了。
+
+    实测：单目标 .imgdb 约 4.2-4.4 KB（见 phase0-results.md 里程碑 0c）。
+    """
     if not name.isascii():
         raise ValueError(f"arcoreimg 只支持 ASCII 目标名，收到 {name!r}")
-    image_path, out_path = Path(image_path), Path(out_path)
+    if "|" in name or "\n" in name:
+        raise ValueError(f"目标名不能含 '|' 或换行（清单以 '|' 分隔），收到 {name!r}")
+    if not print_width_m > 0:
+        raise ValueError(f"打印物理宽度必须为正数（米），收到 {print_width_m!r}")
+
+    image_path = Path(image_path).resolve()  # 清单要求绝对路径
+    out_path = Path(out_path)
     if not image_path.name.isascii():
         raise ValueError(f"arcoreimg 只支持 ASCII 文件名，收到 {image_path.name!r}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    _run(
-        arcoreimg,
-        [
-            "build-db",
-            f"--input_image_path={image_path}",
-            f"--output_db_path={out_path}",
-        ],
-    )
+    # 清单文件是临时产物，不留在用户目录里
+    with tempfile.TemporaryDirectory() as tmp:
+        listing = Path(tmp) / "targets.txt"
+        listing.write_text(f"{name}|{image_path}|{print_width_m:.6f}\n")
+        _run(
+            arcoreimg,
+            [
+                "build-db",
+                f"--input_image_list_path={listing}",
+                f"--output_db_path={out_path}",
+            ],
+        )
+
     if not out_path.exists():
         raise RuntimeError(f"arcoreimg build-db 未产出 {out_path}")
     return out_path.stat().st_size
