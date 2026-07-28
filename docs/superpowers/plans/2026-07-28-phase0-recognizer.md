@@ -6,11 +6,13 @@
 
 **Architecture:** 两阶段检索。粗排用二进制层次词汇树（k-majority）+ TF-IDF 倒排索引取 Top-20；精排对候选做 ORB 暴力汉明匹配 + RANSAC 单应矩阵，按三条判定决定是否命中。为了让粗排的召回率有可比基线，先实现**不含任何词汇表变量的暴力检索**（对全库逐个几何校验），它同时是最硬的 go/no-go 参考点。测试数据由合成查询图生成器程序化产出（透视/模糊/亮度/色温/高光/JPEG 压缩），全流程不需要真机、不需要网络、不需要 NAS。
 
-**Tech Stack:** Python 3.11+、opencv-python-headless、numpy、pytest。外部命令行工具：`arcoreimg`（ARCore SDK）、`ffmpeg`/`ffprobe`。
+**Tech Stack:** Python 3.10+、opencv-python、numpy、pytest。外部命令行工具：`arcoreimg`（ARCore SDK）、`ffmpeg`/`ffprobe`。
+
+**本机实测环境（2026-07-28）：** Python 3.10.0、cv2 5.0.0、numpy 2.0.0 已全局可用。使用 `python3 -m venv --system-site-packages .venv` 建虚拟环境复用已装好的 cv2/numpy，再 `.venv/bin/pip install -e . --no-deps` 装本包。所有 `python`/`pytest`/`photoar` 命令都用 `.venv/bin/` 下的。`.venv/` 已在 `.gitignore` 里。
 
 ## Global Constraints
 
-- **依赖白名单**：仅 `opencv-python-headless`、`numpy`、`pytest`。**禁止**引入 scipy、scikit-learn、torch、Pillow、scipy.spatial 等。需要的算法自己实现（词汇树、倒排索引、popcount）。
+- **依赖白名单**：仅 `opencv-python`（或 headless 变体）、`numpy`、`pytest`。**禁止**引入 scipy、scikit-learn、torch、Pillow 等。需要的算法自己实现（词汇树、倒排索引、popcount）。
 - **尺度对齐是硬约束**：入库提特征与查询提特征都必须先把图缩到长边 `LONG_EDGE = 640`。ORB 无尺度不变性，两侧不一致会让召回率腰斩。任何绕过 `resize_to_long_edge` 的代码路径都是 bug。
 - **特征参数**（集中定义在 `src/photoar/features.py`，其他模块只 import，不得复制字面量）：`LONG_EDGE = 640`、`N_FEATURES = 300`、`SCALE_FACTOR = 1.2`、`N_LEVELS = 8`。
 - **判定阈值**（集中定义在 `src/photoar/verify.py`）：`MIN_INLIERS = 25`、`DET_MIN = 0.05`、`DET_MAX = 20.0`、`RATIO = 1.5`、`RANSAC_REPROJ = 3.0`。
@@ -18,7 +20,7 @@
 - **误识别率优先于漏检率**（spec §14.2）：调参时两者冲突，一律牺牲漏检保误识别。任何降低判定严格度的改动都要在提交信息里说明对误识别率的影响。
 - **Phase 0 不引入 SQLite**。产物是文件（描述子库、索引、`.imgdb`、JSON manifest）。数据库是 Phase 1 随服务一起引入的。
 - **Phase 0 不写任何服务、不写任何 Android 代码。**
-- **`photo-ar` 目前不是 git 仓库。** 执行本计划前须先征得用户同意执行 `git init`；在获得同意前，所有 `Step: Commit` 步骤跳过，改为在任务末尾运行该任务的全部测试并报告结果。
+- **git**：仓库已于 2026-07-28 初始化（默认分支 `main`），commit 步骤正常执行。**只本地 commit，永不 push**。commit message 里不得出现 `Co-Authored-By` 之类的署名。若 git 报缺少身份，用 `git -c user.name=xyz -c user.email=<你的邮箱> commit ...`。
 
 ## 与 spec 的偏离（已确认）
 
@@ -79,9 +81,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "photoar"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
-    "opencv-python-headless>=4.9",
+    "opencv-python>=4.9",
     "numpy>=1.26",
 ]
 
@@ -589,6 +591,10 @@ def test_verify_pair_handles_empty_features():
 def test_verify_pair_rejects_mirrored_match(textured_image):
     """镜像的单应矩阵行列式为负。实体照片经相机成像永远不会镜像，
     因此负行列式必须判否——这比 spec 写的 abs(det) 更严格且更正确。
+
+    注意：这个测试只验证"镜像图整体上会被拒"这个组合行为，它**不能**
+    隔离出拒绝的机制——实测镜像图只有约 8 个内点，`not r.ok` 会直接
+    短路。真正锁住签名行列式分支的是下面那个测试。
     """
     import cv2
 
@@ -597,6 +603,36 @@ def test_verify_pair_rejects_mirrored_match(textured_image):
     mirrored = F.extract(cv2.flip(img, 1))
     r = V.verify_pair(mirrored, ref, "p4")
     assert not r.ok or r.det > 0
+
+
+def test_mirrored_match_is_rejected_by_determinant_sign_not_inlier_count(textured_image):
+    """隔离签名行列式分支：构造一个内点远超阈值、但行列式为负的场景。
+
+    做法：参考的描述子与查询**完全相同**（BFMatcher 会 1:1 零距离匹配），
+    而参考的关键点是查询关键点的水平镜像。于是 findHomography 得到一个
+    纯反射矩阵：约 300 个内点、行列式为负。此时 ok 只可能因符号检验为 False。
+
+    三条断言缺一不可：
+      - inliers >= MIN_INLIERS 证明拒绝**不是**因为内点不够（去掉这条，
+        测试就会在构造哪天不再产生大量匹配时静默退化成空测试）
+      - det < 0        证明确实处于镜像情形
+      - not r.ok       被测行为本身
+
+    镜像必须在**缩放后**的坐标系里做：extract() 先把图缩到长边 640 才提
+    特征，所以关键点活在 640 长边的坐标系里，不是原始 800x600。
+    """
+    img = textured_image(seed=2, w=800, h=600)
+    query = F.extract(img)
+    resized_w = F.resize_to_long_edge(img).shape[1]
+
+    mirrored_pts = query.pts.copy()
+    mirrored_pts[:, 0] = (resized_w - 1) - mirrored_pts[:, 0]
+    mirror_ref = F.Features(pts=mirrored_pts, desc=query.desc)
+
+    r = V.verify_pair(query, mirror_ref, "mirror")
+    assert r.inliers >= V.MIN_INLIERS
+    assert r.det < 0
+    assert not r.ok
 
 
 def test_decide_returns_no_match_on_empty_results():
