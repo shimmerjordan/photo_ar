@@ -49,6 +49,19 @@ def test_has_faststart_detects_both_cases(sample_video):
     assert not T.has_faststart(sample_video("nofs.mp4", seconds=2, faststart=False))
 
 
+def test_has_faststart_on_file_larger_than_probe_window(sample_video):
+    """校验有界读取在大文件上依然给出正确答案（不代表"只读了前 128KB"本身
+    这一点——那由实现里的 f.read(n) 调用保证）。"""
+    fs_path = sample_video("big_fs.mp4", w=1280, h=720, seconds=5, faststart=True)
+    nofs_path = sample_video("big_nofs.mp4", w=1280, h=720, seconds=5, faststart=False)
+
+    assert fs_path.stat().st_size > T._FASTSTART_PROBE_BYTES
+    assert nofs_path.stat().st_size > T._FASTSTART_PROBE_BYTES
+
+    assert T.has_faststart(fs_path)
+    assert not T.has_faststart(nofs_path)
+
+
 def test_needs_transcode_for_oversized_video():
     assert T.needs_transcode(T.VideoInfo(1920, 1080, 8_000, True))
 
