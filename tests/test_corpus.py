@@ -118,12 +118,11 @@ def test_load_corpus_rejects_permuted_index_via_self_query(tmp_path, textured_im
     只重建 index.npz，让 doc j 的内容变成原 slot (n-1-j) 的描述子（整体
     倒序，n 为偶数保证没有不动点）。
 
-    语料刻意选到 100 张、远大于 TOP_K(20)：若语料张数 <= TOP_K，
-    index.query 会把全部文档当成 top-K 候选返回，"自己的下标是否在候选
-    列表里"这条断言无论顺序是否被打乱都恒为真，起不到检测作用——这一点
-    是实测验证过的（用本仓库的合成图在 12/30 张规模上尝试过，均无法
-    可靠触发，只有把规模推到明显超过 TOP_K 之后才能稳定触发，细节见
-    task-11-report.md）。
+    这里覆盖"大语料"这个 regime：100 张、远大于 TOP_K(20)，实际用的 k
+    就是 top_k 本身（k = max(1, min(top_k, n_docs // 2)) = min(20, 50) = 20），
+    不受收缩影响。与下面的
+    test_load_corpus_rejects_permuted_index_small_corpus（12 张、k 被
+    收缩到 6）成对，分别覆盖 _verify_self_query 里 k 公式的两条分支。
     """
     d = tmp_path / "photos"
     d.mkdir()
@@ -136,9 +135,9 @@ def test_load_corpus_rejects_permuted_index_via_self_query(tmp_path, textured_im
     out = tmp_path / "corpus"
     build_corpus(img_paths, out, seed=0, arcoreimg=None)
 
-    paths = CorpusPaths.at(out)
-    voc = V.Vocab.load(paths.vocab)
-    store = DescStore(paths.desc)
+    cp = CorpusPaths.at(out)
+    voc = V.Vocab.load(cp.vocab)
+    store = DescStore(cp.desc)
     n = len(store)
     assert n % 2 == 0  # 保证倒序没有不动点
 
@@ -146,7 +145,43 @@ def test_load_corpus_rejects_permuted_index_via_self_query(tmp_path, textured_im
     for j in range(n):
         original_slot = n - 1 - j
         builder.add(voc.words_of(store.read(original_slot).desc))
-    builder.build().save(paths.index)
+    builder.build().save(cp.index)
+
+    with pytest.raises(CorpusIntegrityError):
+        load_corpus(out)
+
+
+def test_load_corpus_rejects_permuted_index_small_corpus(tmp_path, photo_dir):
+    """同上，但专门覆盖"小语料"这个 regime：12 张照片，严格小于
+    recognizer.TOP_K(20)。
+
+    在给 _verify_self_query 加上 k = max(1, min(top_k, n_docs // 2)) 这个
+    收缩之前，这条测试对这种规模的语料完全没有检测力——index.query 会
+    把全部 12 篇文档都当 top-K 候选返回，"自己的下标在不在候选里"这条
+    断言无论顺序有没有被打乱都恒为真（检测概率恒为 0%）。收缩后
+    k = max(1, min(20, 6)) = 6，单次采样检测出错位的概率约
+    1 - 6/12 = 50%，5 个采样点合起来约 1 - 0.5^5 ≈ 97%。
+
+    这是概率性检测，不是恒定必然：可靠性已经用连续独立跑 20 次、全部
+    通过验证过（跑法与结果记在 task-11-report.md 里，不在这里重复跑，
+    避免拖慢日常测试）；也验证过把 _verify_self_query 的 k 临时改回恒定
+    的 top_k 后，这条测试会稳定 FAIL（同样记在报告里）。
+    """
+    _, paths = photo_dir
+    out = tmp_path / "corpus"
+    build_corpus(paths, out, seed=0, arcoreimg=None)
+
+    cp = CorpusPaths.at(out)
+    voc = V.Vocab.load(cp.vocab)
+    store = DescStore(cp.desc)
+    n = len(store)
+    assert n == 12 and n % 2 == 0  # 保证倒序没有不动点，且确实是小语料 regime
+
+    builder = InvertedIndexBuilder(voc.n_words)
+    for j in range(n):
+        original_slot = n - 1 - j
+        builder.add(voc.words_of(store.read(original_slot).desc))
+    builder.build().save(cp.index)
 
     with pytest.raises(CorpusIntegrityError):
         load_corpus(out)

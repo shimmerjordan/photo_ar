@@ -33,10 +33,11 @@ from .recognizer import TOP_K, TwoStageRecognizer
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 # arcoreimg build-db 的清单行要求一个正的打印物理宽度（米）。Phase 0 只做
-# 识别、不做 AR 放置，语料构建时并不知道每张照片真实的打印尺寸，因此这里
-# 用一个占位默认值（0.152m ≈ 6 寸照片宽边）满足清单格式要求。Phase 1 若要
-# 让 .imgdb 里的物理宽度真实可用，需要从别处（如客户端上传时的元数据）
-# 传入真实值，而不是依赖这个默认值。
+# 识别、不做 AR 放置，语料构建时并不天然知道每张照片真实的打印尺寸，因此
+# 用这个值作为 build_corpus 的 print_width_m 默认值（0.152m ≈ 6 寸照片
+# 宽边）。调用方（CLI 的 --print-width-mm，或直接调用 build_corpus 的
+# 代码）可以覆盖它；如果 0d 的照片是别的尺寸打印的，必须显式传入真实值，
+# 否则烘进 .imgdb 的物理宽度会是错的。
 _DEFAULT_PRINT_WIDTH_M = 0.152
 
 
@@ -103,9 +104,12 @@ def build_corpus(
     out_root: str | Path,
     seed: int = 0,
     arcoreimg: str | None = None,
+    print_width_m: float = _DEFAULT_PRINT_WIDTH_M,
 ) -> list[PhotoEntry]:
     if not image_paths:
         raise ValueError("build_corpus 需要至少一张图片")
+    if print_width_m <= 0:
+        raise ValueError(f"print_width_m 必须为正数（米），收到 {print_width_m!r}")
 
     paths = CorpusPaths.at(out_root)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -127,7 +131,7 @@ def build_corpus(
                 score = Q.assert_quality(path, arcoreimg=arcoreimg)
                 imgdb_bytes = Q.build_single_target_db(
                     path, name=photo_id,
-                    print_width_m=_DEFAULT_PRINT_WIDTH_M,
+                    print_width_m=print_width_m,
                     out_path=paths.imgdb_dir / f"{photo_id}.imgdb",
                     arcoreimg=arcoreimg,
                 )
@@ -210,11 +214,32 @@ def _verify_self_query(
     hash 的原始内容。这里改用行为验证：一张照片自己的词去查索引，理应
     在候选里看到它自己的 doc 下标；如果索引被错位，这条会失败。
 
-    用较大的 top_k（复用 recognizer 的 TOP_K）是因为这是在抓"整体错位"
-    这种粗暴故障，不是在测召回率，不应该因为某张照片本来就是识别难例
-    而变得 flaky。零特征的照片直接跳过，不能既没有词又要求命中自己。
+    实际查询用的 k 会按语料规模收缩：
+        k = max(1, min(top_k, n_docs // 2))
+    而不是恒等于 top_k。原因是 InvertedIndex.query 内部本来就会把 k 截到
+    min(top_k, n_docs)——如果语料规模不大于 top_k（比如恰好等于
+    recognizer.TOP_K=20 的默认语料），query 就会把**全部**文档当 top-K
+    候选返回，"自己的下标是否在候选里"这条断言无论顺序有没有被打乱都
+    恒为真，检测概率恒为 0%，这正是本项目反复撞见的那种"看着在守护、
+    实际什么都没守护"的假校验。收缩 k 之后：
+      - 一个被打乱的索引会把照片 i 的词映射到别的文档上，所以照片 i
+        自己的 doc 下标在打分排序里近似随机分布；单次采样检测出错位的
+        概率约为 1 - k/n_docs。
+      - n_docs=12 时 k=6，单次约 50%，5 个采样点合起来 1-0.5^5 ≈ 97%。
+      - n_docs=1000 时 k=20（不受收缩影响，因为 20 <= 500），单次约
+        98%，几乎必然检测到。
+      - n_docs=2 时 k=1，要求排第一；打乱后另一篇文档会排第一，能测到。
+      - n_docs=1 时语料本身没法被"打乱"，恒过是对的。
+      - 旧版本 k 恒为 top_k(20)，n_docs<=20 时检测概率恒为 0%。
+
+    这仍然是概率性检测，不是保证；用 5 个均匀分布的采样点是为了把单次
+    检测的偶然失败（比如某张照片恰好是识别难例）平均掉，同时保持对
+    "整体错位"这种粗暴故障的高检出率。零特征的照片直接跳过，不能既
+    没有词又要求命中自己。
     """
-    slots = _self_query_sample_slots(len(entries))
+    n_docs = len(entries)
+    k = max(1, min(top_k, n_docs // 2))
+    slots = _self_query_sample_slots(n_docs)
     for slot in slots:
         features = store.read(slot)
         if len(features) == 0:
@@ -222,11 +247,11 @@ def _verify_self_query(
         words = vocab.words_of(features.desc)
         if words.size == 0:
             continue
-        candidates = [doc for doc, _ in index.query(words, top_k)]
+        candidates = [doc for doc, _ in index.query(words, k)]
         if slot not in candidates:
             raise CorpusIntegrityError(
                 f"倒排索引自查失败：photo_id={entries[slot].photo_id}（slot {slot}）用 "
-                f"自己的描述子查询索引，Top-{top_k} 候选 {candidates} 里却没有它自己。 "
+                f"自己的描述子查询索引，Top-{k} 候选 {candidates} 里却没有它自己。 "
                 f"这通常意味着倒排索引与 manifest / 描述子库的顺序发生了错位。"
             )
 

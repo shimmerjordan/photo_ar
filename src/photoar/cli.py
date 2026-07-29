@@ -1,6 +1,6 @@
 """photoar 命令行入口。
 
-    photoar build --photos <目录> --out <语料目录> [--arcoreimg <路径>]
+    photoar build --photos <目录> --out <语料目录> [--arcoreimg <路径>] [--print-width-mm 152]
     photoar eval  --corpus <语料目录> [--samples 20] [--limit N] [--seed 1]
 
 eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法或环境错误。
@@ -13,8 +13,16 @@ from pathlib import Path
 
 import cv2
 
-from .corpus import IMAGE_SUFFIXES, CorpusIntegrityError, build_corpus, load_corpus
+from .corpus import (
+    IMAGE_SUFFIXES,
+    _DEFAULT_PRINT_WIDTH_M,
+    CorpusIntegrityError,
+    build_corpus,
+    load_corpus,
+)
 from .evaluate import evaluate
+
+_DEFAULT_PRINT_WIDTH_MM = _DEFAULT_PRINT_WIDTH_M * 1000.0
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
@@ -26,8 +34,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
         print(f"在 {photo_dir} 下没有找到图片（支持 {sorted(IMAGE_SUFFIXES)}）",
               file=sys.stderr)
         return 2
+    if args.print_width_mm <= 0:
+        print(f"--print-width-mm 必须为正数，收到 {args.print_width_mm!r}",
+              file=sys.stderr)
+        return 2
 
-    entries = build_corpus(paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg)
+    entries = build_corpus(
+        paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg,
+        print_width_m=args.print_width_mm / 1000.0,
+    )
     print(f"入库 {len(entries)} 张，语料写入 {args.out}")
     if args.arcoreimg:
         sizes = [e.imgdb_bytes for e in entries if e.imgdb_bytes]
@@ -79,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--arcoreimg", default=None,
                    help="arcoreimg 路径；省略则跳过质量分与 .imgdb 生成")
+    b.add_argument(
+        "--print-width-mm", type=float, default=_DEFAULT_PRINT_WIDTH_MM,
+        help=f"参考图实际打印宽度（毫米），烘进 .imgdb；仅在提供 --arcoreimg 时"
+             f"才会用到，默认 {_DEFAULT_PRINT_WIDTH_MM:g}mm",
+    )
     b.set_defaults(func=_cmd_build)
 
     e = sub.add_parser("eval", help="用合成查询图评估识别率")
