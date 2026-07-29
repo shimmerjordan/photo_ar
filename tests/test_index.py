@@ -92,3 +92,59 @@ def test_recall_at_k_on_many_docs():
         if target in [d for d, _ in idx.query(q, top_k=20)]:
             hits += 1
     assert hits >= 18  # 20 次里至少 18 次
+
+
+def test_ties_break_by_ascending_doc_index():
+    """当多篇文档对同一 query 得分完全相同时，返回顺序必须按 doc_index 升序排列。
+
+    np.argpartition 用的是 introselect，不保证保留原始下标顺序；如果只在其后
+    接一个 argsort(kind="stable")，"稳定"针对的是 argpartition 输出的候选数组
+    本身（其内部顺序已不确定），并不是原始文档下标——即使分数完全相同，也可能
+    返回下标乱序的结果。用这里完全相同的构造，在只有 argsort(stable) 而没有
+    按 (-score, doc_index) 做 lexsort 的旧实现下跑，返回的是
+    [0, 4, 12, 10, 24]（10 排在 12 之后，不是升序）；对随机同分数组的 2000 次
+    试验里，有 1550 次违反了升序保证。修复后必须显式按 (-score, doc_index)
+    lexsort，不能只依赖 argpartition + 稳定排序。
+    """
+    tied_words = np.array([1, 2, 3], np.int32)
+    tied_positions = {0, 4, 10, 12, 16, 20, 24, 28}
+    n_total = 30
+
+    b = InvertedIndexBuilder(50)
+    for i in range(n_total):
+        if i in tied_positions:
+            b.add(tied_words.copy())
+        else:
+            b.add(np.array([40 + (i % 5)], np.int32))
+    idx = b.build()
+
+    top_k = 5  # 切入 8 篇同分文档中间，容不下全部
+    result = idx.query(tied_words, top_k=top_k)
+
+    docs = [d for d, _ in result]
+    scores = [s for _, s in result]
+    assert len(docs) == top_k
+    assert all(d in tied_positions for d in docs)
+    assert max(scores) - min(scores) < 1e-6  # 确认这些文档确实同分
+    assert docs == sorted(docs)
+
+
+def test_query_rejects_positive_out_of_range_word():
+    idx = _build([[1, 2, 3]], n_words=10)
+    with pytest.raises(ValueError):
+        idx.query(np.array([999], np.int32), top_k=5)
+
+
+def test_query_rejects_negative_word_id():
+    """负数词 id 若不校验，numpy 会用负索引悄悄绕过：self._idf[w] 在 w=-1 时
+    取到最后一个词的 idf；切片端点 self._offsets[w] 与 self._offsets[w + 1]
+    分别回绕到总长度（offsets[-1]）和 0（offsets[0]），形成 start > end 的
+    空切片——不会给任何文档加分，但幽灵词的 idf 权重仍计入查询向量的归一化
+    分母 qnorm，导致所有真实文档的分数被静默压低，且不抛出任何异常。
+    实测（10 词词表，文档 0 含词 1,2,3,9）：查询 [1,2,3] 时文档 0 得分
+    0.9258；查询 [1,2,3,-1] 时同一文档得分被压低到 0.8571，排名不变但分数
+    失真，且没有任何异常提示这是非法输入。
+    """
+    idx = _build([[1, 2, 3, 9], [4, 5, 6], [1, 2, 7], [8, 9]], n_words=10)
+    with pytest.raises(ValueError):
+        idx.query(np.array([1, 2, 3, -1], np.int32), top_k=3)

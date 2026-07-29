@@ -88,6 +88,13 @@ class InvertedIndex:
         return self._n_docs
 
     def query(self, words: np.ndarray, top_k: int) -> list[tuple[int, float]]:
+        n_words = self._idf.shape[0]
+        if words.size and (int(words.min()) < 0 or int(words.max()) >= n_words):
+            raise ValueError(
+                f"词 id 超出范围 [0, {n_words})："
+                f"min={int(words.min())} max={int(words.max())}"
+            )
+
         if self._n_docs == 0 or words.size == 0 or top_k <= 0:
             return []
 
@@ -106,7 +113,14 @@ class InvertedIndex:
 
         k = min(top_k, self._n_docs)
         cand = np.argpartition(-scores, k - 1)[:k]
-        cand = cand[np.argsort(-scores[cand], kind="stable")]
+        # np.argpartition (introselect) does not preserve original index order
+        # among tied scores, so a plain argsort(kind="stable") is only stable
+        # relative to argpartition's unspecified internal order — not ascending
+        # by doc index. Sort explicitly by (-score, doc_index) so ties resolve
+        # to ascending doc index, deterministically. lexsort's last key is the
+        # primary key.
+        order = np.lexsort((cand, -scores[cand]))
+        cand = cand[order]
         return [(int(d), float(scores[d])) for d in cand]
 
     def save(self, path: str | Path) -> None:
