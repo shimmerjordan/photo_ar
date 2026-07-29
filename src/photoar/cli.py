@@ -1,0 +1,99 @@
+"""photoar 命令行入口。
+
+    photoar build --photos <目录> --out <语料目录> [--arcoreimg <路径>]
+    photoar eval  --corpus <语料目录> [--samples 20] [--limit N] [--seed 1]
+
+eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法或环境错误。
+退出码可直接被 CI 使用。
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import cv2
+
+from .corpus import IMAGE_SUFFIXES, CorpusIntegrityError, build_corpus, load_corpus
+from .evaluate import evaluate
+
+
+def _cmd_build(args: argparse.Namespace) -> int:
+    photo_dir = Path(args.photos)
+    paths = sorted(
+        p for p in photo_dir.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not paths:
+        print(f"在 {photo_dir} 下没有找到图片（支持 {sorted(IMAGE_SUFFIXES)}）",
+              file=sys.stderr)
+        return 2
+
+    entries = build_corpus(paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg)
+    print(f"入库 {len(entries)} 张，语料写入 {args.out}")
+    if args.arcoreimg:
+        sizes = [e.imgdb_bytes for e in entries if e.imgdb_bytes]
+        if sizes:
+            print(
+                f".imgdb 体积  最小 {min(sizes)}  中位 {sorted(sizes)[len(sizes)//2]}  "
+                f"最大 {max(sizes)} 字节"
+            )
+    return 0
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    try:
+        rec, entries = load_corpus(args.corpus)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except CorpusIntegrityError as exc:
+        # 语料本身顺序错位，不是用法错误，也不是识别率没达标——是环境/
+        # 产物损坏，同样归为退出码 2，不能让调用方误以为是"未达标"（1）。
+        print(f"语料完整性校验失败：{exc}", file=sys.stderr)
+        return 2
+
+    chosen = entries[: args.limit] if args.limit else entries
+    refs = {}
+    for e in chosen:
+        img = cv2.imread(e.ref_path, cv2.IMREAD_COLOR)
+        if img is not None:
+            refs[e.photo_id] = img
+    if not refs:
+        print("参考图都读不出来，检查 manifest 里的 ref_path 是否还有效",
+              file=sys.stderr)
+        return 2
+
+    metrics = evaluate(rec, refs, samples_per_ref=args.samples, seed=args.seed)
+    print(f"图库规模    {len(entries)}")
+    print(f"评估参考图  {len(refs)}")
+    print(metrics.as_report())
+    return 0 if metrics.meets_baseline else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="photoar")
+    sub = parser.add_subparsers(dest="cmd")
+
+    b = sub.add_parser("build", help="从照片目录构建识别语料")
+    b.add_argument("--photos", required=True)
+    b.add_argument("--out", required=True)
+    b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--arcoreimg", default=None,
+                   help="arcoreimg 路径；省略则跳过质量分与 .imgdb 生成")
+    b.set_defaults(func=_cmd_build)
+
+    e = sub.add_parser("eval", help="用合成查询图评估识别率")
+    e.add_argument("--corpus", required=True)
+    e.add_argument("--samples", type=int, default=20)
+    e.add_argument("--limit", type=int, default=0, help="只评估前 N 张，0 = 全部")
+    e.add_argument("--seed", type=int, default=1)
+    e.set_defaults(func=_cmd_eval)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_usage(sys.stderr)
+        return 2
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
