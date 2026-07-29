@@ -1,0 +1,78 @@
+import shutil
+import subprocess
+
+import pytest
+
+from photoar import transcode as T
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="需要 ffmpeg/ffprobe",
+)
+
+
+@pytest.fixture
+def sample_video(tmp_path):
+    """用 ffmpeg 自带的 testsrc 造视频，不依赖任何素材文件。"""
+
+    def _make(name="in.mp4", w=1920, h=1080, seconds=20, faststart=False):
+        path = tmp_path / name
+        args = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"testsrc=size={w}x{h}:rate=30:duration={seconds}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest",
+        ]
+        if faststart:
+            args += ["-movflags", "+faststart"]
+        args.append(str(path))
+        subprocess.run(args, check=True, capture_output=True)
+        return path
+
+    return _make
+
+
+def test_probe_reads_dimensions_and_duration(sample_video):
+    info = T.probe(sample_video(w=1280, h=720, seconds=3))
+    assert (info.width, info.height) == (1280, 720)
+    assert 2500 <= info.duration_ms <= 3500
+
+
+def test_probe_raises_when_ffprobe_missing(sample_video):
+    with pytest.raises(T.FfmpegMissing):
+        T.probe(sample_video(seconds=1), ffprobe="not-a-real-ffprobe-xyz")
+
+
+def test_has_faststart_detects_both_cases(sample_video):
+    assert T.has_faststart(sample_video("fs.mp4", seconds=2, faststart=True))
+    assert not T.has_faststart(sample_video("nofs.mp4", seconds=2, faststart=False))
+
+
+def test_needs_transcode_for_oversized_video():
+    assert T.needs_transcode(T.VideoInfo(1920, 1080, 8_000, True))
+
+
+def test_needs_transcode_for_overlong_video():
+    assert T.needs_transcode(T.VideoInfo(1280, 720, 20_000, True))
+
+
+def test_needs_transcode_without_faststart():
+    assert T.needs_transcode(T.VideoInfo(1280, 720, 8_000, False))
+
+
+def test_no_transcode_when_already_compliant():
+    assert not T.needs_transcode(T.VideoInfo(1280, 720, 8_000, True))
+
+
+def test_transcode_produces_compliant_output(tmp_path, sample_video):
+    src = sample_video(w=1920, h=1080, seconds=20, faststart=False)
+    dst = tmp_path / "out.mp4"
+    T.transcode(src, dst)
+
+    info = T.probe(dst)
+    assert info.height == T.TARGET_HEIGHT
+    assert info.width % 2 == 0, "H.264 要求宽度为偶数，故用 scale=-2:720"
+    assert info.duration_ms <= T.MAX_DURATION_MS + 500
+    assert T.has_faststart(dst)
+    assert not T.needs_transcode(info)
