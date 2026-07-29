@@ -42,7 +42,9 @@ _POPCOUNT = (
 def hamming_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """成对 Hamming 距离。a:(N,32) b:(M,32) -> (N,M) uint16。
 
-    调用方需保证 N*M 不会大到爆内存；本项目里 M 恒等于 branching（<=10）。
+    调用方需保证 N*M 不会大到爆内存：会物化一个 (N, M, 32) 的中间数组。
+    本项目里 M 恒等于 branching，当前默认 16（曾为 10，见 BRANCHING 的实测注释），
+    所以中间数组按 N*16*32 字节计。切勿用两个大操作数调用它。
     """
     if a.shape[0] == 0 or b.shape[0] == 0:
         return np.zeros((a.shape[0], b.shape[0]), np.uint16)
