@@ -16,7 +16,7 @@
 - **尺度对齐是硬约束**：入库提特征与查询提特征都必须先把图缩到长边 `LONG_EDGE = 640`。ORB 无尺度不变性，两侧不一致会让召回率腰斩。任何绕过 `resize_to_long_edge` 的代码路径都是 bug。
 - **特征参数**（集中定义在 `src/photoar/features.py`，其他模块只 import，不得复制字面量）：`LONG_EDGE = 640`、`N_FEATURES = 300`、`SCALE_FACTOR = 1.2`、`N_LEVELS = 8`。
 - **判定阈值**（集中定义在 `src/photoar/verify.py`）：`MIN_INLIERS = 25`、`DET_MIN = 0.05`、`DET_MAX = 20.0`、`RATIO = 1.5`、`RANSAC_REPROJ = 3.0`。
-- **单应矩阵估计器**：`HOMOGRAPHY_METHOD = cv2.USAC_ACCURATE`（2026-07-28 实测后从 `cv2.RANSAC` 改，见下）。
+- **RANSAC 迭代上限**：`RANSAC_MAX_ITERS = 200`（2026-07-28 实测后加，见下）。估计器仍是 `cv2.RANSAC`。
 - **一切随机性必须可复现**：只用 `numpy.random.default_rng(seed)`，禁止 `random` 模块的全局状态、禁止无 seed 的随机。测试必须是确定性的。
 - **误识别率优先于漏检率**（spec §14.2）：调参时两者冲突，一律牺牲漏检保误识别。任何降低判定严格度的改动都要在提交信息里说明对误识别率的影响。
 - **Phase 0 不引入 SQLite**。产物是文件（描述子库、索引、`.imgdb`、JSON manifest）。数据库是 Phase 1 随服务一起引入的。
@@ -28,30 +28,38 @@
 1. **spec §8.2 说先用 ORB-SLAM 现成 ORB 词汇表，不要自训。本计划改为：先做暴力检索基线（Task 5），再自训小词汇表（Task 6）。**
    理由：spec 的顾虑是"自训引入新变量导致归因困难"，而暴力检索连词汇表这个变量都不存在，是比借来的词汇表**更硬**的参考点，且它直接产出最重要的指标（误识别率）。有了暴力基线的 ground truth，Task 7 的粗排召回率才有可比对象。`ORBvoc.txt`（145MB 文本、1M 节点）保留为词汇表召回不达标时的备选，接口按可替换设计。
 2. **spec §6 说描述子 300×32 = 9600 字节/张、1 万张 96MB。这个数字漏算了关键点坐标。** RANSAC 需要关键点坐标，每张还要 300×2×float32 = 2400 字节。实际每张 12008 字节（含头），**1 万张约 120MB**，不是 96MB。仍在预算内，但 spec §8.4 的数字应按 120MB 更新。
-3. **spec §8.3 说 `findHomography(..., HOMOGRAPHY_METHOD, 3.0)`。实测后改用 `cv2.USAC_ACCURATE`。** 详见下节。
+3. **spec §8.3 说 `findHomography(..., RANSAC, 3.0)`。实测后给它加了 `maxIters=RANSAC_MAX_ITERS`（200）的上限。** 估计器仍是 `cv2.RANSAC`，判定条件一个都没改。详见下节。
 
-## 单应矩阵估计器改用 `cv2.USAC_ACCURATE`（2026-07-28 实测，已获用户裁决）
+## RANSAC 迭代上限降到 200（2026-07-28 实测，已获用户裁决）
 
-里程碑 0a 实测每次 `verify_pair` 约 21.7 ms，两阶段 Top-20 精排推算 434 ms，而 spec §8.4 的服务端目标是 80 ms，差 5 倍；且开发机 CPU 快于目标硬件 N5095。profile 之后发现瓶颈**不在** `BFMatcher`：
+里程碑 0a 实测每次 `verify_pair` 约 21.7 ms，两阶段 Top-20 精排推算 434 ms，而 spec §8.4 的服务端目标是 80 ms。profile 之后发现瓶颈**不在** `BFMatcher`：
 
 | 组件 | 耗时 |
 |---|---|
 | `BFMatcher(NORM_HAMMING, crossCheck=True)` 300×300 描述子 | 0.17 ms |
 | `findHomography(..., cv2.RANSAC, 3.0)` | **20.74 ms** ← 占 99% |
 
-只有约 90 个匹配点，RANSAC 却跑满了默认的 2000 次迭代。各估计器实测（真匹配 / 假匹配耗时，内点数，最终判定）：
+**但真正的关键洞察是：那 20 ms 只花在假匹配上。真匹配恒定约 0.34 ms。** RANSAC 是自适应终止的 —— 一旦找到好模型就停，只有在**根本不存在好模型**（即照片对不匹配）时才会烧满默认的 2000 次迭代。两阶段 Top-20 里有 19 个是假匹配，390 ms 全在这 19 次上。
 
-| 方法 | 真匹配 | 假匹配 | 内点 | 判定 |
+12 对真匹配 + 12 对假匹配的实测：
+
+| `maxIters` | 真匹配内点（12 对） | 真匹配 | 假匹配 | 误判 |
 |---|---|---|---|---|
-| `RANSAC` 默认 | 4.33 ms | 20.45 ms | 40 / 7 | True / False |
-| `RANSAC maxIters=200` | 2.17 ms | 2.22 ms | 40 / 7 | 一致 |
-| **`USAC_ACCURATE`** | **0.16 ms** | **0.21 ms** | 40 / 7 | 一致 |
-| `USAC_MAGSAC` | 0.45 ms | 0.25 ms | 40 / 7 | 一致 |
-| `RHO` | 0.07 ms | 0.10 ms | 35 / 6 | 内点略少 |
+| 2000（默认） | 110,140,93,171,115,87,211,98,108,112,108,93 | 0.34 ms | **20.56 ms** | 0/12 |
+| 500 | **完全相同** | 0.33 ms | 5.23 ms | 0/12 |
+| **200** | **完全相同** | 0.33 ms | **2.19 ms** | 0/12 |
+| 100 | **完全相同** | 0.30 ms | 1.25 ms | 0/12 |
+| 50 | **完全相同** | 0.33 ms | 0.70 ms | 0/12 |
 
-采用 `USAC_ACCURATE`：约快 100 倍，内点数与默认 RANSAC 完全一致（40 / 7），命中判定一致。Top-20 精排从 434 ms 降到约 3 ms，80 ms 目标轻松达成。
+降到 200：真匹配内点数逐个完全不变，假匹配内点数略降（更安全的方向），误判仍为 0，Top-20 精排从 390 ms 降到约 42 ms。**拒绝机制完全不变，所以现有 12 个测试全部照旧通过，里程碑 0a 也不必重跑。**
 
-⚠️ **必须记住的副作用**：假匹配时 `USAC_ACCURATE` 报 `det=854`，而默认 RANSAC 报 `det=0.16`。两者都被判否，但**走的判定条件不同** —— USAC 被行列式上界（`DET_MAX=20.0`）挡住，默认 RANSAC 被内点数（`MIN_INLIERS=25`）挡住。换估计器改变了拒绝的机制，所以**换完必须重跑里程碑 0a**（"误识别 0"那个结论是在默认 RANSAC 下测的）。重跑成本约 10 秒，原本 868 秒。
+### 为什么没选 `USAC_ACCURATE`
+
+`USAC_ACCURATE` 更快（Top-20 约 5 ms，真匹配内点差 ≤2，12/12 通过），但它**在估计器层面就拒绝纯反射** —— 镜像构造下返回 `inliers=0, det=0.0`，不产出反射矩阵。这会让 Task 3 的 `test_mirrored_match_is_rejected_by_determinant_sign_not_inlier_count` 失效，也就是把那个专门用来防 `abs(det)` 回归的守卫拆掉。加上它改变了拒绝机制（假匹配的 det 多为 0.0/-0.0/-877，靠 `DET_MIN` 而非内点数挡住），意味着 0a 必须重跑。42 ms 已达标，不值得付这个代价。
+
+### `maxIters` 不是完全免费的
+
+它限制的是**难例上花多少力气**。RANSAC 对 4 点模型需要约 `log(1-p)/log(1-w⁴)` 次迭代（`w` 为内点率）：200 覆盖约 `w ≥ 0.37`，500 覆盖约 `w ≥ 0.29`。真实照片里严重变形的边缘真匹配可能落在 0.3 附近，会变成漏检。这是可接受的方向（漏检代价比误识别低一个量级），而**里程碑 0d 是判断 200 是否太紧的依据**。若 0d 漏检偏多，就抬这个数 —— 而抬它只在假匹配上花时间。
 
 ## 词表粒度取舍数据（供 Task 8 / 里程碑 0b，不要据此现在拍阈值）
 
@@ -754,8 +762,10 @@ DET_MIN = 0.05
 DET_MAX = 20.0
 RATIO = 1.5
 RANSAC_REPROJ = 3.0
-# 估计器：USAC_ACCURATE 比默认 RANSAC 快约 100 倍且内点数一致（实测见文档开头）
-HOMOGRAPHY_METHOD = cv2.USAC_ACCURATE
+# RANSAC 迭代上限。默认 2000 只在假匹配上被烧满——真匹配靠自适应终止恒定约 0.34ms。
+# 实测降到 200：真匹配内点数完全不变、假匹配内点数略降、误判仍为 0，
+# 而假匹配耗时从 20.56ms 降到 2.19ms。只限制难例上的努力，不改任何判定条件。
+RANSAC_MAX_ITERS = 200
 
 MIN_MATCHES_FOR_HOMOGRAPHY = 4
 
@@ -791,7 +801,9 @@ def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
 
     src = query.pts[[m.queryIdx for m in matches]]
     dst = ref.pts[[m.trainIdx for m in matches]]
-    H, mask = cv2.findHomography(src, dst, HOMOGRAPHY_METHOD, RANSAC_REPROJ)
+    H, mask = cv2.findHomography(
+        src, dst, cv2.RANSAC, RANSAC_REPROJ, maxIters=RANSAC_MAX_ITERS
+    )
     if H is None or mask is None:
         return _fail(photo_id)
 
