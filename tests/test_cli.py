@@ -143,6 +143,51 @@ def test_eval_rejects_negative_limit(tmp_path, photo_dir, capsys):
     assert "-5" in err
 
 
+def test_build_rejects_negative_holdout_frac(tmp_path, photo_dir, capsys):
+    """本轮修复追加：--holdout-frac -0.1 原本会被 select_holdout 的
+    `frac <= 0` 分支静默当成"不留出"接受，跟 --limit 打错负号被显式拒绝
+    （M12，exit 2）的处理方式不一致。这里钉死退出码必须**正好是 2**（用法
+    错误），不是笼统的"非零"，也不是 0/1。"""
+    rc = main([
+        "build", "--photos", str(photo_dir), "--out", str(tmp_path / "corpus"),
+        "--holdout-frac", "-0.1",
+    ])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "-0.1" in err
+
+
+def test_eval_reports_out_of_library_false_positive_attribution_for_analysis(
+    tmp_path, photo_dir, capsys, monkeypatch
+):
+    """本轮修复追加：select_holdout 按内容哈希整组去留只堵住了字节完全
+    相同的重复跨边界，堵不住"重新编码的近似重复"（同一张照片被压缩/裁切/
+    转码成不同字节，哈希本身就不相等）。CLI 必须把每次库外误识别命中的
+    库内 photo_id 报出来，供验收跑之后人工/脚本核对该 photo_id 在
+    manifest 里的 ref_path 是不是这张留出图的另一份编码——用 monkeypatch
+    强制产生确定性的 false positive，不依赖真实 CV 恰好触发误识别。"""
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus),
+          "--holdout-frac", "0.3", "--seed", "0"])
+    capsys.readouterr()
+
+    import photoar.cli as cli_mod
+    from photoar.evaluate import OutOfLibraryMetrics
+
+    def fake_evaluate_out_of_library(rec, queries, **kwargs):
+        (qid,) = queries.keys()
+        return OutOfLibraryMetrics(
+            total=1, false_positive=1, correct_rejection=0,
+            false_positive_matches=[(qid, "some-library-photo-id")],
+        )
+
+    monkeypatch.setattr(cli_mod, "evaluate_out_of_library", fake_evaluate_out_of_library)
+
+    main(["eval", "--corpus", str(corpus), "--samples", "2"])
+    err = capsys.readouterr().err
+    assert "some-library-photo-id" in err
+
+
 def test_build_converts_print_width_mm_to_metres_for_arcoreimg(
     tmp_path, photo_dir, capsys, fake_arcoreimg
 ):

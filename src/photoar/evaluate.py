@@ -61,6 +61,15 @@ class OutOfLibraryMetrics:
     false_positive: int
     correct_rejection: int
     latencies_ms: list[float] = field(default_factory=list)
+    # 本轮修复（select_holdout 按内容哈希整组去留）追加：那个修复只堵住了
+    # "字节完全相同的重复跨边界"，堵不住"重新编码的近似重复"（同一张照片
+    # 被压缩/裁切/转码成不同字节）——那种情况内容哈希本身就不相等，没有
+    # 哈希能查出来。这里不做基于视觉相似度的去重（会误伤"同一被摄物体、
+    # 不同物理照片"这种必须能跨边界的合法案例），而是老实记下每一次
+    # false_positive 到底命中了库里哪一个 photo_id，让验收跑之后可以人工/
+    # 脚本核对该 photo_id 在 manifest 里的 ref_path 是不是这张留出图的另
+    # 一份编码——只是附加的可追溯信息，不改变 false_positive 计数口径。
+    false_positive_matches: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def false_positive_rate(self) -> float:
@@ -274,6 +283,7 @@ def evaluate_out_of_library(
     """
     false_positive = correct_rejection = 0
     latencies: list[float] = []
+    matches: list[tuple[str, str]] = []
 
     for qid, img in sorted(queries.items()):
         for query_img, _ in synth.generate(img, samples_per_ref, _ref_seed(seed, qid)):
@@ -283,6 +293,7 @@ def evaluate_out_of_library(
 
             if d.matched:
                 false_positive += 1
+                matches.append((qid, d.photo_id))
             else:
                 correct_rejection += 1
 
@@ -291,6 +302,7 @@ def evaluate_out_of_library(
         false_positive=false_positive,
         correct_rejection=correct_rejection,
         latencies_ms=latencies,
+        false_positive_matches=matches,
     )
 
 
@@ -306,9 +318,11 @@ def combine_out_of_library(metrics: list[OutOfLibraryMetrics]) -> OutOfLibraryMe
     false_positive = sum(m.false_positive for m in metrics)
     correct_rejection = sum(m.correct_rejection for m in metrics)
     latencies: list[float] = []
+    matches: list[tuple[str, str]] = []
     for m in metrics:
         latencies.extend(m.latencies_ms)
+        matches.extend(m.false_positive_matches)
     return OutOfLibraryMetrics(
         total=total, false_positive=false_positive, correct_rejection=correct_rejection,
-        latencies_ms=latencies,
+        latencies_ms=latencies, false_positive_matches=matches,
     )

@@ -195,6 +195,44 @@ def test_combine_out_of_library_sums_across_holdout_images():
     assert (c.total, c.false_positive, c.correct_rejection) == (10, 1, 9)
 
 
+# ---------------------------------------------------------------------------
+# 本轮修复追加：select_holdout 按内容哈希整组去留只堵住了字节完全相同的
+# 重复跨边界，堵不住"重新编码的近似重复"（哈希本身就不相等，没有哈希能
+# 查出来）。作为可追溯性的补救，evaluate_out_of_library 记录每次
+# false_positive 到底命中了库里哪个 photo_id，供验收跑之后人工/脚本核对
+# 是否其实是同一张照片的另一份编码——不改变 false_positive 的计数口径。
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_out_of_library_records_matched_photo_id_for_attribution(textured_image):
+    img = textured_image(seed=23, w=400, h=300)
+    rec = _FakeRecognizer([_hit("pX"), _miss()])
+    m = E.evaluate_out_of_library(rec, {"holdout-4": img}, samples_per_ref=4, seed=1)
+    assert m.false_positive == 2
+    assert m.false_positive_matches == [("holdout-4", "pX"), ("holdout-4", "pX")]
+
+
+def test_evaluate_out_of_library_records_no_matches_when_all_rejected(textured_image):
+    img = textured_image(seed=24, w=400, h=300)
+    rec = _FakeRecognizer([_miss()])
+    m = E.evaluate_out_of_library(rec, {"holdout-5": img}, samples_per_ref=3, seed=1)
+    assert m.false_positive == 0
+    assert m.false_positive_matches == []
+
+
+def test_combine_out_of_library_merges_false_positive_matches():
+    a = E.OutOfLibraryMetrics(
+        total=2, false_positive=1, correct_rejection=1,
+        false_positive_matches=[("qa", "pa")],
+    )
+    b = E.OutOfLibraryMetrics(
+        total=2, false_positive=1, correct_rejection=1,
+        false_positive_matches=[("qb", "pb")],
+    )
+    c = E.combine_out_of_library([a, b])
+    assert c.false_positive_matches == [("qa", "pa"), ("qb", "pb")]
+
+
 def test_metrics_oos_is_none_by_default_and_does_not_change_meets_baseline(textured_image):
     """0a/0b 的历史 Metrics 从未附带 oos——默认 None 时 meets_baseline 的
     行为必须和这个字段被加进来之前完全一样，不能追溯改写已经记录的结论。"""

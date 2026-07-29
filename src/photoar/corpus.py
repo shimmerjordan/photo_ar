@@ -148,19 +148,48 @@ def select_holdout(
     DescStoreWriter / 词汇树训练 / 倒排索引，否则它的内容早就以别的形式
     渗进了语料（比如被采样进词汇树训练集），"从未入库"这个前提就不成立了。
 
-    用 default_rng(seed).choice 做不放回抽样：给定同一个 seed，两次对
-    同一批 image_paths 调用必须选中同一批留出图（spec 明确要求的确定性），
-    这里先按路径排序再抽样，保证结果与调用方传入 image_paths 的原始顺序
-    无关（跟 build_corpus 自己对 image_paths 排序的做法一致）。
+    再审阅追加（本轮修复的 gap）：build_corpus 按内容哈希（_photo_id）去重
+    ——字节完全相同的重复照片只入库一次。如果这里按**单张照片**独立抽样，
+    一对字节完全相同的重复完全可能一份被抽进 holdout、另一份留在 library：
+    evaluate_out_of_library 拿着"holdout 那份"去查询，识别器如实认出它就是
+    library 里那份的内容，报 matched——这是"正确认出了一个重复"，却被库外
+    查询的分类规则无条件计成 false_positive（因为这张查询"理论上"不该在库
+    里）。真实照片目录（尤其是从 Wikimedia 之类来源按主题抓取、常见转载/
+    裁切重复）里这近乎必然发生，一旦发生，meets_baseline 会因为纯粹的数据
+    卫生问题（不是识别器的错）而在 0.1% 的库外误识别阈值上翻盘。
+    修复：先按 _photo_id（与 build_corpus 去重用的是同一个函数，不能另起
+    一套"同内容"的定义——两套定义一旦分叉，就是 Minor #23 那类指纹校验
+    分叉 bug 的同类重演）把候选照片分组，再以**整组**为单位决定去留，
+    保证同一份内容的所有拷贝永远同进同出，绝不会被切开。
+    这不会、也不能按"视觉相似"分组：几张不同的照片拍的是同一个物理对象
+    （同一地标的不同照片、同一场景的连拍）在这个项目里必须被当成互相独立
+    的库外候选——它们是不同的物理打印品，各自对应不同的视频，必须能够被
+    分别抽进 holdout 或 library。只有字节级完全相同才分进同一组。
 
-    返回 (library_paths, holdout_paths)；frac<=0 时 holdout_paths 恒为
-    空列表，library_paths 就是排序后的全量——这是默认行为，不留出任何图，
-    与这个特性存在之前完全等价。
+    holdout 的目标张数 n_holdout 仍然按"照片总数 x frac"算（与这个特性
+    最初的定义一致），但因为要素单位从"一张照片"变成"一组"，一旦语料里
+    存在重复，实际留出的照片数可能比 n_holdout 多（一组的最后一张把总数
+    带过线，仍然要整组留下，不能砍掉一半）——这是"整组同进同出"这条不
+    可退让的约束的直接代价，换来的是 holdout 集合不会再包含任何在 library
+    里也找得到的内容。
+
+    用 default_rng(seed).permutation 对分组做确定性洗牌：给定同一个 seed，
+    两次对同一批 image_paths 调用必须选中同一批留出组（spec 明确要求的
+    确定性）。组的排列顺序（group_list 的构造）只依赖路径本身的排序，与
+    内容哈希、dict 迭代顺序都无关，因此 permutation 的下标序列在同一个
+    seed 下总是作用在同一份有序 group_list 上，结果确定性不受影响。
+
+    返回 (library_paths, holdout_paths)；frac 恰好为 0 时 holdout_paths
+    恒为空列表，library_paths 就是排序后的全量——这是默认行为，不留出任何
+    图，与这个特性存在之前完全等价。负数 frac 是用法错误（跟 --limit 的
+    负数被显式拒绝一致），直接 raise，不会被静默当成"不留出"处理。
     """
     ordered = sorted(Path(p) for p in image_paths)
     n = len(ordered)
-    if frac <= 0:
+    if frac == 0:
         return ordered, []
+    if frac < 0:
+        raise ValueError(f"holdout frac 不能为负数，收到 {frac!r}")
     if not (0 < frac < 1):
         raise ValueError(f"holdout frac 必须在 (0, 1) 之间，收到 {frac!r}")
     n_holdout = max(1, round(n * frac))
@@ -169,10 +198,41 @@ def select_holdout(
             f"holdout frac={frac!r} 会把 {n} 张图全部留出（算出 {n_holdout} 张）："
             f"库里至少要留 1 张才能建语料，换一个更小的 frac 或提供更多照片"
         )
+
+    groups: dict[str, list[Path]] = {}
+    for p in ordered:
+        groups.setdefault(_photo_id(p), []).append(p)
+    # 分组顺序只由组内最小路径决定——与内容哈希值本身、dict 插入/迭代顺序
+    # 都无关，保证下面的 permutation 在同一个 seed 下总是作用在同一份序列
+    # 上（否则哈希值受 Python 层面无关因素影响时，"同 seed 同结果"这条
+    # spec 要求的确定性会被间接破坏）。
+    group_list = sorted(groups.values(), key=lambda g: g[0])
+
     rng = np.random.default_rng(seed)
-    holdout_idx = set(rng.choice(n, size=n_holdout, replace=False).tolist())
-    library = [p for i, p in enumerate(ordered) if i not in holdout_idx]
-    holdout = [ordered[i] for i in sorted(holdout_idx)]
+    holdout_group_idx: set[int] = set()
+    total = 0
+    for gi in rng.permutation(len(group_list)).tolist():
+        if total >= n_holdout:
+            break
+        holdout_group_idx.add(gi)
+        total += len(group_list[gi])
+
+    holdout = sorted(p for gi in holdout_group_idx for p in group_list[gi])
+    library = sorted(
+        p for gi, g in enumerate(group_list) if gi not in holdout_group_idx for p in g
+    )
+
+    if not library:
+        # 只有在重复极端密集时才可能发生：比如全部照片其实只有一种内容，
+        # 唯一一组一旦被选中，library 就被清空。整组去留的约束不允许"砍
+        # 掉一半"来凑出至少留 1 张，只能报错让调用方换更小的 frac 或检查
+        # 照片目录是不是重复度异常高。
+        raise ValueError(
+            f"holdout frac={frac!r} 加上重复照片必须整组去留，把全部 {len(ordered)} "
+            f"张图（{len(group_list)} 组不同内容）都留出了：库里至少要留 1 张才能"
+            f"建语料，换一个更小的 frac 或提供更多照片"
+        )
+
     return library, holdout
 
 

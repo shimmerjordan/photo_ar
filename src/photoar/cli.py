@@ -207,6 +207,20 @@ def _cmd_eval(args: argparse.Namespace) -> int:
             oos_line += f"（另有 {oos_unreadable} 张读取失败，已跳过）"
         print(oos_line)
     print(metrics.as_report())
+    if oos_metrics is not None and oos_metrics.false_positive_matches:
+        # 本轮修复（select_holdout 按内容哈希整组去留）追加：内容哈希去重
+        # 只堵住了字节完全相同的重复跨边界，堵不住"重新编码的近似重复"
+        # （同一张照片被压缩/裁切/转码成不同字节，哈希本身就不相等）。这里
+        # 不猜哪些是真误识别、哪些是数据卫生问题，只是把每次库外误识别
+        # 命中的库内 photo_id 报出来，供验收跑之后人工/脚本核对该 photo_id
+        # 在 manifest 里的 ref_path 是否其实是这张留出图的另一份编码。
+        print(
+            "库外误识别命中详情（qid=留出图路径 -> 命中的库内 photo_id；"
+            "供核对是否为重新编码的近似重复，而非真实误识别）：",
+            file=sys.stderr,
+        )
+        for qid, photo_id in oos_metrics.false_positive_matches:
+            print(f"  {qid} -> {photo_id}", file=sys.stderr)
     return 0 if metrics.meets_baseline else 1
 
 

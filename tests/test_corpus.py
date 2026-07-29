@@ -365,6 +365,48 @@ def test_select_holdout_rejects_frac_that_would_empty_the_library(photo_dir):
         select_holdout(paths, frac=1.0, seed=0)
 
 
+def test_select_holdout_rejects_negative_frac(photo_dir):
+    """本轮修复追加：frac<=0 原本被一刀切地当成"不留出"，负数因此会被
+    静默接受、悄悄退化成"不留出任何图"——跟 --limit 打错负号被显式拒绝
+    （M12，exit 2）的处理方式不一致，用户很可能是打错了负号却完全得不到
+    任何提示。0 仍然合法（默认值，语义明确是"不留出"），只有负数被拒绝。
+    """
+    _, paths = photo_dir
+    with pytest.raises(ValueError):
+        select_holdout(paths, frac=-0.1, seed=0)
+
+
+# ---------------------------------------------------------------------------
+# 本轮修复（最终整体审阅追加的 gap）：select_holdout 原来对每张照片独立
+# 抽样，完全不知道 build_corpus 会按内容哈希（_photo_id）去重。真实照片
+# 目录里字节完全相同的重复（同一张图被复制、多次下载）近乎必然出现——
+# 一旦一份被抽进 holdout、另一份留在 library，evaluate_out_of_library 会
+# 把"库外查询其实是库内某张的重复、被正确认出"错记成 false_positive，
+# meets_baseline 会因为纯粹的数据卫生问题在 0.1% 阈值上翻盘，而不是识别器
+# 真的变差了。修复：按 _photo_id 分组，整组一起决定去留。
+# ---------------------------------------------------------------------------
+
+
+def test_select_holdout_never_splits_byte_identical_duplicates_across_boundary(photo_dir):
+    d, paths = photo_dir
+    dup = d / "dup_of_first.jpg"
+    dup.write_bytes(paths[0].read_bytes())  # 与 paths[0] 字节完全相同
+    all_paths = paths + [dup]
+
+    for seed in range(30):
+        library, holdout = select_holdout(all_paths, frac=0.25, seed=seed)
+        first_in_holdout = paths[0] in holdout
+        dup_in_holdout = dup in holdout
+        assert first_in_holdout == dup_in_holdout, (
+            f"seed={seed}：字节完全相同的一对重复被分到了两边"
+            f"（paths[0] in holdout={first_in_holdout}, dup in holdout={dup_in_holdout}）"
+        )
+        # 反过来在 library 里也必须同进同出，不能其中一份在切分中丢失。
+        assert (paths[0] in library) == (dup in library)
+        assert set(library) | set(holdout) == set(all_paths)
+        assert set(library).isdisjoint(set(holdout))
+
+
 def test_build_corpus_never_ingests_holdout_photos(tmp_path, photo_dir):
     """端到端确认：select_holdout 切出的留出图确实一张都没有进 build_corpus
     的产物——manifest 里不会出现它们的 photo_id，desc.bin 的 slot 数也要
