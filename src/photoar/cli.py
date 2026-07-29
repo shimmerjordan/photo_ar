@@ -5,6 +5,9 @@
     photoar eval  --corpus <语料目录> [--samples 20] [--limit N] [--seed 1]
                   [--strict-latency]
 
+--limit N：库内参考图与库外留出图**各等间距抽样** N 张（见 `_strided`），
+图库规模不变。
+
 eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法或环境错误。
 退出码可直接被 CI 使用。
 
@@ -110,6 +113,29 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _strided(items: list, limit: int) -> list:
+    """按**等间距**抽 limit 个元素，而不是取前 limit 个。
+
+    `--limit` 的用途是在上万张语料上把 eval 的墙上时钟压回可接受范围
+    （实测 0.1-0.3 s/查询），但"取前 N 个"会让覆盖面完全由文件名排序决定。
+    Oxford5k 上实测过这个偏差有多严重：manifest 按路径排序，前 500 张只
+    落在 ashmolean/balliol/all_souls/bodleian 四个分组里，而语料里最大也
+    最自相似的 oxford(1502)/magdalen(685)/christ_church(543) 三组一张都
+    没覆盖到——那样量出来的是"四个地标的识别率"，不是这份语料的识别率，
+    而结果文档里只会写着"评估了 500 张"。
+
+    等间距抽样是确定性的（不需要 seed，同一份 manifest 必得同一个子集），
+    且按各分组的原始占比铺开。注意它只减少**被当作查询源的参考图**，图库
+    规模不变——粗排仍在全库竞争，所以限幅不会让识别任务变简单。
+    """
+    n = len(items)
+    if not limit or limit >= n:
+        return items
+    step = n / limit
+    # step >= 1，所以 int(i * step) 严格递增，不会取到重复元素。
+    return [items[int(i * step)] for i in range(limit)]
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     if args.limit < 0:
         # M12：--limit -5 若不拦，entries[:-5] 会被 Python 切片语义悄悄解释
@@ -137,7 +163,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         print(f"语料完整性校验失败：{exc}", file=sys.stderr)
         return 2
 
-    chosen = entries[: args.limit] if args.limit else entries
+    chosen = _strided(entries, args.limit)
 
     # C1：一次只解码一张参考图、调一次 evaluate()，而不是把 chosen 里的
     # 参考图全部 cv2.imread 进一个大 dict 再整体调用一次——后者在万张量级
@@ -170,7 +196,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     # 最常见的那种假阳性：用户拍了一张库里没有的东西。跟库内参考图（C1）
     # 同样的理由，一次只解码一张、调一次 evaluate_out_of_library()，不把
     # 留出图也整批摊进内存。
-    holdout_paths = load_holdout(args.corpus)
+    # --limit 同样约束库外这一层：原来它只截断库内参考图，留出集是**无上限**
+    # 遍历的。1 万张语料 + --holdout-frac 0.1 = 1000 张留出，配 --samples 10
+    # 就是 1 万次库外查询，即使 --limit 100 也照样跑满——限幅形同失效，而
+    # 用户以为自己已经限住了。
+    all_holdout = load_holdout(args.corpus)
+    n_holdout_total = len(all_holdout)
+    holdout_paths = _strided(all_holdout, args.limit)
     per_oos_metrics = []
     oos_unreadable = 0
     for p in holdout_paths:
@@ -197,12 +229,18 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     # 延迟的结果把退出码从 0 翻成 1。
     metrics = combine(per_ref_metrics, oos=oos_metrics, latency_gate=args.strict_latency)
     print(f"图库规模    {len(entries)}")
-    eval_line = f"评估参考图  {len(per_ref_metrics)}"
+    # 覆盖面必须自带分母：限幅跑出来的数字如果只写"评估参考图 500"，读者没法
+    # 分辨这是全量还是 4500 张里的 500 张，而结果文档要求写明覆盖了多少张。
+    eval_line = f"评估参考图  {len(per_ref_metrics)}/{len(entries)}"
+    if args.limit:
+        eval_line += f"（--limit {args.limit}，等间距抽样）"
     if unreadable:
         eval_line += f"（另有 {unreadable} 张参考图读取失败，已跳过）"
     print(eval_line)
     if holdout_paths:
-        oos_line = f"库外查询图  {len(per_oos_metrics)}"
+        oos_line = f"库外查询图  {len(per_oos_metrics)}/{n_holdout_total}"
+        if args.limit:
+            oos_line += f"（--limit {args.limit}，等间距抽样）"
         if oos_unreadable:
             oos_line += f"（另有 {oos_unreadable} 张读取失败，已跳过）"
         print(oos_line)
@@ -250,7 +288,12 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("eval", help="用合成查询图评估识别率")
     e.add_argument("--corpus", required=True)
     e.add_argument("--samples", type=int, default=20)
-    e.add_argument("--limit", type=int, default=0, help="只评估前 N 张，0 = 全部")
+    e.add_argument(
+        "--limit", type=int, default=0,
+        help="库内参考图与库外留出图各**等间距抽样** N 张来评估（不是取前 N 张，"
+             "否则覆盖面由文件名排序决定），0 = 全部。图库规模不变，粗排仍在"
+             "全库竞争",
+    )
     e.add_argument("--seed", type=int, default=1)
     e.add_argument(
         "--strict-latency", action="store_true",

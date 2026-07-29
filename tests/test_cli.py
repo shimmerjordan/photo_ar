@@ -129,6 +129,87 @@ def test_eval_streams_ref_images_one_at_a_time(tmp_path, photo_dir, capsys, monk
     assert rc in (0, 1)
 
 
+class TestStridedLimit:
+    """`--limit` 必须**等间距抽样**，不能取前 N 张。
+
+    旧实现是 `entries[: args.limit]`，覆盖面完全由 manifest 的路径排序决定。
+    在 Oxford5k 上实测过后果：前 500 张只落在 ashmolean/balliol/all_souls/
+    bodleian 四个分组，而最大也最自相似的 oxford(1502)/magdalen(685)/
+    christ_church(543) 一张都没覆盖到——量出来的是"四个地标的识别率"，而
+    结果文档里只会写着"评估了 500 张"。
+    """
+
+    def test_spreads_across_the_whole_list(self):
+        from photoar.cli import _strided
+
+        items = list(range(100))
+        assert _strided(items, 5) == [0, 20, 40, 60, 80], (
+            "必须铺满整个列表；取前 N 张会得到 [0, 1, 2, 3, 4]"
+        )
+
+    def test_returns_exactly_limit_items_without_duplicates(self):
+        from photoar.cli import _strided
+
+        for n, limit in [(100, 7), (5063, 500), (11, 10), (10, 10)]:
+            got = _strided(list(range(n)), limit)
+            assert len(got) == limit, f"n={n} limit={limit} 抽到 {len(got)} 个"
+            assert len(set(got)) == limit, f"n={n} limit={limit} 抽到了重复元素"
+            assert got == sorted(got), "必须保持原顺序"
+
+    def test_limit_zero_or_oversized_returns_everything(self):
+        from photoar.cli import _strided
+
+        items = list(range(10))
+        assert _strided(items, 0) == items
+        assert _strided(items, 10) == items
+        assert _strided(items, 99) == items
+
+    def test_limit_also_bounds_the_holdout_loop(self, tmp_path, photo_dir, capsys,
+                                                monkeypatch):
+        """--limit 原来只截断库内参考图，留出集是无上限遍历的：1 万张语料
+        + --holdout-frac 0.1 + --samples 10 就是 1 万次库外查询照样跑满，
+        限幅形同失效。用 spy 数 evaluate_out_of_library() 被调了几次——每张
+        留出图恰好一次（流式，见 C1），所以调用次数就是覆盖的留出图张数。"""
+        import photoar.cli as cli_mod
+
+        corpus = tmp_path / "corpus"
+        main(["build", "--photos", str(photo_dir), "--out", str(corpus),
+              "--holdout-frac", "0.3"])
+        capsys.readouterr()
+
+        n_holdout = len(cli_mod.load_holdout(corpus))
+        assert n_holdout >= 2, f"这个前提得成立才测得出限幅：留出 {n_holdout} 张"
+
+        real = cli_mod.evaluate_out_of_library
+        calls = []
+
+        def spy(rec, refs, **kwargs):
+            calls.append(len(refs))
+            return real(rec, refs, **kwargs)
+
+        monkeypatch.setattr(cli_mod, "evaluate_out_of_library", spy)
+
+        main(["eval", "--corpus", str(corpus), "--samples", "2", "--limit", "1"])
+        assert len(calls) == 1, (
+            f"--limit 1 时库外查询只该覆盖 1 张留出图，实际覆盖 {len(calls)} 张"
+            f"（共 {n_holdout} 张）"
+        )
+
+    def test_report_prints_coverage_denominator(self, tmp_path, photo_dir, capsys):
+        """限幅跑出来的数字只写"评估参考图 500"，读者没法分辨是全量还是
+        4500 张里的 500 张，而结果文档要求写明覆盖面。"""
+        corpus = tmp_path / "corpus"
+        main(["build", "--photos", str(photo_dir), "--out", str(corpus),
+              "--holdout-frac", "0.3"])
+        capsys.readouterr()
+
+        main(["eval", "--corpus", str(corpus), "--samples", "2", "--limit", "1"])
+        out = capsys.readouterr().out
+        assert "评估参考图  1/" in out, f"缺少覆盖面分母：\n{out}"
+        assert "库外查询图  1/" in out, f"库外也要带分母：\n{out}"
+        assert "等间距抽样" in out, "限幅时要说明抽样方式，否则读者会以为是前 N 张"
+
+
 def test_eval_rejects_negative_limit(tmp_path, photo_dir, capsys):
     """M12：--limit -5 目前会被 Python 切片语义悄悄解释成 entries[:-5]
     （从末尾截断），而不是"负数是非法输入"。这在 --limit 打字打错负号时会
