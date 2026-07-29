@@ -123,3 +123,32 @@ def test_train_on_real_orb_descriptors(textured_image):
     words = voc.words_of(descs)
     # 真实 ORB 描述子应铺开到多个词上，而不是全挤进一个
     assert len(np.unique(words)) >= 20
+
+
+def test_default_branching_and_depth_are_the_measured_sweet_spot():
+    """BRANCHING=16, DEPTH=4 不是随手取的常量，是里程碑 0b 扫了 8 个配置后测出来的。
+
+    1000 张库 / 500 个共用查询图上，R@20 随词表变细单调上升（216 词 83.00% 一路到
+    57850 词 97.60%），但不是词数决定论：10/5（60135 词）与 16/4（57850 词）词数
+    几乎相同，R@20 却差 1.6pp（96.00% vs 97.60%）——因为每一层都是一次走错分支的
+    机会，层数越少越好，所以调参应该先提 BRANCHING 再考虑 DEPTH。这里钉住这两个
+    默认值，防止以后有人"顺手"把 BRANCHING 改回 10 或者把 DEPTH 调大。
+    """
+    assert V.BRANCHING == 16
+    assert V.DEPTH == 4
+
+
+def test_train_on_small_corpus_stops_early_without_crashing(textured_image):
+    """BRANCHING=16 时，小训练集撑不满 4 层：12 张图约 3600 个描述子，
+    第 1 层每簇约 225 个，第 2 层约 14 个，第 3 层已经低于 MIN_DESC_PER_NODE=8，
+    树会提前停止分裂，n_words 应该远低于理论上限 16**4=65536。Task 11 的语料测试
+    用的就是这种规模的训练集，这里确认 train() 在小语料下优雅退化：不崩溃、
+    词表非空、words_of 返回的 id 始终落在 [0, n_words) 内。
+    """
+    descs = np.vstack([F.extract(textured_image(seed=s)).desc for s in range(12)])
+    voc = V.train(descs, seed=0)  # 用模块默认值 BRANCHING=16, DEPTH=4
+    assert voc.n_words > 0
+    assert voc.n_words < 16**4
+    words = voc.words_of(descs)
+    assert words.min() >= 0
+    assert words.max() < voc.n_words
