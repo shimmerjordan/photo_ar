@@ -45,6 +45,15 @@ class TwoStageRecognizer:
         return [self._ids[d] for d in self._coarse(img_bgr)]
 
     def recognize(self, img_bgr: np.ndarray) -> Decision:
+        # Minor #16：这里没有调用 self._coarse(img_bgr) 再另外拿 query，
+        # 而是重复了 _coarse 里 extract+words_of+index.query 这三行——是
+        # 故意的，不是没注意到重复。recognize() 精排阶段（下面的
+        # verify_pair）需要 query 这个 Features 对象本身（关键点+描述子），
+        # _coarse() 只返回 candidates 的 doc 下标列表，不保留 query。如果
+        # 这里改成先调 self._coarse(img_bgr) 拿候选、再为了拿 query 单独
+        # 调一次 extract(img_bgr)，就会在识别热路径上把最贵的一步
+        # （ORB 特征提取，见 features.extract）跑两遍。DRY clean-up 的
+        # 直觉在这里是错的，动之前先看这条注释。
         query = extract(img_bgr)
         words = self._vocab.words_of(query.desc)
         docs = [doc for doc, _ in self._index.query(words, self._top_k)]
