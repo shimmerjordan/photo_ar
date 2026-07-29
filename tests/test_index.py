@@ -135,6 +135,30 @@ def test_query_rejects_positive_out_of_range_word():
         idx.query(np.array([999], np.int32), top_k=5)
 
 
+def test_idf_property_matches_ubiquitous_word_zero():
+    """I3：idf 属性要暴露给调用方（corpus._verify_self_query）用来判断
+    "这篇文档是不是全部由 ubiquitous 词组成"——词 0 出现在全部 3 篇文档里
+    （df == n_docs），idf 必须恰好是 0。"""
+    idx = _build([[0, 1], [0, 2], [0, 3]], n_words=10)
+    assert idx.idf[0] == 0.0
+    assert idx.idf[1] > 0.0
+
+
+def test_unretrievable_docs_reports_docs_dropped_from_postings():
+    """I3：一篇文档如果全部的词都是 ubiquitous 词（df == n_docs），build()
+    算出的 tf-idf 范数是 0，会被整体排除在倒排表之外——unretrievable_docs()
+    必须能报出这类文档，而不是让它们在 n_docs 里悄悄消失。"""
+    # doc 0 只有词 0（3 篇文档共有，df=3=n_docs，idf=0，范数 0，被跳过）
+    # doc 1、doc 2 各自还有一个非共享词，不会被跳过
+    idx = _build([[0], [0, 1], [0, 2]], n_words=10)
+    assert idx.unretrievable_docs() == [0]
+
+
+def test_unretrievable_docs_empty_when_every_doc_has_a_distinguishing_word():
+    idx = _build([[0, 1], [0, 2], [0, 3]], n_words=10)
+    assert idx.unretrievable_docs() == []
+
+
 def test_query_rejects_negative_word_id():
     """负数词 id 若不校验，numpy 会用负索引悄悄绕过：self._idf[w] 在 w=-1 时
     取到最后一个词的 idf；切片端点 self._offsets[w] 与 self._offsets[w + 1]

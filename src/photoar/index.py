@@ -87,6 +87,32 @@ class InvertedIndex:
     def n_docs(self) -> int:
         return self._n_docs
 
+    @property
+    def idf(self) -> np.ndarray:
+        """每个词的 idf 权重（只读，长度 n_words）。
+
+        idf[w] == 0 当且仅当词 w 是"全库共享词"（df == n_docs，
+        log(n_docs/df) == log(1) == 0）。一篇文档如果全部的词都是这种
+        ubiquitous 词，build() 里算出的 tf-idf 范数就是 0，整篇文档会被
+        合法地排除在倒排表之外（见 I3）——调用方用这个属性判断"某篇文档
+        是否属于这种情况"，从而区分"语料退化，本来就检索不到"与"索引顺序
+        被打乱"。
+        """
+        return self._idf
+
+    def unretrievable_docs(self) -> list[int]:
+        """返回哪些 doc 下标从未出现在倒排表任何 postings 里。
+
+        这些文档的所有词 idf 都是 0（ubiquitous），build() 阶段 tf-idf
+        范数为 0 而被整体跳过，因此无法通过任何词被检索到——但 n_docs
+        仍然把它们计入总数。n_docs=1 是最极端的情形：唯一的文档里每个词
+        的 df 都等于 n_docs(=1)，所以它必然在这里面。供 build_corpus /
+        load_corpus 报告"这份语料里有多少张照片实际上不可被检索"，而不是
+        让它们悄无声息地消失（见 I3）。
+        """
+        present = {int(d) for d in self._doc_ids}
+        return [d for d in range(self._n_docs) if d not in present]
+
     def query(self, words: np.ndarray, top_k: int) -> list[tuple[int, float]]:
         n_words = self._idf.shape[0]
         if words.size and (int(words.min()) < 0 or int(words.max()) >= n_words):

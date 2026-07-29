@@ -17,6 +17,7 @@ manifest 里 photos 的顺序就是描述子库 slot 下标与倒排索引 doc �
 
 import hashlib
 import json
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -39,6 +40,19 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 # 代码）可以覆盖它；如果 0d 的照片是别的尺寸打印的，必须显式传入真实值，
 # 否则烘进 .imgdb 的物理宽度会是错的。
 DEFAULT_PRINT_WIDTH_M = 0.152
+
+# 词汇树训练用的描述子数量上限。vocab.train 的 k-majority 在根层每次迭代
+# 都要物化 (N, BRANCHING, 32) 的中间数组，实测端到端峰值 RSS 随训练描述子
+# 数 N 线性增长、约 1.66 KB/描述子（50k -> 142.6MB，150k -> 308.7MB，
+# 300k -> 554.9MB，见 final-fix-wave1-report.md 的 C2 测量）。1 万张照片 x
+# N_FEATURES(300) = 300 万描述子若不设上限会把这一步撑到约 5GB，是 0d 第一次
+# 真实入库最容易撞上的 OOM 点。这个数值故意与 measure-0b.py 独立定义的同名
+# TRAIN_DESC_CAP 一致——那不是巧合，是同一个真实内存约束，此前只在测量脚本
+# 里躲开、产品代码里没有，是"0b 的数字不是产品这棵树量出来的"这条已知缺口；
+# 这里把上限搬进 build_corpus，缺口即告闭合。超过上限时用 default_rng(seed)
+# 做不放回抽样：词袋检索的词表本来就只需要能代表描述子的分布，不需要看到
+# 每一个描述子，抽样训练是标准做法。
+TRAIN_DESC_CAP = 120_000
 
 # manifest.json 的 schema 版本。v1 -> v2：PhotoEntry 新增 desc_sha256 字段
 # （描述子指纹，供 load_corpus 的 _verify_desc_fingerprints 校验描述子库
@@ -126,15 +140,44 @@ def build_corpus(
 
     entries: list[PhotoEntry] = []
     feats = []
+    seen_ids: set[str] = set()
+    # I7：每个跳过原因都要能数出来、报出来——旧代码只有 quality_too_low 这
+    # 一种会被"悄悄 continue"，unreadable/zero_feature 更是从来没人数过；
+    # CLI 原来只打印"入库 N 张"，用户没法知道 1 万张变成 9800 张是质量分
+    # 不够、图片本身读不出来、还是重复照片，0d 的 correct_rate 也会被这种
+    # "分母悄悄变小却没人知道"污染。
+    skip_counts = {
+        "unreadable": 0,
+        "zero_feature": 0,
+        "duplicate": 0,
+        "quality_too_low": 0,
+        "invalid_listing": 0,
+    }
     for path in sorted(Path(p) for p in image_paths):
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
+            skip_counts["unreadable"] += 1
             continue
         f = extract(img)
         if len(f) == 0:
+            skip_counts["zero_feature"] += 1
             continue
 
         photo_id = _photo_id(path)
+        if photo_id in seen_ids:
+            # I9：按内容哈希去重。字节完全相同的重复照片如果都入库，desc.bin
+            # 会出现两个内容一模一样的 slot：两者互为最近邻，RATIO 判定
+            # （第一名内点数 >= RATIO * 第二名）永远无法分出胜负，两份都会
+            # 被判 ambiguous——安全方向（不会误识别），但等于两张都永久
+            # 漏检，还会让 manifest 出现重复 id、.imgdb 被写两次到同一路径。
+            # 只对"已经成功入库的照片"去重（seen_ids 只在成功 append 后才
+            # 添加，见下方）：如果第一次出现本身就没通过下面的质量分/清单
+            # 格式校验，后续字节相同的重复照片仍会各自重新走一遍这些校验
+            # （结果必然相同，因为内容相同——冗余但不是错误），不会被误记成
+            # "重复"而掩盖真实的拒绝原因。
+            skip_counts["duplicate"] += 1
+            continue
+
         score, imgdb_bytes = -1, 0
         if arcoreimg is not None:
             try:
@@ -146,8 +189,20 @@ def build_corpus(
                     arcoreimg=arcoreimg,
                 )
             except Q.QualityTooLow:
+                skip_counts["quality_too_low"] += 1
+                continue
+            except Q.InvalidListingField:
+                # I5：文件名/路径含 '|' 或换行，与 ASCII 字符集无关（已实测
+                # 推翻"只支持 ASCII"这个旧假设）。这类照片单张跳过、记录
+                # 原因，而不是让 build_single_target_db 的 ValueError 一路
+                # 冒泡出 build_corpus，让整个入库中止在半途——中文文件名在
+                # 真实照片目录里近乎必然出现，之前会被这条路径误伤（虽然
+                # 中文本身现在已经不再触发这个异常，含字面 '|' 的路径仍然
+                # 会）。
+                skip_counts["invalid_listing"] += 1
                 continue
 
+        seen_ids.add(photo_id)
         feats.append(f)
         entries.append(
             PhotoEntry(
@@ -159,20 +214,32 @@ def build_corpus(
             )
         )
 
+    _warn_skips(skip_counts)
+
     if not entries:
-        raise ValueError("没有任何图片通过入库（可能全部不可读或质量分不达标）")
+        detail = _skip_summary(skip_counts)
+        suffix = f"（{detail}）" if detail else "（可能全部不可读或质量分不达标）"
+        raise ValueError(f"没有任何图片通过入库{suffix}")
 
     with DescStoreWriter(paths.desc, capacity=len(feats)) as w:
         for f in feats:
             w.append(f)
 
-    voc = V.train(np.vstack([f.desc for f in feats]), seed=seed)
+    all_desc = np.vstack([f.desc for f in feats])
+    train_desc = all_desc
+    if train_desc.shape[0] > TRAIN_DESC_CAP:
+        rng = np.random.default_rng(seed)
+        sample = rng.choice(train_desc.shape[0], size=TRAIN_DESC_CAP, replace=False)
+        train_desc = train_desc[sample]
+    voc = V.train(train_desc, seed=seed)
     voc.save(paths.vocab)
 
     builder = InvertedIndexBuilder(voc.n_words)
     for f in feats:
         builder.add(voc.words_of(f.desc))
-    builder.build().save(paths.index)
+    idx = builder.build()
+    idx.save(paths.index)
+    _warn_unretrievable(idx.unretrievable_docs(), entries, action="入库")
 
     paths.manifest.write_text(
         json.dumps(
@@ -182,6 +249,60 @@ def build_corpus(
         )
     )
     return entries
+
+
+_SKIP_REASON_LABELS = {
+    "unreadable": "读不出来（不是有效图片）",
+    "zero_feature": "提取不到 ORB 特征点",
+    "duplicate": "内容与已入库的另一张完全重复（按内容哈希去重）",
+    "quality_too_low": "arcoreimg 质量分不达标",
+    "invalid_listing": "文件名/路径含清单分隔符 '|' 或换行",
+}
+
+
+def _skip_summary(skip_counts: dict[str, int]) -> str:
+    """把逐原因的跳过计数拼成一行人类可读摘要；没有任何跳过时返回空串。"""
+    parts = [
+        f"{_SKIP_REASON_LABELS[reason]} {count} 张"
+        for reason, count in skip_counts.items()
+        if count
+    ]
+    return "；".join(parts)
+
+
+def _warn_skips(skip_counts: dict[str, int]) -> None:
+    """I7：把每张未入库照片的跳过原因报出来，而不是只让"入库 N 张"这一个
+    数字掩盖掉分母是怎么变小的——不知道 1 万张变成 9800 张是质量分不够、
+    读不出来还是重复照片，0d 的 correct_rate 就没法正确解读。"""
+    total = sum(skip_counts.values())
+    if not total:
+        return
+    print(
+        f"警告：{total} 张照片未入库 —— {_skip_summary(skip_counts)}",
+        file=sys.stderr,
+    )
+
+
+def _warn_unretrievable(
+    unretrievable: list[int], entries: list["PhotoEntry"], action: str
+) -> None:
+    """I3：把"哪些照片的全部特征词都是全局共享词、因而永远无法被检索命中"
+    报出来，而不是让它们在 n_docs / len(entries) 里悄悄消失。
+
+    这不是错误（语料本身没有损坏，_verify_self_query 会正确地跳过对它们
+    的自查），只是一个用户应该知道的退化信号：常见原因是语料规模太小
+    （n_docs=1 时唯一那篇文档必然触发）或者内容高度重复/雷同。
+    """
+    if not unretrievable:
+        return
+    ids_preview = "、".join(entries[d].photo_id for d in unretrievable[:5])
+    more = f" 等共 {len(unretrievable)} 张" if len(unretrievable) > 5 else ""
+    print(
+        f"警告：{action}的照片里有 {len(unretrievable)} 张的全部特征词都是"
+        f"全局共享词（idf=0），无法被检索命中，但仍计入图库规模：{ids_preview}"
+        f"{more}。常见原因是语料规模太小（比如只有 1 张）或内容高度重复/雷同。",
+        file=sys.stderr,
+    )
 
 
 def _verify_desc_fingerprints(store: DescStore, entries: list["PhotoEntry"]) -> None:
@@ -217,6 +338,7 @@ def _verify_self_query(
     store: DescStore,
     entries: list["PhotoEntry"],
     top_k: int = TOP_K,
+    unretrievable: frozenset[int] = frozenset(),
 ) -> None:
     """抽样验证倒排索引的 doc 下标顺序与 manifest / 描述子库一致。
 
@@ -239,18 +361,29 @@ def _verify_self_query(
       - n_docs=1000 时 k=20（不受收缩影响，因为 20 <= 500），单次约
         98%，几乎必然检测到。
       - n_docs=2 时 k=1，要求排第一；打乱后另一篇文档会排第一，能测到。
-      - n_docs=1 时语料本身没法被"打乱"，恒过是对的。
       - 旧版本 k 恒为 top_k(20)，n_docs<=20 时检测概率恒为 0%。
 
     这仍然是概率性检测，不是保证；用 5 个均匀分布的采样点是为了把单次
     检测的偶然失败（比如某张照片恰好是识别难例）平均掉，同时保持对
     "整体错位"这种粗暴故障的高检出率。零特征的照片直接跳过，不能既
     没有词又要求命中自己。
+
+    unretrievable 是 index.unretrievable_docs() 算出的、"全部词都是全局
+    共享词（idf=0）、tf-idf 范数为 0、build() 时被整体排除在倒排表之外"
+    的文档下标集合（I3）。这类文档天生不会出现在任何候选列表里——
+    index.query 对着一个 qnorm=0 的查询直接返回空列表——继续对它们做自查
+    只会制造 100% 必然触发的假阳性，而不是检测真实的顺序错位。旧代码这里
+    曾经错误地断言"n_docs=1 时语料本身没法被打乱，恒过是对的"：实测结果
+    是恒炸，不是恒过（唯一文档的每个词 df 必然等于 n_docs=1，必然触发这
+    个情况）。跳过这些下标，而不是跳过"n_docs 很小"这整类语料——n_docs=2
+    时如果两篇文档有各自的独有词，顺序打乱依然能被正确测到。
     """
     n_docs = len(entries)
     k = max(1, min(top_k, n_docs // 2))
     slots = _self_query_sample_slots(n_docs)
     for slot in slots:
+        if slot in unretrievable:
+            continue
         features = store.read(slot)
         if len(features) == 0:
             continue
@@ -286,9 +419,32 @@ def load_corpus(root: str | Path) -> tuple[TwoStageRecognizer, list[PhotoEntry]]
     idx = InvertedIndex.load(paths.index)
     store = DescStore(paths.desc)
 
+    # I4：三者数量的前置校验必须在指纹校验循环之前做。desc.bin 被截断
+    # （比如少了整数个 slot）时，仍然满足"文件大小是 SLOT_STRIDE 的整数
+    # 倍"，DescStore 不会报错，但 len(store) 会比 manifest/index 记的数量
+    # 少。_verify_desc_fingerprints 是按 enumerate(entries) 的下标去读
+    # store 的，如果不先在这里挡住，读到越界下标时 DescStore.read 会抛出
+    # 未捕获的 IndexError（不是 CorpusIntegrityError），让调用方
+    # （cli._cmd_eval）的 traceback 以 Python 默认退出码 1 结束——违反了
+    # "语料损坏归 2，不是 1"的退出码约定。TwoStageRecognizer.__init__ 本来
+    # 就会检查这三者长度相等，但它在这之后才构造，救不了指纹校验这一步。
+    if not (len(store) == len(entries) == idx.n_docs):
+        raise CorpusIntegrityError(
+            f"语料三者数量不一致：manifest {len(entries)} 条、描述子库 "
+            f"{len(store)} slot、倒排索引 {idx.n_docs} 个 doc。这通常意味着"
+            f"某个产物文件被截断或被部分覆盖，需要用当前版本重新 build_corpus。"
+        )
+
     # 顺序完整性校验：manifest 的顺序必须真的等于 slot 顺序（指纹）与
     # doc 顺序（自查），否则宁可在启动时报错，也不要在线上悄悄认错人。
     _verify_desc_fingerprints(store, entries)
+
+    # I3：先算出"哪些文档的全部词都是全局共享词、天生检索不到"，报出来
+    # （不是错误，是退化信号），并把同一份结果喂给 _verify_self_query 当
+    # 豁免名单——它们必然不会出现在任何查询候选里，继续对它们做自查只会
+    # 制造 100% 必然触发的假阳性，见 _verify_self_query 的文档。
+    unretrievable = idx.unretrievable_docs()
+    _warn_unretrievable(unretrievable, entries, action="加载")
 
     rec = TwoStageRecognizer(
         vocab=voc,
@@ -297,6 +453,6 @@ def load_corpus(root: str | Path) -> tuple[TwoStageRecognizer, list[PhotoEntry]]
         photo_ids=[e.photo_id for e in entries],
     )
 
-    _verify_self_query(voc, idx, store, entries)
+    _verify_self_query(voc, idx, store, entries, unretrievable=frozenset(unretrievable))
 
     return rec, entries

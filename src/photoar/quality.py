@@ -19,7 +19,18 @@
       --input_images_directory:  all images under it are used
       --output_db_path:          output database file path
 
-只支持 PNG/JPEG，且文件名与目标名只支持 ASCII 字符。
+只支持 PNG/JPEG。
+
+清单行格式是"名称|绝对路径|宽度"，用 '|' 分隔，所以名称与路径都不能含
+'|' 或换行，否则会把一行拆成错误的列数。这是清单格式本身的约束，与字符
+集无关——之前这里错误地记录过"文件名与目标名只支持 ASCII 字符"，已用
+tools/arcoreimg（版本 1.2）实测推翻（final-fix-wave1-report.md 的 I5
+测量）：中文目标名、中文文件名、中文父目录，build-db 与 eval-img 都正常
+返回 0 并产出有效结果；只有路径或名称本身含字面 '|' 才会让 arcoreimg 报
+"Invalid line format"。真实照片目录里中文文件名近乎必然出现，这条错误
+记录曾经让 build_corpus 对着一张中文文件名照片直接判错误诊断并中止整个
+入库（I5）。
+
 质量分低于 MIN_QUALITY_SCORE 的照片在入库阶段就拒绝——留到扫不出来
 才发现的代价高得多。
 """
@@ -38,6 +49,16 @@ _SCORE_RE = re.compile(r"(\d{1,3})")
 
 class ArcoreimgMissing(RuntimeError):
     pass
+
+
+class InvalidListingField(ValueError):
+    """目标名或图片路径含清单分隔符 '|' 或换行，会把清单行拆成错误的列数。
+
+    与字符集无关（非 ASCII 字符本身没问题，见模块 docstring 的实测记录），
+    只有字面的 '|' 或 '\\n' 会破坏"名称|绝对路径|宽度"这个格式。build_corpus
+    像对待 QualityTooLow 一样对待这个异常：跳过这一张、记录原因，不中止
+    整个入库（见 I5/I7）。
+    """
 
 
 class QualityTooLow(ValueError):
@@ -94,24 +115,37 @@ def build_single_target_db(
     addImage(name, bitmap, widthInMeters) 传一遍——库里已经带着它了。
 
     实测：单目标 .imgdb 约 4.2-4.4 KB（见 phase0-results.md 里程碑 0c）。
+
+    I5：目标名与图片路径都不要求 ASCII——实测 tools/arcoreimg（版本 1.2）
+    对中文目标名、中文文件名、中文父目录均正常返回 0 并产出有效 .imgdb，
+    真正会破坏清单格式的只有字面 '|' 或换行（清单以 '|' 分隔列）。这里对
+    "名称"和"绝对路径整体"（不只是 basename——路径写进清单的是完整绝对
+    路径，父目录里如果含 '|' 同样会破坏格式）都做这个检查。
     """
-    if not name.isascii():
-        raise ValueError(f"arcoreimg 只支持 ASCII 目标名，收到 {name!r}")
     if "|" in name or "\n" in name:
-        raise ValueError(f"目标名不能含 '|' 或换行（清单以 '|' 分隔），收到 {name!r}")
+        raise InvalidListingField(
+            f"目标名不能含 '|' 或换行（清单以 '|' 分隔），收到 {name!r}"
+        )
     if not print_width_m > 0:
         raise ValueError(f"打印物理宽度必须为正数（米），收到 {print_width_m!r}")
 
     image_path = Path(image_path).resolve()  # 清单要求绝对路径
     out_path = Path(out_path)
-    if not image_path.name.isascii():
-        raise ValueError(f"arcoreimg 只支持 ASCII 文件名，收到 {image_path.name!r}")
+    path_str = str(image_path)
+    if "|" in path_str or "\n" in path_str:
+        raise InvalidListingField(
+            f"图片路径不能含 '|' 或换行（清单以 '|' 分隔），收到 {path_str!r}"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 清单文件是临时产物，不留在用户目录里
     with tempfile.TemporaryDirectory() as tmp:
         listing = Path(tmp) / "targets.txt"
-        listing.write_text(f"{name}|{image_path}|{print_width_m:.6f}\n")
+        # 显式指定 utf-8：name/image_path 现在允许非 ASCII 字符（I5），不能
+        # 依赖进程 locale 的默认编码。
+        listing.write_text(
+            f"{name}|{image_path}|{print_width_m:.6f}\n", encoding="utf-8"
+        )
         _run(
             arcoreimg,
             [

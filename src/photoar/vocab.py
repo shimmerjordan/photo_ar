@@ -49,7 +49,18 @@ def hamming_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if a.shape[0] == 0 or b.shape[0] == 0:
         return np.zeros((a.shape[0], b.shape[0]), np.uint16)
     xor = np.bitwise_xor(a[:, None, :], b[None, :, :])
-    return _POPCOUNT[xor].sum(axis=2).astype(np.uint16)
+    # dtype=np.uint16 明确指定累加类型：不指定时 numpy 对 uint16 数组 .sum()
+    # 默认按平台 int（这里是 int64）累加，这一步的输出数组从 (N,M) uint16
+    # 撑成 (N,M) int64（4 倍）。这个数组比 _POPCOUNT[xor] 那个 (N,M,32)
+    # 的中间数组小 32 倍，所以对整体峰值 RSS 的实测收益不大：单独跑
+    # hamming_matrix(N=300000,M=16) 从 544MB 降到 517MB，约 5%；跑完整的
+    # vocab.train() 端到端峰值在 50k/150k/300k 描述子上分别从 142.6/308.7/
+    # 554.9MB 降到 137.0/290.7/521.6MB，约 4-6%（测量见
+    # final-fix-wave1-report.md 的 C2/M10 章节）——比最初预估的"~25%"小
+    # 得多，但仍是确定的净收益且没有任何下行代价。单个 popcount 最大 256
+    # （32 字节 * 8 bit），M<=16（BRANCHING）时逐行求和最大 256*16=4096，
+    # uint16（上限 65535）绰绰有余，不会溢出。
+    return _POPCOUNT[xor].sum(axis=2, dtype=np.uint16)
 
 
 def _majority(descs: np.ndarray) -> np.ndarray:

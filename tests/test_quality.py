@@ -1,71 +1,13 @@
-import os
-import stat
-import textwrap
-
 import cv2
 import numpy as np
 import pytest
 
 from photoar import quality as Q
 
-
-@pytest.fixture
-def fake_arcoreimg(tmp_path):
-    """造一个假的 arcoreimg，让测试不依赖真实二进制。
-
-    行为：eval-img 打印固定分数；build-db 写出一个固定大小的文件。
-    """
-
-    def _make(score: int = 85, db_bytes: int = 4_300, exit_code: int = 0):
-        script = tmp_path / "arcoreimg"
-        script.write_text(
-            textwrap.dedent(f"""\
-            #!/usr/bin/env python3
-            # 模拟真实 arcoreimg 的接口（已实测，见计划 Task 9 Step 1）：
-            #   eval-img --input_image_path=<path>        -> 打印裸数字
-            #   build-db --input_image_list_path=<file> --output_db_path=<file>
-            # 清单文件每行: 名称|绝对路径|物理宽度(米)
-            import sys, pathlib
-            argv = sys.argv[1:]
-            if {exit_code} != 0:
-                sys.stderr.write("boom\\n"); sys.exit({exit_code})
-
-            def opt(prefix):
-                for i, a in enumerate(argv):
-                    if a.startswith(prefix):
-                        return a.split("=", 1)[1] if "=" in a else argv[i + 1]
-                return None
-
-            if argv and argv[0] == "eval-img":
-                if not opt("--input_image_path"):
-                    sys.stderr.write("missing --input_image_path\\n"); sys.exit(2)
-                print({score})
-                sys.exit(0)
-
-            if argv and argv[0] == "build-db":
-                listing = opt("--input_image_list_path")
-                out = opt("--output_db_path")
-                if not listing or not out:
-                    sys.stderr.write("missing required option\\n"); sys.exit(2)
-                # 真实工具会因清单格式错误而失败；这里也校验，否则测试测不到格式
-                for line in pathlib.Path(listing).read_text().splitlines():
-                    if not line.strip():
-                        continue
-                    parts = line.split("|")
-                    if len(parts) not in (2, 3):
-                        sys.stderr.write(f"bad list line: {{line}}\\n"); sys.exit(2)
-                    if not pathlib.Path(parts[1]).is_absolute():
-                        sys.stderr.write(f"path not absolute: {{parts[1]}}\\n"); sys.exit(2)
-                pathlib.Path(out).write_bytes(b"X" * {db_bytes})
-                sys.exit(0)
-
-            sys.exit(2)
-            """)
-        )
-        script.chmod(script.stat().st_mode | stat.S_IEXEC)
-        return str(script)
-
-    return _make
+# fake_arcoreimg 这个 fixture 挪到了 tests/conftest.py（I6 最终审阅追加）：
+# tests/test_cli.py 覆盖 --print-width-mm 转换时也需要用同一份假 arcoreimg，
+# 并且新加了 expected_width_m 参数用来校验清单第三列（物理宽度），不再只是
+# 校验列数和路径是否绝对。
 
 
 @pytest.fixture
@@ -110,20 +52,64 @@ def test_build_single_target_db_returns_size(tmp_path, image_file, fake_arcoreim
     assert size == 4_312
 
 
-def test_build_single_target_db_rejects_nonascii_name(tmp_path, image_file, fake_arcoreimg):
-    """arcoreimg 只支持 ASCII 文件名/目标名，提前拦住而不是让它神秘失败。"""
-    with pytest.raises(ValueError):
+# ---------------------------------------------------------------------------
+# I5（最终审阅追加）：这里原来断言"非 ASCII 目标名会被拒绝"，理由是"arcoreimg
+# 只支持 ASCII"。这个假设从未被真正验证过，用仓库里实际的 tools/arcoreimg
+# （版本 1.2）实测后被推翻：中文目标名、中文文件名、中文父目录，build-db 和
+# eval-img 都正常返回码 0、产出有效结果；--help 里也从未提过字符集限制。
+# 真正会破坏清单格式的只有字面 '|' 或换行——因为清单以 '|' 分隔列，这与
+# ASCII 无关。旧的 ASCII 拒绝逻辑如果不改，会让 0d 对着几乎必然出现中文
+# 文件名的真实照片目录整批 build 失败。
+# ---------------------------------------------------------------------------
+
+
+def test_build_single_target_db_accepts_nonascii_name(tmp_path, image_file, fake_arcoreimg):
+    """中文目标名必须被接受——实测 arcoreimg 本身不拒绝它。"""
+    size = Q.build_single_target_db(
+        image_file, name="外婆生日", print_width_m=0.152,
+        out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
+    )
+    assert size > 0
+
+
+def test_build_single_target_db_accepts_nonascii_parent_directory(tmp_path, fake_arcoreimg, textured_image):
+    """中文父目录必须被接受，不能只检查 basename 而漏掉父目录——写进清单
+    的是解析后的完整绝对路径，父目录同样是这条路径的一部分。"""
+    sub = tmp_path / "中文目录"
+    sub.mkdir()
+    img_path = sub / "photo.jpg"
+    cv2.imwrite(str(img_path), textured_image(seed=5))
+
+    size = Q.build_single_target_db(
+        img_path, name="p1", print_width_m=0.152,
+        out_path=tmp_path / "cn.imgdb", arcoreimg=fake_arcoreimg(),
+    )
+    assert size > 0
+
+
+def test_build_single_target_db_rejects_name_with_pipe(tmp_path, image_file, fake_arcoreimg):
+    """清单文件用 '|' 分隔，名称里带 '|' 会把行结构破坏掉——这与字符集无关，
+    是清单格式本身的约束（真实 arcoreimg 对此返回非零退出码，见模块
+    docstring 的实测记录）。"""
+    with pytest.raises(Q.InvalidListingField):
         Q.build_single_target_db(
-            image_file, name="外婆生日", print_width_m=0.152,
+            image_file, name="a|b", print_width_m=0.152,
             out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
         )
 
 
-def test_build_single_target_db_rejects_name_with_pipe(tmp_path, image_file, fake_arcoreimg):
-    """清单文件用 '|' 分隔，名称里带 '|' 会把行结构破坏掉。"""
-    with pytest.raises(ValueError):
+def test_build_single_target_db_rejects_path_with_pipe(tmp_path, fake_arcoreimg, textured_image):
+    """I5 的"过紧过松"里"过松"的那一半：旧代码只检查 image_path.name（不含
+    父目录）是否 ASCII，完全没检查过路径里是否含 '|'——如果父目录名字面带
+    '|'（Linux 文件名合法字符），清单行同样会被破坏，旧代码却完全没有拦。"""
+    sub = tmp_path / "a|b"
+    sub.mkdir()
+    img_path = sub / "photo.jpg"
+    cv2.imwrite(str(img_path), textured_image(seed=6))
+
+    with pytest.raises(Q.InvalidListingField):
         Q.build_single_target_db(
-            image_file, name="a|b", print_width_m=0.152,
+            img_path, name="p1", print_width_m=0.152,
             out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
         )
 
@@ -140,8 +126,12 @@ def test_build_single_target_db_rejects_nonpositive_width(tmp_path, image_file, 
 def test_build_single_target_db_writes_absolute_path_in_list(tmp_path, fake_arcoreimg, textured_image):
     """物理宽度是建库时烘进 .imgdb 的，清单行必须是 名称|绝对路径|宽度。
 
-    fake 脚本会校验行格式与路径是否为绝对路径并在不合规时退出码非 0，
-    所以这个测试真的能测到清单的写法，而不是只测到"没抛异常"。
+    fake 脚本会校验行格式、路径是否为绝对路径、以及第三列的宽度是否与
+    期望值一致（expected_width_m，I6），在不合规时退出码非 0——所以这个
+    测试真的能测到清单的写法（包括宽度这个值本身），而不是只测到"没抛
+    异常"。I6 之前：fake 从不看 parts[2]，即使把 0.089 写成 89.0（1000 倍
+    的 mm/m 单位错误）这条测试也会通过；见
+    final-fix-wave1-report.md 记录的注入验证。
     """
     import os
 
@@ -155,8 +145,21 @@ def test_build_single_target_db_writes_absolute_path_in_list(tmp_path, fake_arco
     try:
         size = Q.build_single_target_db(
             "photos/rel.jpg", name="rel", print_width_m=0.089,
-            out_path=tmp_path / "rel.imgdb", arcoreimg=fake_arcoreimg(),
+            out_path=tmp_path / "rel.imgdb",
+            arcoreimg=fake_arcoreimg(expected_width_m=0.089),
         )
     finally:
         os.chdir(cwd)
     assert size > 0
+
+
+def test_build_single_target_db_rejects_width_unit_mismatch(tmp_path, image_file, fake_arcoreimg):
+    """I6 的直接回归：如果调用方不小心把毫米当米传进来（1000 倍单位错误），
+    fake arcoreimg 现在会真的校验清单第三列，退出非零，_run 把它包成
+    RuntimeError——这条测试锁死"宽度确实被端到端验证过"，不是只测格式。"""
+    with pytest.raises(RuntimeError):
+        Q.build_single_target_db(
+            image_file, name="p1", print_width_m=0.152,
+            out_path=tmp_path / "x.imgdb",
+            arcoreimg=fake_arcoreimg(expected_width_m=152.0),  # 期望值故意错 1000 倍
+        )
