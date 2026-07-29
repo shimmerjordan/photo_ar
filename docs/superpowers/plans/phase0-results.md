@@ -19,7 +19,7 @@
 复现命令：
 
 ```bash
-.venv/bin/python .superpowers/sdd/2026-07-28-phase0-recognizer/measure-0a.py
+.venv/bin/python bench/measure_0a.py
 ```
 
 参数：库规模 200、评估参考图 20 张、每张 10 个合成查询、seed=1，共 200 次查询 × 200 次 `verify_pair` = 4 万次几何校验。
@@ -59,8 +59,8 @@ P95 延迟    4379.1 ms
 ### 用 `maxIters=200` 重跑 0a 的结果
 
 ```bash
-.venv/bin/python .superpowers/sdd/2026-07-28-phase0-recognizer/measure-0a.py
-# 日志：.superpowers/sdd/2026-07-28-phase0-recognizer/measure-0a-maxiters200.log
+.venv/bin/python bench/measure_0a.py
+# 日志：bench/logs/measure-0a-maxiters200.log
 ```
 
 | 指标 | `maxIters=2000` | `maxIters=200` |
@@ -179,8 +179,8 @@ build-db --input_image_list_path=<file> | --input_images_directory=<dir>
 
 ```bash
 PHOTOAR_BRANCHING=16 PHOTOAR_DEPTH=4 \
-  .venv/bin/python .superpowers/sdd/2026-07-28-phase0-recognizer/measure-0b.py
-# 日志：.superpowers/sdd/2026-07-28-phase0-recognizer/measure-0b-br16.log
+  .venv/bin/python bench/measure_0b.py
+# 日志：bench/logs/measure-0b-br16.log
 # 默认参数那一轮：measure-0b.log
 ```
 

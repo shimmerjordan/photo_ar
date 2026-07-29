@@ -1,0 +1,48 @@
+库外误识别命中详情（qid=留出图路径 -> 命中的库内 photo_id；供核对是否为重新编码的近似重复，而非真实误识别）：
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/colosseum_008.jpg -> 4cf98d014b5b8e91
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/colosseum_008.jpg -> 4cf98d014b5b8e91
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/colosseum_008.jpg -> 4cf98d014b5b8e91
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/neuschwanstein-castle_018.jpg -> 60dbfc3579fa297b
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_002.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_005.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_005.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_005.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/sagrada-fam-lia_005.jpg -> 5db6434a118675f0
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+  /tmp/claude-1000/-home-xyz-Projects-priv/315074fd-33bf-4da1-a4ca-bb5f7a02017d/scratchpad/0d-pilot/photos/tower-bridge_012.jpg -> b3d904a9fcd2869d
+图库规模    96
+评估参考图  96
+库外查询图  11
+样本总数    960
+正确命中       900   93.75%  （目标 >= 95%）
+误识别           0   0.000%  （目标 <= 0.1%）
+漏检            60    6.25%
+库外误识别      36  32.727%  （目标 <= 0.1%；库外样本 110，统计口径与上面的库内数字相互独立，不可相加）
+库外正确拒绝    74   67.27%
+P95 延迟    67.9 ms  （达标）
+结论（正确率+误识别率+库外误识别）  未达标
