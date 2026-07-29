@@ -248,10 +248,12 @@ PHOTOAR_BRANCHING=16 PHOTOAR_DEPTH=4 \
 
 语义上要说清：同一地标的两张不同照片**应当被区分开**（它们是两张不同的实体照片，各自关联不同视频）。组内相似是难度来源，不是"应当合并"。
 
-取数脚本 `.superpowers/sdd/.../fetch-real-photos.py`（gitignore 的临时件，只读外部 API）。实际取到 **153 张**，7 个组，中位分辨率 1920×1281。
+取数脚本 `bench/fetch_real_photos.py`（只读外部 API）。实际取到 **153 张**，7 个组，中位分辨率 1920×1281。
 
-⚠️ 取数受 Wikimedia 限流严重：0.1 s/张时立刻 429，改为 0.8 s + 指数退避后仍持续 429 —— 未缓存的缩略图需要现渲染，那个服务限流更狠。1.5 小时才取到 153 张。若要上千张需要几小时，或改取原图（无渲染限流，但体积大得多）。
+⚠️ 取数受 Wikimedia 限流严重：0.1 s/张时立刻 429，改为 0.8 s + 指数退避后仍持续 429 —— 未缓存的缩略图需要现渲染，那个服务限流更狠。1.5 小时才取到 153 张。
 另注：**huggingface.co 从本机不可达**（超时），`hf-mirror.com` 只有首页通、实际路径超时，所以 INRIA Holidays 的 HF 镜像这条路是断的。github / zenodo / figshare / commons 均正常。
+
+**🔴 这条取数路线随后被弃用**（见"上规模"一节）：Wikimedia 现在直接以 robot policy 拒绝，不只是限流（`HTTP 429: Your request does not comply with our robot policy`）；而且那条 `categorymembers` 查询本身就是低效的 —— 实测 `Category:Trevi Fountain` 的 `gcmtype=file` 返回 **0** 个文件，所以 40 个分类只取到 153 张。上规模改用 `bench/fetch_dataset.py`（Oxford5k / Paris6k）。
 
 ### 两轮对照：脏语料 vs 剔除近似重复
 
