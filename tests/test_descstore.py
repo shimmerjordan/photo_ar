@@ -1,8 +1,15 @@
 import numpy as np
 import pytest
 
+from photoar import corpus as C
 from photoar import features as F
-from photoar.descstore import IncompleteWrite, SLOT_STRIDE, DescStore, DescStoreWriter
+from photoar.descstore import (
+    IncompleteWrite,
+    SLOT_STRIDE,
+    DescStore,
+    DescStoreWriter,
+    truncate_count,
+)
 
 
 def test_slot_stride_matches_documented_budget():
@@ -127,6 +134,48 @@ def test_incomplete_write_error_path_leaves_file_readable(tmp_path):
         got = store.read(0)
         assert np.array_equal(got.desc, first.desc)
         assert np.allclose(got.pts, first.pts)
+
+
+# ---------------------------------------------------------------------------
+# Minor #23（最终审阅追加）：min(count, N_FEATURES) 这条截断规则原来在
+# DescStoreWriter.append 和 corpus._desc_fingerprint 里各自独立写了一份。
+# 两处一旦分叉，fingerprint 校验就会系统性地误判——现在共用
+# descstore.truncate_count。
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_count_caps_at_n_features():
+    assert truncate_count(F.N_FEATURES - 1) == F.N_FEATURES - 1
+    assert truncate_count(F.N_FEATURES) == F.N_FEATURES
+    assert truncate_count(F.N_FEATURES + 100) == F.N_FEATURES
+    assert truncate_count(0) == 0
+
+
+def test_corpus_desc_fingerprint_uses_the_same_truncation_as_descstore_writer(tmp_path):
+    """corpus._desc_fingerprint 必须和 DescStoreWriter.append 实际写入的
+    字节完全一致——两者现在共用同一个 truncate_count，这里直接构造一份
+    超过 N_FEATURES 的描述子，验证指纹确实是对截断后的内容算的，而不是
+    对全量内容算的。"""
+    n = F.N_FEATURES + 17
+    desc = (np.arange(n * F.DESC_BYTES, dtype=np.int64) % 256).astype(np.uint8).reshape(
+        n, F.DESC_BYTES
+    )
+    fp = C._desc_fingerprint(desc)
+
+    path = tmp_path / "one.bin"
+    features = F.Features(
+        pts=np.zeros((n, 2), np.float32), desc=desc,
+    )
+    with DescStoreWriter(path, capacity=1) as w:
+        w.append(features)
+    with DescStore(path) as store:
+        actual = store.read(0)
+        assert len(actual) == F.N_FEATURES  # 确认真的被截断了
+        import hashlib
+        written_fp = hashlib.sha256(
+            np.ascontiguousarray(actual.desc, np.uint8).tobytes()
+        ).hexdigest()
+    assert fp == written_fp
 
 
 def test_read_out_of_range_raises(tmp_path):

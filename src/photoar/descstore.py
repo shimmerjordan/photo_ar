@@ -3,7 +3,7 @@
 每张照片占固定 SLOT_STRIDE 字节，slot 下标即偏移，因此精排阶段只需
 按 Top-K 的下标随机读 K 个 slot，无需把全库描述子常驻内存。
 
-slot 布局（小端）：
+slot 布局（本机字节序 / native order，见下方 Minor #8 说明）：
   offset 0   uint32  count      实际特征数（<= N_FEATURES）
   offset 4   uint32  _pad       对齐填充，保证 float32 数组 8 字节对齐
   offset 8   float32[N_FEATURES*2]  关键点 xy
@@ -11,6 +11,17 @@ slot 布局（小端）：
 
 spec §6 给的 9600 字节/张只算了描述子，漏了 RANSAC 必需的关键点坐标。
 实际每张 12008 字节，1 万张约 120MB（仍在预算内）。
+
+Minor #8：这是一份**文件格式**声明，Phase 1 会用别的代码直接读这些文件，
+所以必须写清楚真实约束，不能想当然。np.uint32/np.float32 走的是运行
+该进程的 CPU 本机字节序（native order），不是"写死小端"——numpy 默认
+dtype（不带 '<'/'>' 前缀）就是本机序，这里从来没有显式要求过小端。
+文档曾经写"小端"，只是因为 Phase 0/1 目前唯一会跑这份代码的目标
+（x86-64、ARM64 手机 SoC）全部是小端，从未被验证过、也从未被强制过。
+如果将来在大端机器上写入再拿到小端机器上读（反之亦然），这里不会
+自动转换字节序，会读出错误的 count/坐标/描述子——但目前每一个受支持
+的目标平台都是小端，所以这不是一个已知的活 bug，只是一个不应该被
+文档过度承诺成"小端"的真实前提条件。
 """
 
 from pathlib import Path
@@ -26,6 +37,21 @@ SLOT_STRIDE = _HEADER_BYTES + _PTS_BYTES + _DESC_BYTES_TOTAL
 
 _PTS_OFFSET = _HEADER_BYTES
 _DESC_OFFSET = _HEADER_BYTES + _PTS_BYTES
+
+
+def truncate_count(n_features_available: int) -> int:
+    """Minor #23：算出真正会被写进/读出一个 slot 的特征数上限。
+
+    descstore.DescStoreWriter.append 与 corpus._desc_fingerprint 都需要
+    这个数字，且两处**必须**永远一致——fingerprint 校验的就是"manifest
+    记录的指纹"与"DescStoreWriter 实际写入的字节"是不是同一份内容，如果
+    两处各自独立写 `min(count, N_FEATURES)`，未来只要有一处改了截断规则
+    而另一处没跟着改，指纹校验就会系统性地假报不匹配（或者更糟：系统性
+    地假通过）。extract() 本身已经把返回的特征数上限收在 N_FEATURES，
+    这条 min() 目前恒等于"什么都不做"，但正是因为它现在不可达才最容易
+    被两边各自维护到分叉而不被测试发现，所以显式抽出来共用一个函数。
+    """
+    return min(n_features_available, N_FEATURES)
 
 
 class IncompleteWrite(RuntimeError):
@@ -57,7 +83,7 @@ class DescStoreWriter:
         slot = self._next
         self._next += 1
 
-        count = min(len(features), N_FEATURES)
+        count = truncate_count(len(features))
         base = slot * SLOT_STRIDE
         raw = self._map[base : base + SLOT_STRIDE]
         raw[:] = 0
