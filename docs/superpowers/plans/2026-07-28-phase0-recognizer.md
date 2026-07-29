@@ -6,25 +6,84 @@
 
 **Architecture:** 两阶段检索。粗排用二进制层次词汇树（k-majority）+ TF-IDF 倒排索引取 Top-20；精排对候选做 ORB 暴力汉明匹配 + RANSAC 单应矩阵，按三条判定决定是否命中。为了让粗排的召回率有可比基线，先实现**不含任何词汇表变量的暴力检索**（对全库逐个几何校验），它同时是最硬的 go/no-go 参考点。测试数据由合成查询图生成器程序化产出（透视/模糊/亮度/色温/高光/JPEG 压缩），全流程不需要真机、不需要网络、不需要 NAS。
 
-**Tech Stack:** Python 3.11+、opencv-python-headless、numpy、pytest。外部命令行工具：`arcoreimg`（ARCore SDK）、`ffmpeg`/`ffprobe`。
+**Tech Stack:** Python 3.10+、opencv-python、numpy、pytest。外部命令行工具：`arcoreimg`（ARCore SDK）、`ffmpeg`/`ffprobe`。
+
+**本机实测环境（2026-07-28）：** Python 3.10.0、cv2 5.0.0、numpy 2.0.0 已全局可用。使用 `python3 -m venv --system-site-packages .venv` 建虚拟环境复用已装好的 cv2/numpy，再 `.venv/bin/pip install -e . --no-deps` 装本包。所有 `python`/`pytest`/`photoar` 命令都用 `.venv/bin/` 下的。`.venv/` 已在 `.gitignore` 里。
 
 ## Global Constraints
 
-- **依赖白名单**：仅 `opencv-python-headless`、`numpy`、`pytest`。**禁止**引入 scipy、scikit-learn、torch、Pillow、scipy.spatial 等。需要的算法自己实现（词汇树、倒排索引、popcount）。
+- **依赖白名单**：仅 `opencv-python`（或 headless 变体）、`numpy`、`pytest`。**禁止**引入 scipy、scikit-learn、torch、Pillow 等。需要的算法自己实现（词汇树、倒排索引、popcount）。
 - **尺度对齐是硬约束**：入库提特征与查询提特征都必须先把图缩到长边 `LONG_EDGE = 640`。ORB 无尺度不变性，两侧不一致会让召回率腰斩。任何绕过 `resize_to_long_edge` 的代码路径都是 bug。
 - **特征参数**（集中定义在 `src/photoar/features.py`，其他模块只 import，不得复制字面量）：`LONG_EDGE = 640`、`N_FEATURES = 300`、`SCALE_FACTOR = 1.2`、`N_LEVELS = 8`。
 - **判定阈值**（集中定义在 `src/photoar/verify.py`）：`MIN_INLIERS = 25`、`DET_MIN = 0.05`、`DET_MAX = 20.0`、`RATIO = 1.5`、`RANSAC_REPROJ = 3.0`。
+- **RANSAC 迭代上限**：`RANSAC_MAX_ITERS = 200`（2026-07-28 实测后加，见下）。估计器仍是 `cv2.RANSAC`。
 - **一切随机性必须可复现**：只用 `numpy.random.default_rng(seed)`，禁止 `random` 模块的全局状态、禁止无 seed 的随机。测试必须是确定性的。
 - **误识别率优先于漏检率**（spec §14.2）：调参时两者冲突，一律牺牲漏检保误识别。任何降低判定严格度的改动都要在提交信息里说明对误识别率的影响。
 - **Phase 0 不引入 SQLite**。产物是文件（描述子库、索引、`.imgdb`、JSON manifest）。数据库是 Phase 1 随服务一起引入的。
 - **Phase 0 不写任何服务、不写任何 Android 代码。**
-- **`photo-ar` 目前不是 git 仓库。** 执行本计划前须先征得用户同意执行 `git init`；在获得同意前，所有 `Step: Commit` 步骤跳过，改为在任务末尾运行该任务的全部测试并报告结果。
+- **git**：仓库已于 2026-07-28 初始化（默认分支 `main`），commit 步骤正常执行。**只本地 commit，永不 push**。commit message 里不得出现 `Co-Authored-By` 之类的署名。若 git 报缺少身份，用 `git -c user.name=xyz -c user.email=<你的邮箱> commit ...`。
 
 ## 与 spec 的偏离（已确认）
 
 1. **spec §8.2 说先用 ORB-SLAM 现成 ORB 词汇表，不要自训。本计划改为：先做暴力检索基线（Task 5），再自训小词汇表（Task 6）。**
    理由：spec 的顾虑是"自训引入新变量导致归因困难"，而暴力检索连词汇表这个变量都不存在，是比借来的词汇表**更硬**的参考点，且它直接产出最重要的指标（误识别率）。有了暴力基线的 ground truth，Task 7 的粗排召回率才有可比对象。`ORBvoc.txt`（145MB 文本、1M 节点）保留为词汇表召回不达标时的备选，接口按可替换设计。
 2. **spec §6 说描述子 300×32 = 9600 字节/张、1 万张 96MB。这个数字漏算了关键点坐标。** RANSAC 需要关键点坐标，每张还要 300×2×float32 = 2400 字节。实际每张 12008 字节（含头），**1 万张约 120MB**，不是 96MB。仍在预算内，但 spec §8.4 的数字应按 120MB 更新。
+3. **spec §8.3 说 `findHomography(..., RANSAC, 3.0)`。实测后给它加了 `maxIters=RANSAC_MAX_ITERS`（200）的上限。** 估计器仍是 `cv2.RANSAC`，判定条件一个都没改。详见下节。
+
+## RANSAC 迭代上限降到 200（2026-07-28 实测，已获用户裁决）
+
+里程碑 0a 实测每次 `verify_pair` 约 21.7 ms，两阶段 Top-20 精排推算 434 ms，而 spec §8.4 的服务端目标是 80 ms。profile 之后发现瓶颈**不在** `BFMatcher`：
+
+| 组件 | 耗时 |
+|---|---|
+| `BFMatcher(NORM_HAMMING, crossCheck=True)` 300×300 描述子 | 0.17 ms |
+| `findHomography(..., cv2.RANSAC, 3.0)` | **20.74 ms** ← 占 99% |
+
+**但真正的关键洞察是：那 20 ms 只花在假匹配上。真匹配恒定约 0.34 ms。** RANSAC 是自适应终止的 —— 一旦找到好模型就停，只有在**根本不存在好模型**（即照片对不匹配）时才会烧满默认的 2000 次迭代。两阶段 Top-20 里有 19 个是假匹配，390 ms 全在这 19 次上。
+
+12 对真匹配 + 12 对假匹配的实测：
+
+| `maxIters` | 真匹配内点（12 对） | 真匹配 | 假匹配 | 误判 |
+|---|---|---|---|---|
+| 2000（默认） | 110,140,93,171,115,87,211,98,108,112,108,93 | 0.34 ms | **20.56 ms** | 0/12 |
+| 500 | **完全相同** | 0.33 ms | 5.23 ms | 0/12 |
+| **200** | **完全相同** | 0.33 ms | **2.19 ms** | 0/12 |
+| 100 | **完全相同** | 0.30 ms | 1.25 ms | 0/12 |
+| 50 | **完全相同** | 0.33 ms | 0.70 ms | 0/12 |
+
+降到 200：真匹配内点数逐个完全不变，假匹配内点数略降（更安全的方向），误判仍为 0，Top-20 精排从 390 ms 降到约 42 ms。**拒绝机制完全不变，所以现有 12 个测试全部照旧通过，里程碑 0a 也不必重跑。**
+
+### 为什么没选 `USAC_ACCURATE`
+
+`USAC_ACCURATE` 更快（Top-20 约 5 ms，真匹配内点差 ≤2，12/12 通过），但它**在估计器层面就拒绝纯反射** —— 镜像构造下返回 `inliers=0, det=0.0`，不产出反射矩阵。这会让 Task 3 的 `test_mirrored_match_is_rejected_by_determinant_sign_not_inlier_count` 失效，也就是把那个专门用来防 `abs(det)` 回归的守卫拆掉。加上它改变了拒绝机制（假匹配的 det 多为 0.0/-0.0/-877，靠 `DET_MIN` 而非内点数挡住），意味着 0a 必须重跑。42 ms 已达标，不值得付这个代价。
+
+### `maxIters` 不是完全免费的
+
+它限制的是**难例上花多少力气**。RANSAC 对 4 点模型需要约 `log(1-p)/log(1-w⁴)` 次迭代（`w` 为内点率）：200 覆盖约 `w ≥ 0.37`，500 覆盖约 `w ≥ 0.29`。真实照片里严重变形的边缘真匹配可能落在 0.3 附近，会变成漏检。这是可接受的方向（漏检代价比误识别低一个量级），而**里程碑 0d 是判断 200 是否太紧的依据**。若 0d 漏检偏多，就抬这个数 —— 而抬它只在假匹配上花时间。
+
+## 词表粒度：召回率随词数单调上升（0b 实测推翻了先前的假设）
+
+**先前的假设是错的，方向正好相反。** 早先我测得「合成查询图的词落在源图词表里的比例」：
+
+| 配置 | 词数 | 重合均值 |
+|---|---|---|
+| `branching=6, depth=3` | 216 | 0.743 |
+| `branching=10, depth=4`（默认） | 5338 | 0.269 |
+
+据此我在计划里写过「若 0b 召回不佳，第一个该动的旋钮是把词表调粗」。0b 之后用 1000 张库、500 个共用查询图实测粗排召回率，结果相反：
+
+| branching | depth | 词数 | R@1 | R@5 | R@10 | R@20 |
+|---|---|---|---|---|---|---|
+| 6 | 3 | 216 | 58.60% | 73.40% | 79.00% | 83.00% |
+| 8 | 3 | 512 | 74.20% | 82.00% | 86.00% | 88.40% |
+| **10** | **4** | **10000** | **88.00%** | **94.20%** | **95.40%** | **96.00%** ← 默认 |
+| 6 | 4 | 1296 | 80.20% | 86.60% | 90.00% | 92.00% |
+
+**召回率随词数单调上升，调粗词表把 Recall@20 从 96% 打到 83%。**
+
+错在哪：**词重合率不是召回率的代理指标。** 粗词表的重合率高，正是因为它的词太笼统、什么都能重合 —— 那种重合没有区分度，而 IDF 无法恢复词表本身从未具备的辨别力。高重合 + 低区分度 = 差召回。
+
+**结论：不要用重合率来判断词表好坏，直接量召回率。** 若召回不足，方向是往更细走（提高 `BRANCHING` 或 `DEPTH`），而不是更粗；但更细也有代价 —— 词数上去后每个词的倒排表变短，量化噪声更容易让查询词落进空词，存在一个峰值，须实测。
 
 ## 文件结构
 
@@ -79,9 +138,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "photoar"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
-    "opencv-python-headless>=4.9",
+    "opencv-python>=4.9",
     "numpy>=1.26",
 ]
 
@@ -589,6 +648,10 @@ def test_verify_pair_handles_empty_features():
 def test_verify_pair_rejects_mirrored_match(textured_image):
     """镜像的单应矩阵行列式为负。实体照片经相机成像永远不会镜像，
     因此负行列式必须判否——这比 spec 写的 abs(det) 更严格且更正确。
+
+    注意：这个测试只验证"镜像图整体上会被拒"这个组合行为，它**不能**
+    隔离出拒绝的机制——实测镜像图只有约 8 个内点，`not r.ok` 会直接
+    短路。真正锁住签名行列式分支的是下面那个测试。
     """
     import cv2
 
@@ -597,6 +660,36 @@ def test_verify_pair_rejects_mirrored_match(textured_image):
     mirrored = F.extract(cv2.flip(img, 1))
     r = V.verify_pair(mirrored, ref, "p4")
     assert not r.ok or r.det > 0
+
+
+def test_mirrored_match_is_rejected_by_determinant_sign_not_inlier_count(textured_image):
+    """隔离签名行列式分支：构造一个内点远超阈值、但行列式为负的场景。
+
+    做法：参考的描述子与查询**完全相同**（BFMatcher 会 1:1 零距离匹配），
+    而参考的关键点是查询关键点的水平镜像。于是 findHomography 得到一个
+    纯反射矩阵：约 300 个内点、行列式为负。此时 ok 只可能因符号检验为 False。
+
+    三条断言缺一不可：
+      - inliers >= MIN_INLIERS 证明拒绝**不是**因为内点不够（去掉这条，
+        测试就会在构造哪天不再产生大量匹配时静默退化成空测试）
+      - det < 0        证明确实处于镜像情形
+      - not r.ok       被测行为本身
+
+    镜像必须在**缩放后**的坐标系里做：extract() 先把图缩到长边 640 才提
+    特征，所以关键点活在 640 长边的坐标系里，不是原始 800x600。
+    """
+    img = textured_image(seed=2, w=800, h=600)
+    query = F.extract(img)
+    resized_w = F.resize_to_long_edge(img).shape[1]
+
+    mirrored_pts = query.pts.copy()
+    mirrored_pts[:, 0] = (resized_w - 1) - mirrored_pts[:, 0]
+    mirror_ref = F.Features(pts=mirrored_pts, desc=query.desc)
+
+    r = V.verify_pair(query, mirror_ref, "mirror")
+    assert r.inliers >= V.MIN_INLIERS
+    assert r.det < 0
+    assert not r.ok
 
 
 def test_decide_returns_no_match_on_empty_results():
@@ -682,6 +775,10 @@ DET_MIN = 0.05
 DET_MAX = 20.0
 RATIO = 1.5
 RANSAC_REPROJ = 3.0
+# RANSAC 迭代上限。默认 2000 只在假匹配上被烧满——真匹配靠自适应终止恒定约 0.34ms。
+# 实测降到 200：真匹配内点数完全不变、假匹配内点数略降、误判仍为 0，
+# 而假匹配耗时从 20.56ms 降到 2.19ms。只限制难例上的努力，不改任何判定条件。
+RANSAC_MAX_ITERS = 200
 
 MIN_MATCHES_FOR_HOMOGRAPHY = 4
 
@@ -717,7 +814,9 @@ def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
 
     src = query.pts[[m.queryIdx for m in matches]]
     dst = ref.pts[[m.trainIdx for m in matches]]
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_REPROJ)
+    H, mask = cv2.findHomography(
+        src, dst, cv2.RANSAC, RANSAC_REPROJ, maxIters=RANSAC_MAX_ITERS
+    )
     if H is None or mask is None:
         return _fail(photo_id)
 
@@ -2248,23 +2347,49 @@ git commit -m "feat: 两阶段检索编排，记录里程碑 0b 结果"
 - Produces:
   - 常量 `MIN_QUALITY_SCORE = 75`
   - `ArcoreimgMissing(RuntimeError)`、`QualityTooLow(ValueError)`（属性 `score: int`、`path: str`）
-  - `eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int`
-  - `build_single_target_db(image_path, name, out_path, arcoreimg="arcoreimg") -> int`（返回 `.imgdb` 字节数）
-  - `assert_quality(image_path, arcoreimg="arcoreimg") -> int`（低于阈值抛 `QualityTooLow`）
+  - `eval_img(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int`
+  - `build_single_target_db(image_path, name, print_width_m, out_path, arcoreimg=ARCOREIMG) -> int`（返回 `.imgdb` 字节数）
+  - `assert_quality(image_path, arcoreimg=ARCOREIMG) -> int`（低于阈值抛 `QualityTooLow`）
+  - 常量 `ARCOREIMG = "arcoreimg"`（默认值；仓库内已放置可用二进制于 `tools/arcoreimg`）
 
-- [ ] **Step 1: 先确认外部工具的真实接口**
+- [ ] **Step 1: 外部工具的真实接口（已实测，2026-07-28）**
 
-`arcoreimg` 的确切参数必须实测，不能凭记忆写。运行：
+二进制已获取并放在仓库内 `tools/arcoreimg`（已加入 `.gitignore`，不入库）：
 
-```bash
-arcoreimg --help
-arcoreimg eval-img --help
-arcoreimg build-db --help
+- 来源：`https://raw.githubusercontent.com/google-ar/arcore-android-sdk/master/tools/arcoreimg/linux/arcoreimg`
+- 5273584 字节，sha256 `2585423461c77c02d034ed5333c5054384a5d19ad212f581ad0274198ace60c0`
+- ELF 64-bit x86-64，已 `chmod +x`
+
+**实测到的接口（下面的实现必须匹配这个，而不是本计划早先版本里的猜测）：**
+
+```
+$ arcoreimg
+Available actions: help, version, build-db, eval-db, eval-img
+
+$ arcoreimg eval-img --help
+Usage: arcoreimg eval-image --input_image_path=<some_file_path>
+  --input_image_path:  Path of image to be evaluated. Currently only supports *.png, *.jpg and *.jpeg.
+
+$ arcoreimg build-db --help
+Usage: arcoreimg build-db --input_images_directory=<dir>|--input_image_list_path=<file> --output_db_path=<file>
+  --input_image_list_path:
+    Path of a text file where every line consists of the name, the absolute path and the
+    width in meters (optional) of an image, separated by a '|'. e.g.:
+        cat|path/to/cat_image.png|0.1
+        little dog|/path/to/dog_image.jpg
+  --input_images_directory:  所有图都用来建库
+  --output_db_path:          输出库文件路径
 ```
 
-把三段输出原文粘贴到 `src/photoar/quality.py` 顶部的 docstring 里作为契约记录。若 `arcoreimg` 不在 PATH，从 ARCore SDK for Android 的 `tools/arcoreimg/linux/` 取，并在 `docs/superpowers/plans/phase0-results.md` 记录获取路径。
+**⚠️ 计划早先版本猜错了一处**：`build-db` **没有** `--input_image_path` 参数。必须走 `--input_image_list_path`，写一个临时清单文件，每行 `名称|绝对路径|物理宽度(米)`。
 
-**实现必须匹配实测到的参数，而不是本计划下面示例代码里的猜测。** 若实测参数与示例不同，改实现并同步更新测试里 fake 脚本的行为。
+**这带来一个设计改进**：打印物理宽度是在**建库时烘进 `.imgdb`** 的，不需要客户端运行时用 `addImage(name, bitmap, widthInMeters)` 再传一遍。所以 `build_single_target_db` 必须接收 `print_width_m` 参数并写进清单行。
+
+`eval-img` 的输出就是一个裸数字（例如 `100`），没有前缀文字。
+
+**已实测的 `.imgdb` 体积（即里程碑 0c，见 `phase0-results.md`）**：单目标约 **4.2-4.4 KB**，3 目标库 12301 字节（≈4.1KB/目标，线性）。远低于原估的 30KB，也远低于 200KB 的「改架构」阈值 —— 所以下发 `.imgdb` 的方案成立，且 spec §4 的带宽估算可以往下修一个量级。
+
+**同时实测到一个反直觉行为，必须记住**：同一张图内容，分辨率越高 `eval-img` 分数越低（1200×800→100、2400×1600→20、4000×3000→0）。这是合成纹理图的产物（噪声从 1/8 尺寸上采样，放大后只剩低频），说明**合成图不能用来验证质量分闸门**，只有真实照片能。因此本任务的单元测试一律走 fake 脚本，质量分闸门的真实行为留到里程碑 0d 验证。
 
 - [ ] **Step 2: 写失败的测试**
 
@@ -2289,25 +2414,49 @@ def fake_arcoreimg(tmp_path):
     行为：eval-img 打印固定分数；build-db 写出一个固定大小的文件。
     """
 
-    def _make(score: int = 85, db_bytes: int = 30_000, exit_code: int = 0):
+    def _make(score: int = 85, db_bytes: int = 4_300, exit_code: int = 0):
         script = tmp_path / "arcoreimg"
         script.write_text(
             textwrap.dedent(f"""\
             #!/usr/bin/env python3
+            # 模拟真实 arcoreimg 的接口（已实测，见计划 Task 9 Step 1）：
+            #   eval-img --input_image_path=<path>        -> 打印裸数字
+            #   build-db --input_image_list_path=<file> --output_db_path=<file>
+            # 清单文件每行: 名称|绝对路径|物理宽度(米)
             import sys, pathlib
             argv = sys.argv[1:]
             if {exit_code} != 0:
                 sys.stderr.write("boom\\n"); sys.exit({exit_code})
-            if argv and argv[0] == "eval-img":
-                print("Image quality score: {score}")
-                sys.exit(0)
-            if argv and argv[0] == "build-db":
-                out = None
+
+            def opt(prefix):
                 for i, a in enumerate(argv):
-                    if a.startswith("--output_db_path"):
-                        out = a.split("=", 1)[1] if "=" in a else argv[i + 1]
+                    if a.startswith(prefix):
+                        return a.split("=", 1)[1] if "=" in a else argv[i + 1]
+                return None
+
+            if argv and argv[0] == "eval-img":
+                if not opt("--input_image_path"):
+                    sys.stderr.write("missing --input_image_path\\n"); sys.exit(2)
+                print({score})
+                sys.exit(0)
+
+            if argv and argv[0] == "build-db":
+                listing = opt("--input_image_list_path")
+                out = opt("--output_db_path")
+                if not listing or not out:
+                    sys.stderr.write("missing required option\\n"); sys.exit(2)
+                # 真实工具会因清单格式错误而失败；这里也校验，否则测试测不到格式
+                for line in pathlib.Path(listing).read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    parts = line.split("|")
+                    if len(parts) not in (2, 3):
+                        sys.stderr.write(f"bad list line: {{line}}\\n"); sys.exit(2)
+                    if not pathlib.Path(parts[1]).is_absolute():
+                        sys.stderr.write(f"path not absolute: {{parts[1]}}\\n"); sys.exit(2)
                 pathlib.Path(out).write_bytes(b"X" * {db_bytes})
                 sys.exit(0)
+
             sys.exit(2)
             """)
         )
@@ -2352,19 +2501,63 @@ def test_assert_quality_rejects_low_score(image_file, fake_arcoreimg):
 def test_build_single_target_db_returns_size(tmp_path, image_file, fake_arcoreimg):
     out = tmp_path / "p1.imgdb"
     size = Q.build_single_target_db(
-        image_file, name="p1", out_path=out, arcoreimg=fake_arcoreimg(db_bytes=31_234)
+        image_file, name="p1", print_width_m=0.152, out_path=out,
+        arcoreimg=fake_arcoreimg(db_bytes=4_312),
     )
     assert out.exists()
-    assert size == 31_234
+    assert size == 4_312
 
 
 def test_build_single_target_db_rejects_nonascii_name(tmp_path, image_file, fake_arcoreimg):
     """arcoreimg 只支持 ASCII 文件名/目标名，提前拦住而不是让它神秘失败。"""
     with pytest.raises(ValueError):
         Q.build_single_target_db(
-            image_file, name="外婆生日", out_path=tmp_path / "x.imgdb",
-            arcoreimg=fake_arcoreimg(),
+            image_file, name="外婆生日", print_width_m=0.152,
+            out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
         )
+
+
+def test_build_single_target_db_rejects_name_with_pipe(tmp_path, image_file, fake_arcoreimg):
+    """清单文件用 '|' 分隔，名称里带 '|' 会把行结构破坏掉。"""
+    with pytest.raises(ValueError):
+        Q.build_single_target_db(
+            image_file, name="a|b", print_width_m=0.152,
+            out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
+        )
+
+
+def test_build_single_target_db_rejects_nonpositive_width(tmp_path, image_file, fake_arcoreimg):
+    for bad in (0.0, -0.1):
+        with pytest.raises(ValueError):
+            Q.build_single_target_db(
+                image_file, name="p1", print_width_m=bad,
+                out_path=tmp_path / "x.imgdb", arcoreimg=fake_arcoreimg(),
+            )
+
+
+def test_build_single_target_db_writes_absolute_path_in_list(tmp_path, fake_arcoreimg, textured_image):
+    """物理宽度是建库时烘进 .imgdb 的，清单行必须是 名称|绝对路径|宽度。
+
+    fake 脚本会校验行格式与路径是否为绝对路径并在不合规时退出码非 0，
+    所以这个测试真的能测到清单的写法，而不是只测到"没抛异常"。
+    """
+    import os
+
+    sub = tmp_path / "photos"
+    sub.mkdir()
+    img_path = sub / "rel.jpg"
+    cv2.imwrite(str(img_path), textured_image(seed=3))
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)  # 用相对路径调用，验证实现会自己转成绝对路径
+    try:
+        size = Q.build_single_target_db(
+            "photos/rel.jpg", name="rel", print_width_m=0.089,
+            out_path=tmp_path / "rel.imgdb", arcoreimg=fake_arcoreimg(),
+        )
+    finally:
+        os.chdir(cwd)
+    assert size > 0
 ```
 
 - [ ] **Step 3: 运行测试确认失败**
@@ -2390,9 +2583,11 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'photoar.quality'`
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 MIN_QUALITY_SCORE = 75
+ARCOREIMG = "arcoreimg"  # 仓库内已放置可用二进制于 tools/arcoreimg
 
 _SCORE_RE = re.compile(r"(\d{1,3})")
 
@@ -2427,7 +2622,7 @@ def _run(arcoreimg: str, args: list[str]) -> str:
     return proc.stdout
 
 
-def eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
+def eval_img(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int:
     out = _run(arcoreimg, ["eval-img", f"--input_image_path={Path(image_path)}"])
     scores = _SCORE_RE.findall(out)
     if not scores:
@@ -2435,7 +2630,7 @@ def eval_img(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
     return int(scores[-1])
 
 
-def assert_quality(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
+def assert_quality(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int:
     score = eval_img(image_path, arcoreimg)
     if score < MIN_QUALITY_SCORE:
         raise QualityTooLow(str(image_path), score)
@@ -2445,24 +2640,43 @@ def assert_quality(image_path: str | Path, arcoreimg: str = "arcoreimg") -> int:
 def build_single_target_db(
     image_path: str | Path,
     name: str,
+    print_width_m: float,
     out_path: str | Path,
-    arcoreimg: str = "arcoreimg",
+    arcoreimg: str = ARCOREIMG,
 ) -> int:
+    """建一个只含这一张参考图的 .imgdb，并把打印物理宽度烘进去。
+
+    物理宽度写在清单行里，所以客户端不需要在运行时再用
+    addImage(name, bitmap, widthInMeters) 传一遍——库里已经带着它了。
+
+    实测：单目标 .imgdb 约 4.2-4.4 KB（见 phase0-results.md 里程碑 0c）。
+    """
     if not name.isascii():
         raise ValueError(f"arcoreimg 只支持 ASCII 目标名，收到 {name!r}")
-    image_path, out_path = Path(image_path), Path(out_path)
+    if "|" in name or "\n" in name:
+        raise ValueError(f"目标名不能含 '|' 或换行（清单以 '|' 分隔），收到 {name!r}")
+    if not print_width_m > 0:
+        raise ValueError(f"打印物理宽度必须为正数（米），收到 {print_width_m!r}")
+
+    image_path = Path(image_path).resolve()  # 清单要求绝对路径
+    out_path = Path(out_path)
     if not image_path.name.isascii():
         raise ValueError(f"arcoreimg 只支持 ASCII 文件名，收到 {image_path.name!r}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    _run(
-        arcoreimg,
-        [
-            "build-db",
-            f"--input_image_path={image_path}",
-            f"--output_db_path={out_path}",
-        ],
-    )
+    # 清单文件是临时产物，不留在用户目录里
+    with tempfile.TemporaryDirectory() as tmp:
+        listing = Path(tmp) / "targets.txt"
+        listing.write_text(f"{name}|{image_path}|{print_width_m:.6f}\n")
+        _run(
+            arcoreimg,
+            [
+                "build-db",
+                f"--input_image_list_path={listing}",
+                f"--output_db_path={out_path}",
+            ],
+        )
+
     if not out_path.exists():
         raise RuntimeError(f"arcoreimg build-db 未产出 {out_path}")
     return out_path.stat().st_size
@@ -2665,8 +2879,14 @@ def has_faststart(path: str | Path) -> bool:
     """检查 moov 是否出现在 mdat 之前。
 
     直接读文件头判断，比解析 ffprobe 的 trace 输出稳得多。
+
+    ⚠️ 必须用 f.read(n) 读有界前缀，**不能**写成
+    `Path(path).read_bytes()[:n]` —— 后者会先把整个文件读进内存再切片。
+    probe() 每次都调本函数，包括对**转码前的原始大文件**，而「源文件过大」
+    恰恰是本模块存在的理由；4K 手机视频动辄几百 MB。
     """
-    head = Path(path).read_bytes()[:_FASTSTART_PROBE_BYTES]
+    with open(path, "rb") as f:
+        head = f.read(_FASTSTART_PROBE_BYTES)
     moov, mdat = head.find(b"moov"), head.find(b"mdat")
     if moov == -1:
         return False  # 头部没有 moov，说明它在后面
@@ -2693,7 +2913,21 @@ def probe(path: str | Path, ffprobe: str = "ffprobe") -> VideoInfo:
     if video is None:
         raise RuntimeError(f"{path} 里没有视频流")
 
-    duration_s = float(data.get("format", {}).get("duration") or video.get("duration") or 0.0)
+    # 时长取**流**的时长而非容器的 format.duration：AAC 编码器的 priming delay
+    # 被计入容器总时长，实测 format.duration 系统性比流时长多约 24ms
+    # （3 秒素材：format 3.024 而 video/audio 均为 3.000），会让刚好 15 秒的
+    # 转码产物探测成 15024ms 而误触发 needs_transcode。
+    # 用 max() 覆盖音轨长于视轨的情形；候选按「键是否存在」收集，不能按转成
+    # float 后的真假判断，否则合法的 0.0 会被当成缺失。
+    candidates = [
+        float(s["duration"])
+        for s in data.get("streams", [])
+        if s.get("codec_type") in ("video", "audio") and s.get("duration") is not None
+    ]
+    if candidates:
+        duration_s = max(candidates)
+    else:
+        duration_s = float(data.get("format", {}).get("duration") or 0.0)
     return VideoInfo(
         width=int(video["width"]),
         height=int(video["height"]),
@@ -2766,7 +3000,9 @@ git commit -m "feat: ffmpeg 转码封装（720p/1.5Mbps/15s/faststart）"
 - Produces:
   - `CorpusPaths` frozen dataclass：`root: Path`、`desc: Path`、`vocab: Path`、`index: Path`、`manifest: Path`、`imgdb_dir: Path`，类方法 `at(root) -> CorpusPaths`
   - `PhotoEntry` frozen dataclass：`photo_id: str`、`ref_path: str`、`quality_score: int`、`imgdb_bytes: int`
-  - `build_corpus(image_paths: list[Path], out_root: Path, seed: int = 0, arcoreimg: str | None = None) -> list[PhotoEntry]`
+  - `build_corpus(image_paths: list[Path], out_root: Path, seed: int = 0, arcoreimg: str | None = None, print_width_m: float = 0.152) -> list[PhotoEntry]`
+  - `CorpusIntegrityError(RuntimeError)`；`load_corpus` 校验每个 slot 的描述子指纹，并对最多 5 张抽样做倒排索引自查
+  - ⚠️ 自查的 top_k **必须**随语料规模缩放：`k = max(1, min(TOP_K, n_docs // 2))`。用固定的 `TOP_K=20` 时，`index.query` 会把 k 夹到 `n_docs`，于是语料 ≤20 张时返回全部文档、检测概率恰好为 0——而小语料正是测试套件构造的规模。缩放后 12 张语料下 5 个抽样的检测率约 97%
   - `load_corpus(root: Path) -> tuple[TwoStageRecognizer, list[PhotoEntry]]`
   - `main(argv: list[str] | None = None) -> int`，子命令 `build` / `eval`
 
@@ -3008,8 +3244,12 @@ def build_corpus(
         if arcoreimg is not None:
             try:
                 score = Q.assert_quality(path, arcoreimg=arcoreimg)
+                # print_width_m 是必填的——Task 9 按 arcoreimg 实测接口给
+                # build_single_target_db 加了这个参数（物理宽度在建库时烘进 .imgdb），
+                # 漏掉它会在带真实 arcoreimg 运行时直接 TypeError。
                 imgdb_bytes = Q.build_single_target_db(
                     path, name=photo_id,
+                    print_width_m=print_width_m,
                     out_path=paths.imgdb_dir / f"{photo_id}.imgdb",
                     arcoreimg=arcoreimg,
                 )
