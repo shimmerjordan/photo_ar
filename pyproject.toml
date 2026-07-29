@@ -16,6 +16,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 photoar = "photoar.cli:main"
+photoar-server = "photoar.server.httpd:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

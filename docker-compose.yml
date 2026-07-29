@@ -1,0 +1,51 @@
+# QNAP Container Station 用。`docker compose up -d` 或直接在 Container Station
+# 的「应用程序」里贴这份 YAML。
+#
+# 三处必须按自己的 NAS 改：
+#   1. PHOTOAR_TOKEN —— 换成自己的随机串（openssl rand -hex 24）
+#   2. 照片与视频所在的共享文件夹挂载点（下面 volumes 里的两条 :ro）
+#   3. deploy/config.json 里的 roots 必须与这里挂进去的容器内路径一致
+services:
+  photo-ar-server:
+    build: .
+    image: photo-ar-server:phase1
+    container_name: photo-ar-server
+    restart: unless-stopped
+    # 识别是 CPU 密集的（ORB + RANSAC）。N5095 只有 4 核，留一核给
+    # cloudflared / CloudDrive2 / QTS 自己，不然扫描时整台 NAS 都发木。
+    cpus: "3.0"
+    mem_limit: 3g
+    ports:
+      # 只监听 LAN/Tailscale。外网走已有的 cloudflared，不在这里暴露。
+      - "8964:8964"
+    environment:
+      PHOTOAR_TOKEN: "改成你自己的随机串"
+      # 词汇树用 UTF-8 路径，容器里 locale 默认是 POSIX，显式设一下省事
+      LANG: C.UTF-8
+    volumes:
+      # 索引、SQLite、转码产物、缩略图。必须是持久卷 —— 丢了要全库重新入库
+      # （每张约 1s，一万张三小时）。
+      - ./data:/data
+      - ./deploy:/config:ro
+      # 照片与视频。只读挂载：这个服务永远不改用户的原始文件
+      # （唯一的写入是 /v1/upload，落在下面单独一条可写挂载里）。
+      - /share/Photo:/share/Photo:ro
+      - /share/Video:/share/Video:ro
+      # CloudDrive2 把网盘挂成了普通路径，一并挂进来就能直接关联网盘里的视频
+      - /share/CloudDrive:/share/CloudDrive:ro
+      # /v1/upload 的落地目录，是整份配置里唯一可写的用户目录
+      - /share/Photo/_arphoto_inbox:/share/Photo/_arphoto_inbox
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os,urllib.request as u
+          t=os.environ.get('PHOTOAR_TOKEN','')
+          r=u.Request('http://127.0.0.1:8964/v1/ping',headers={'Authorization':'Bearer '+t})
+          u.urlopen(r,timeout=4).read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

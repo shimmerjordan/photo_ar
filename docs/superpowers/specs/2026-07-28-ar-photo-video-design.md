@@ -591,6 +591,20 @@ Oxford5k 4385 张入库、20000 次库内查询 + 9740 次库外查询，`MIN_IN
 
 所以出口条件的判读是：§14.2 四项里三项达标、P95 需要在 N5095 上复测；库外那一项在这份语料上不可能达标，但缺陷成分已归零。**尚未覆盖**：真正的域外输入（杂志页 / 屏幕截图 / 纯文字 / 手绘）、质量分闸门开启后的重测。详见 `docs/superpowers/plans/phase0-results.md`。
 
+### Phase 1 出口条件的实际达成情况（2026-07-30）
+
+出口条件「能用 curl 完成入库→识别→取流；路径穿越测试通过」：**达成**。
+
+| 验证方式 | 结果 |
+|---|---|
+| `bench/e2e_curl.sh`（真进程 + 真 curl + 真 vocab/ffmpeg/arcoreimg） | 62 项全绿，含 14 项路径穿越 |
+| `tests/server` | 156 个测试全绿（全仓库 398） |
+| `docker build` + `docker run` | ping / 401 / 403 穿越 / 入库（质量分 95）/ 识别（inliers 83）/ healthcheck healthy |
+
+**未覆盖**：N5095 上的 P95 复测、一万张规模的服务端入库。过程中修掉两个不报错
+的真缺陷（识别库 slot 错位、上传后 keep-alive 读死连接）。详见
+`docs/superpowers/plans/2026-07-30-phase1-server.md`。
+
 ## 16. 风险与已知限制
 
 | 风险 | 影响 | 缓解 |

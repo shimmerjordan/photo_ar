@@ -1,0 +1,35 @@
+{
+  "_comment": "复制成 deploy/config.json 后按注释改。token 建议不写在这里，用环境变量 PHOTOAR_TOKEN 注入。",
+
+  "bind": "0.0.0.0",
+  "port": 8964,
+
+  "_roots": "白名单根目录。服务只允许访问这些目录以下的文件；名字随意，会在 /v1/fs/list 里显示给 App。路径必须是【容器内】的绝对路径，与 docker-compose.yml 的挂载点一致。",
+  "roots": {
+    "照片": "/share/Photo",
+    "视频": "/share/Video",
+    "网盘": "/share/CloudDrive"
+  },
+
+  "_data_dir": "索引、SQLite、.imgdb、缩略图、转码产物。必须是持久卷。",
+  "data_dir": "/data",
+
+  "_vocab_path": "词汇树。由 `photoar build --photos <目录>` 预先训练好后拷进 /data。服务端不训练：换 vocab 等于全库重建索引。",
+  "vocab_path": "/data/vocab.npz",
+
+  "_arcoreimg": "ARCore SDK 里的二进制，镜像里在 /opt/photoar/tools/arcoreimg（已在 PATH 里）。",
+  "arcoreimg": "arcoreimg",
+
+  "_media": "媒体 URL 解析策略链（spec §10）。默认只有 nas_serve —— 本服务自己吐流，CloudDrive2 已经把网盘挂成本地路径，这一条覆盖全部需求。direct_link 是留给以后接 OpenList 的优化位。",
+  "media": {
+    "strategies": ["nas_serve"]
+  },
+
+  "_upload_dir_root": "POST /v1/upload 的落地根，必须在 roots 之内，且这一条挂载要可写。不配则上传功能整体关闭（503）。",
+  "upload_dir_root": "/share/Photo/_arphoto_inbox",
+
+  "_self_score_samples": "入库时算自匹配分用的扰动样本数，每张约 1s。20 是 §14.1 回归测试用的数，也是 0d 全部实测数字的来源；嫌慢可以降到 8，代价是近似重复的判定不稳。",
+  "self_score_samples": 20,
+
+  "version": "phase1"
+}

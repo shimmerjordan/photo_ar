@@ -54,6 +54,48 @@ def truncate_count(n_features_available: int) -> int:
     return min(n_features_available, N_FEATURES)
 
 
+def encode_slot(features: Features) -> bytes:
+    """把一张照片编成恰好 SLOT_STRIDE 字节的一个 slot。
+
+    抽出来的理由和 truncate_count 一样：现在有两个写入方——Phase 0 的定长
+    `DescStoreWriter`（预声明容量、mmap 覆写）与 Phase 1 服务端的增量追加
+    （`append_slot`，边入库边长）。布局写两遍，改一遍忘一遍不会有任何报错，
+    只会让两个写入方产出的文件在同一个 `DescStore` 下读出错误的坐标。
+    """
+    buf = np.zeros(SLOT_STRIDE, np.uint8)
+    count = truncate_count(len(features))
+    buf[0:4].view(np.uint32)[0] = count
+    if count:
+        pts = np.ascontiguousarray(features.pts[:count], np.float32)
+        buf[_PTS_OFFSET : _PTS_OFFSET + count * 8].view(np.float32)[:] = pts.ravel()
+        desc = np.ascontiguousarray(features.desc[:count], np.uint8)
+        buf[_DESC_OFFSET : _DESC_OFFSET + count * DESC_BYTES] = desc.ravel()
+    return buf.tobytes()
+
+
+def append_slot(path: str | Path, features: Features) -> int:
+    """把一张照片追加到（可能还不存在的）描述子库末尾，返回它的 slot 下标。
+
+    Phase 1 的入库是一张一张来的，没有"预先知道总数"这回事，所以不能用
+    `DescStoreWriter`（它要求预声明 capacity，且未写满就 raise）。这里用
+    追加写而不是 mmap：追加是原子的（单次 write 小于 12KB），进程在中途
+    被杀最多留下一个尾部残缺的文件，`DescStore` 构造时的"大小必须是步长
+    整数倍"检查会当场发现，而不是静默读出错位的描述子。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.stat().st_size if path.exists() else 0
+    if existing % SLOT_STRIDE:
+        raise ValueError(
+            f"{path} 大小 {existing} 不是 slot 步长 {SLOT_STRIDE} 的整数倍，"
+            f"追加会让整个文件错位"
+        )
+    with open(path, "ab") as fh:
+        fh.write(encode_slot(features))
+        fh.flush()
+    return existing // SLOT_STRIDE
+
+
 class IncompleteWrite(RuntimeError):
     """写入的 slot 数少于声明的 capacity。
 
@@ -83,17 +125,10 @@ class DescStoreWriter:
         slot = self._next
         self._next += 1
 
-        count = truncate_count(len(features))
         base = slot * SLOT_STRIDE
-        raw = self._map[base : base + SLOT_STRIDE]
-        raw[:] = 0
-
-        raw[0:4].view(np.uint32)[0] = count
-        if count:
-            pts = np.ascontiguousarray(features.pts[:count], np.float32)
-            raw[_PTS_OFFSET : _PTS_OFFSET + count * 8].view(np.float32)[:] = pts.ravel()
-            desc = np.ascontiguousarray(features.desc[:count], np.uint8)
-            raw[_DESC_OFFSET : _DESC_OFFSET + count * DESC_BYTES] = desc.ravel()
+        self._map[base : base + SLOT_STRIDE] = np.frombuffer(
+            encode_slot(features), np.uint8
+        )
         return slot
 
     def close(self, require_complete: bool = True) -> None:
