@@ -1,6 +1,7 @@
 import cv2
 import pytest
 
+import photoar.cli as cli_mod
 from photoar.cli import main
 
 
@@ -208,6 +209,78 @@ class TestStridedLimit:
         assert "评估参考图  1/" in out, f"缺少覆盖面分母：\n{out}"
         assert "库外查询图  1/" in out, f"库外也要带分母：\n{out}"
         assert "等间距抽样" in out, "限幅时要说明抽样方式，否则读者会以为是前 N 张"
+
+
+class TestEvalProgress:
+    """长跑必须能被判断活性。
+
+    上规模 0d 的一次 eval 是 29740 次查询、约 1 小时，改之前整个过程零输出，
+    日志文件一小时都停在 0 字节——从外面完全分不清它是在正常跑、卡在某张图
+    上、还是早就死了。
+    """
+
+    def test_progress_goes_to_stderr_not_stdout(self, tmp_path, photo_dir, capsys):
+        """stdout 那份报告会被逐行引用进结果文档，掺进进度行就污染了它。"""
+        corpus = tmp_path / "corpus"
+        main(["build", "--photos", str(photo_dir), "--out", str(corpus),
+              "--holdout-frac", "0.3"])
+        capsys.readouterr()
+
+        main(["eval", "--corpus", str(corpus), "--samples", "1"])
+        cap = capsys.readouterr()
+        assert "[eval] 库内参考图" in cap.err, f"stderr 里没有进度行：\n{cap.err}"
+        assert "[eval] 库外查询图" in cap.err, f"库外那段也要打进度：\n{cap.err}"
+        assert "[eval]" not in cap.out, f"进度行不该出现在 stdout：\n{cap.out}"
+
+    def test_last_item_always_reported(self, tmp_path, photo_dir, capsys):
+        """间隔整除不到最后一张时也必须收尾打一行，否则日志会停在
+        "18/20" 上，看日志的人分不清是跑完了还是最后两张卡死了。"""
+        corpus = tmp_path / "corpus"
+        main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+        capsys.readouterr()
+
+        n = len(cli_mod.load_corpus(corpus)[1])
+        main(["eval", "--corpus", str(corpus), "--samples", "1"])
+        err = capsys.readouterr().err
+        assert f"库内参考图 {n}/{n}" in err, f"最后一张没收尾：\n{err}"
+
+    def test_unreadable_ref_does_not_skip_a_number(self, tmp_path, photo_dir, capsys,
+                                                  monkeypatch):
+        """读不出来的那张也要计进进度。用 `continue` 跳过 _progress 的话
+        计数会跳号，看日志的人会以为进度行漏打了。"""
+        corpus = tmp_path / "corpus"
+        main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+        capsys.readouterr()
+
+        entries = cli_mod.load_corpus(corpus)[1]
+        n = len(entries)
+        assert n >= 2, f"这个测试需要至少 2 张参考图，实际 {n} 张"
+        # 让最后一张读取失败：它恰好是"收尾那一行"必须打出来的位置。
+        doomed = entries[-1].ref_path
+        real_imread = cli_mod.cv2.imread
+        monkeypatch.setattr(
+            cli_mod.cv2, "imread",
+            lambda p, *a, **k: None if str(p) == str(doomed) else real_imread(p, *a, **k),
+        )
+
+        main(["eval", "--corpus", str(corpus), "--samples", "1"])
+        cap = capsys.readouterr()
+        assert f"库内参考图 {n}/{n}" in cap.err, (
+            f"最后一张读取失败时进度停在了前一张：\n{cap.err}"
+        )
+        assert "读取失败" in cap.out, f"跳过的张数要报出来：\n{cap.out}"
+
+    def test_interval_scales_so_output_stays_bounded(self):
+        """按张数触发而不是每张都打：1000 张打 1000 行会把日志淹掉，
+        而 20 行足够看出速度和剩余时间。"""
+        from photoar.cli import _PROGRESS_LINES, _progress_every
+
+        assert _progress_every(1000) == 50
+        assert _progress_every(29740) == 1487
+        # 小语料不能算出 0 —— i % 0 会 ZeroDivisionError。
+        for n in (0, 1, 5, 19):
+            assert _progress_every(n) >= 1, f"n={n} 算出了非正间隔"
+        assert 1000 // _progress_every(1000) == _PROGRESS_LINES
 
 
 def test_eval_rejects_negative_limit(tmp_path, photo_dir, capsys):

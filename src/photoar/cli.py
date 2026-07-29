@@ -11,6 +11,9 @@
 eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法或环境错误。
 退出码可直接被 CI 使用。
 
+eval 的进度行（`[eval] 库内参考图 i/n ...`）走 **stderr**，stdout 只有那份
+会被引用进结果文档的报告。上规模跑动辄一小时，没有进度行就无法判断活性。
+
 --holdout-frac（finding I8）：build 时按这个比例留出一部分照片彻底不
 入库，写进语料目录的 holdout.json；随后 `photoar eval` 会自动读取它，
 把这些照片当"库外查询"（真实场景里最常见的假阳性来源：用户拍了一张库
@@ -19,6 +22,7 @@ eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法�
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -136,6 +140,46 @@ def _strided(items: list, limit: int) -> list:
     return [items[int(i * step)] for i in range(limit)]
 
 
+_PROGRESS_LINES = 20
+
+
+def _progress_every(n: int) -> int:
+    """进度行的打印间隔：整段大约打 `_PROGRESS_LINES` 行。
+
+    按**张数**而不是按时间（"每 30 秒一行"）触发，这样同一份语料 + 同样的
+    参数，进度行出现的位置逐次运行完全一致——行里的耗时数字当然会变，但
+    "第几张打一行"是确定的，测试才能精确断言而不用做模糊匹配。
+    """
+    return max(1, n // _PROGRESS_LINES)
+
+
+def _progress(label: str, i: int, n: int, t0: float, every: int) -> None:
+    """往 stderr 打一行 `i/n + 已用时间 + 预计剩余`。
+
+    为什么必须有：0d 上规模的一次 eval 是 29740 次查询、约 1 小时，而在这
+    之前整个过程零输出——日志文件一小时都停在 0 字节，从外面完全分不清它
+    是在正常跑、卡在某张图上、还是早就死了。长跑必须能被判断活性，否则
+    只能靠 `ps` 猜。
+
+    打在 stderr 而不是 stdout：stdout 那份报告会被逐行引用进结果文档，
+    掺进进度行就污染了它（库外误识别详情走 stderr 是同一个理由）。
+
+    预计剩余用的是**至今为止的平均速度**，不是瞬时速度。参考图之间的成本
+    差异不小（分辨率、特征点数都不同），瞬时速度会剧烈跳动；平均值在前几
+    张会偏，但越跑越准，对"还要等多久"这个用途够了。
+    """
+    if i % every and i != n:
+        return
+    elapsed = time.time() - t0
+    eta = elapsed / i * (n - i) if i else 0.0
+    print(
+        f"[eval] {label} {i}/{n}  已用 {elapsed / 60:.1f}min  "
+        f"预计还需 {eta / 60:.1f}min",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     if args.limit < 0:
         # M12：--limit -5 若不拦，entries[:-5] 会被 Python 切片语义悄悄解释
@@ -176,14 +220,19 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     # I7 的跳过原因统计，避免"评估参考图"这个分母悄悄变小却没人知道。
     per_ref_metrics = []
     unreadable = 0
-    for e in chosen:
+    t0 = time.time()
+    ref_every = _progress_every(len(chosen))
+    for i, e in enumerate(chosen, 1):
         img = cv2.imread(e.ref_path, cv2.IMREAD_COLOR)
         if img is None:
             unreadable += 1
-            continue
-        per_ref_metrics.append(
-            evaluate(rec, {e.photo_id: img}, samples_per_ref=args.samples, seed=args.seed)
-        )
+        else:
+            per_ref_metrics.append(
+                evaluate(rec, {e.photo_id: img}, samples_per_ref=args.samples, seed=args.seed)
+            )
+        # 读不出来的那张也要计进进度：用 if/else 而不是 `continue`，否则读取
+        # 失败会让计数跳号，看日志的人会以为漏打了。
+        _progress("库内参考图", i, len(chosen), t0, ref_every)
 
     if not per_ref_metrics:
         print("参考图都读不出来，检查 manifest 里的 ref_path 是否还有效",
@@ -205,16 +254,19 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     holdout_paths = _strided(all_holdout, args.limit)
     per_oos_metrics = []
     oos_unreadable = 0
-    for p in holdout_paths:
+    oos_t0 = time.time()
+    oos_every = _progress_every(len(holdout_paths))
+    for i, p in enumerate(holdout_paths, 1):
         img = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if img is None:
             oos_unreadable += 1
-            continue
-        per_oos_metrics.append(
-            evaluate_out_of_library(
-                rec, {str(p): img}, samples_per_ref=args.samples, seed=args.seed
+        else:
+            per_oos_metrics.append(
+                evaluate_out_of_library(
+                    rec, {str(p): img}, samples_per_ref=args.samples, seed=args.seed
+                )
             )
-        )
+        _progress("库外查询图", i, len(holdout_paths), oos_t0, oos_every)
 
     if holdout_paths and not per_oos_metrics:
         print("库外查询图都读不出来，检查 holdout.json 里的路径是否还有效",
