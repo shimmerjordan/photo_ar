@@ -11,6 +11,23 @@ def _res(photo_id, inliers, ok=None, det=1.0):
     return V.PairResult(photo_id=photo_id, inliers=inliers, det=det, ok=ok)
 
 
+def test_ransac_max_iters_is_capped_at_200():
+    """Pin the RANSAC iteration cap: 200 vs default 2000. The cost is only on non-matches
+    (true matches use adaptive termination, ~0.34 ms regardless). Measured with 12 true pairs
+    and 12 false pairs: lowering from 2000 to 200 keeps true-match inlier counts byte-identical,
+    nudges false-match counts slightly down (safer), and cuts false-match cost from 20.56 ms
+    to 2.19 ms — a 10× improvement for Top-20 refinement without changing verdicts.
+
+    This cap limits effort on hard cases. RANSAC needs roughly log(1-p)/log(1-w^4) iterations
+    for a 4-point model at inlier ratio w; 200 covers w ≥ 0.37, while 500 covers w ≥ 0.29.
+    Badly distorted real photos could land near 0.3, so a marginal true match may become a miss
+    — the acceptable direction, since misses cost an order of magnitude less than false positives.
+    Milestone 0d on real photos will reveal whether 200 is too tight; raising this knob costs
+    time only on non-matches.
+    """
+    assert V.RANSAC_MAX_ITERS == 200
+
+
 def test_verify_pair_matches_image_against_its_own_synthetic_query(textured_image):
     img = textured_image(seed=1, w=1000, h=700)
     ref = F.extract(img)

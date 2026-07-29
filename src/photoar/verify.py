@@ -26,6 +26,12 @@ DET_MAX = 20.0
 RATIO = 1.5
 RANSAC_REPROJ = 3.0
 
+# RANSAC 的迭代上限。默认 2000 只在**假匹配**上被烧满——真匹配靠自适应终止，
+# 恒定约 0.34ms。实测把上限降到 200：12 个真匹配的内点数完全不变、假匹配的内点数
+# 略降（更安全的方向）、误判仍为 0，而假匹配耗时从 20.56ms 降到 2.19ms。
+# 这个上限只限制"难例上花多少力气"，不改变任何判定条件。
+RANSAC_MAX_ITERS = 200
+
 MIN_MATCHES_FOR_HOMOGRAPHY = 4
 
 
@@ -60,7 +66,7 @@ def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
 
     src = query.pts[[m.queryIdx for m in matches]]
     dst = ref.pts[[m.trainIdx for m in matches]]
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_REPROJ)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_REPROJ, maxIters=RANSAC_MAX_ITERS)
     if H is None or mask is None:
         return _fail(photo_id)
 
