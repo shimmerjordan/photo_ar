@@ -3000,7 +3000,9 @@ git commit -m "feat: ffmpeg 转码封装（720p/1.5Mbps/15s/faststart）"
 - Produces:
   - `CorpusPaths` frozen dataclass：`root: Path`、`desc: Path`、`vocab: Path`、`index: Path`、`manifest: Path`、`imgdb_dir: Path`，类方法 `at(root) -> CorpusPaths`
   - `PhotoEntry` frozen dataclass：`photo_id: str`、`ref_path: str`、`quality_score: int`、`imgdb_bytes: int`
-  - `build_corpus(image_paths: list[Path], out_root: Path, seed: int = 0, arcoreimg: str | None = None) -> list[PhotoEntry]`
+  - `build_corpus(image_paths: list[Path], out_root: Path, seed: int = 0, arcoreimg: str | None = None, print_width_m: float = 0.152) -> list[PhotoEntry]`
+  - `CorpusIntegrityError(RuntimeError)`；`load_corpus` 校验每个 slot 的描述子指纹，并对最多 5 张抽样做倒排索引自查
+  - ⚠️ 自查的 top_k **必须**随语料规模缩放：`k = max(1, min(TOP_K, n_docs // 2))`。用固定的 `TOP_K=20` 时，`index.query` 会把 k 夹到 `n_docs`，于是语料 ≤20 张时返回全部文档、检测概率恰好为 0——而小语料正是测试套件构造的规模。缩放后 12 张语料下 5 个抽样的检测率约 97%
   - `load_corpus(root: Path) -> tuple[TwoStageRecognizer, list[PhotoEntry]]`
   - `main(argv: list[str] | None = None) -> int`，子命令 `build` / `eval`
 
@@ -3242,8 +3244,12 @@ def build_corpus(
         if arcoreimg is not None:
             try:
                 score = Q.assert_quality(path, arcoreimg=arcoreimg)
+                # print_width_m 是必填的——Task 9 按 arcoreimg 实测接口给
+                # build_single_target_db 加了这个参数（物理宽度在建库时烘进 .imgdb），
+                # 漏掉它会在带真实 arcoreimg 运行时直接 TypeError。
                 imgdb_bytes = Q.build_single_target_db(
                     path, name=photo_id,
+                    print_width_m=print_width_m,
                     out_path=paths.imgdb_dir / f"{photo_id}.imgdb",
                     arcoreimg=arcoreimg,
                 )
