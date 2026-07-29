@@ -22,7 +22,7 @@ import pytest
 
 from photoar import dedup, synth
 from photoar.features import extract
-from photoar.verify import MIN_INLIERS, PairResult
+from photoar.verify import DEDUP_MIN_INLIERS, PairResult
 
 
 def _all_others(n: int) -> list[list[int]]:
@@ -110,9 +110,9 @@ class TestScanPairs:
             f"全部候选对得分 {report.pair_scores}，自匹配分 {report.self_scores}"
         )
         # 重复对的内点数应当远高于阈值，不相似对应当远低于阈值。
-        assert report.pair_scores[(0, 1)] >= MIN_INLIERS * 2
+        assert report.pair_scores[(0, 1)] >= DEDUP_MIN_INLIERS * 2
         distinct = [v for k, v in report.pair_scores.items() if k != (0, 1)]
-        assert distinct and max(distinct) < MIN_INLIERS
+        assert distinct and max(distinct) < DEDUP_MIN_INLIERS
 
     def test_ratio_test_survivor_is_not_flagged_but_loser_is(self, monkeypatch):
         """**这条钉住的是 5058 张真实语料上推翻纯绝对阈值的那条结论。**
@@ -124,7 +124,7 @@ class TestScanPairs:
         因此会在第一条断言上失败。"""
         monkeypatch.setattr(dedup, "verify_pair", _fixed(40))
         safe = dedup.scan_pairs([object()] * 2, [[1], [0]], [100, 100])
-        assert safe.pair_scores[(0, 1)] == 40 >= MIN_INLIERS, "前提：已过绝对阈值"
+        assert safe.pair_scores[(0, 1)] == 40 >= DEDUP_MIN_INLIERS, "前提：已过绝对阈值"
         assert safe.dup_pairs == [], (
             "内点数 40 但自匹配 100，ratio test 通得过，识别器不会混淆，"
             "不能判成重复——这正是旧实现剔掉 14.3% 照片的原因"

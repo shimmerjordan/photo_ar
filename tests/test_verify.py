@@ -124,25 +124,30 @@ def test_decide_accepts_clear_single_winner():
 
 
 def test_decide_accepts_when_only_one_candidate():
-    d = V.decide([_res("a", 40)])
+    d = V.decide([_res("a", V.MIN_INLIERS)])
     assert d.matched
     assert d.photo_id == "a"
 
 
+# 下面两条的分数写成 MIN_INLIERS ± 小量，而不是写死数字。它们要钉的是比值检验
+# 的**语义**（top1 过了下限但相对 top2 不够突出 -> ambiguous），跟下限具体是 25
+# 还是 40 无关。写死数字的话，下限一动这两条就会以 `weak` 的形式假失败——看起来
+# 像判定逻辑坏了，其实只是构造数据整体掉到了下限以下。
 def test_decide_rejects_ambiguous_pair():
-    """第一名 30、第二名 25：30 < 1.5*25=37.5，判否。
+    """第一名刚过下限、第二名正好在下限上：top1 < 1.5*top2，判否。
     这一条是压住误识别率的关键，宁可漏检。
     """
-    d = V.decide([_res("a", 30), _res("b", 25)])
+    d = V.decide([_res("a", V.MIN_INLIERS + 5), _res("b", V.MIN_INLIERS)])
     assert not d.matched
     assert d.reason == "ambiguous"
 
 
 def test_ratio_test_counts_candidates_below_inlier_threshold():
-    """第二名 24 分（自身未过 MIN_INLIERS）也必须参与比值检验：
-    第一名 26 < 1.5*24=36，判否。只在通过者之间比会放过这类歧义。
+    """第二名自身未过 MIN_INLIERS 也必须参与比值检验：
+    第一名 MIN_INLIERS+1 < 1.5*(MIN_INLIERS-1)，判否。
+    只在通过者之间比会把这类歧义当成"唯一通过者"放行。
     """
-    d = V.decide([_res("a", 26), _res("b", 24)])
+    d = V.decide([_res("a", V.MIN_INLIERS + 1), _res("b", V.MIN_INLIERS - 1)])
     assert not d.matched
     assert d.reason == "ambiguous"
 
@@ -234,3 +239,41 @@ class TestDecideWith:
             by_verify_pair = V._passes(inliers, det, V.MIN_INLIERS, V.DET_MIN, V.DET_MAX)
             by_decide = V.decide_with([expected]).reason != "weak"
             assert by_verify_pair == by_decide, f"inliers={inliers} det={det} 两边判定不一致"
+
+
+class TestTheTwoInlierFloorsStayOrdered:
+    """识别侧下限（`MIN_INLIERS`）与去重侧下限（`DEDUP_MIN_INLIERS`）的关系。
+
+    这一条不是风格约束，是正确性约束。两个常量量的不是同一个量：识别侧量
+    「扰动查询图 vs 库内原图」，去重侧量「两张原图之间」，后者系统性偏低
+    （实测同一对从原图 21 涨到查询时 33）。所以去重侧必须 <= 识别侧。
+
+    为什么值得用测试钉住：违反它**不会**报错，也不会让任何现有测试变红。
+    症状是 dedup 少剔了本该剔的对，那些照片入库后互相挤成 ambiguous、
+    **两份都永久漏检**，而用户只会看到"这张扫不出来"。
+    """
+
+    def test_dedup_floor_is_not_above_the_recognizer_floor(self):
+        assert V.DEDUP_MIN_INLIERS <= V.MIN_INLIERS, (
+            f"去重下限 {V.DEDUP_MIN_INLIERS} 高于识别下限 {V.MIN_INLIERS}："
+            f"原图内点数在 [{V.MIN_INLIERS}, {V.DEDUP_MIN_INLIERS}) 的对不会被判为"
+            f"近重复，但它们在查询时完全可能越过 {V.MIN_INLIERS} 而互相混淆，"
+            f"结果是两份都永久漏检。抬识别侧阈值时不要顺手把去重侧一起抬。"
+        )
+
+    def test_dedup_module_default_tracks_the_dedup_floor_not_the_recognizer(self):
+        """`scan_pairs` 的默认下限必须是去重侧那个常量。
+
+        直接查签名默认值而不是跑一遍扫描：这里要防的是"import 改回
+        MIN_INLIERS"这一种改动，它在行为上只有阈值差一档，跑扫描的测试
+        （用的都是远高于/远低于阈值的构造数据）照样全绿。
+        """
+        import inspect
+
+        from photoar import dedup
+
+        default = inspect.signature(dedup.scan_pairs).parameters["min_inliers"].default
+        assert default == V.DEDUP_MIN_INLIERS, (
+            f"dedup.scan_pairs 的 min_inliers 默认值是 {default}，"
+            f"应为 verify.DEDUP_MIN_INLIERS={V.DEDUP_MIN_INLIERS}"
+        )

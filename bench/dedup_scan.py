@@ -51,7 +51,7 @@ from photoar.corpus import IMAGE_SUFFIXES, TRAIN_DESC_CAP
 from photoar.features import extract
 from photoar.index import InvertedIndexBuilder
 from photoar.recognizer import TOP_K
-from photoar.verify import MIN_INLIERS, RATIO
+from photoar.verify import DEDUP_MIN_INLIERS, RATIO
 
 _BUCKETS = ((0, 5), (6, 10), (11, 15), (16, 20), (21, 25), (26, 50), (51, 100),
             (101, 200))
@@ -76,9 +76,10 @@ def main() -> int:
                     help="另建一个符号链接目录，每簇只链一张，可直接 photoar build")
     ap.add_argument("--top-k", type=int, default=TOP_K,
                     help=f"每张照片检查多少个粗排候选，默认 {TOP_K}（与识别器一致）")
-    ap.add_argument("--min-inliers", type=int, default=MIN_INLIERS,
-                    help=f"判为近重复的内点阈值，默认 {MIN_INLIERS}"
-                         f"（= verify.MIN_INLIERS，与识别器同口径）")
+    ap.add_argument("--min-inliers", type=int, default=DEDUP_MIN_INLIERS,
+                    help=f"判为近重复的内点阈值，默认 {DEDUP_MIN_INLIERS}"
+                         f"（= verify.DEDUP_MIN_INLIERS）。它**低于**识别侧的"
+                         f"下限是刻意的：这里量的是原图互查，比查询时系统性偏低")
     ap.add_argument("--ratio", type=float, default=RATIO,
                     help=f"ratio test 系数，默认 {RATIO}（= verify.RATIO，与识别器"
                          f"同口径）。判为冲突的条件是 min(自匹配分) < ratio x 互查内点数")

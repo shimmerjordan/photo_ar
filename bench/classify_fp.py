@@ -18,7 +18,11 @@ B 去清语料（清不掉）。
 
     m = max(verify_pair(a,b), verify_pair(b,a)) 的内点数   # verify_pair 不对称
     s = min(self_score(a), self_score(b))                  # 现实自匹配分
-    近重复  <=>  m >= MIN_INLIERS 且 s < RATIO * m
+    近重复  <=>  m >= DEDUP_MIN_INLIERS 且 s < RATIO * m
+
+下限用去重侧的 `DEDUP_MIN_INLIERS`（25）而不是识别侧的 `MIN_INLIERS`（40）：这里
+量的是原图，与 `photoar.dedup` 同一口径。跟着识别侧走会改变归类结果，也就改变
+"真实误识别有多少"这个数——而那个数正是识别侧阈值的依据，会绕成一个环。
 
 用法：
     python bench/classify_fp.py --corpus <语料目录> --eval-log <eval 的日志>
@@ -42,7 +46,14 @@ import cv2
 
 from photoar import dedup, synth
 from photoar.features import extract
-from photoar.verify import DET_MAX, DET_MIN, MIN_INLIERS, RATIO, verify_pair
+from photoar.verify import (
+    DEDUP_MIN_INLIERS,
+    DET_MAX,
+    DET_MIN,
+    MIN_INLIERS,
+    RATIO,
+    verify_pair,
+)
 
 # eval 打的那一行长这样（注意行首两个空格）：
 #   /path/to/holdout.jpg -> 7a9e84fb41f19245
@@ -151,9 +162,9 @@ def main(argv: list[str] | None = None) -> int:
         fb, _ = feats(ref)
         m, det = mutual_inliers(fa, fb)
         s = min(self_of(qid), self_of(ref))
-        if m >= MIN_INLIERS and s < RATIO * m:
+        if m >= DEDUP_MIN_INLIERS and s < RATIO * m:
             kind = "漏掉的近重复"
-        elif m >= MIN_INLIERS:
+        elif m >= DEDUP_MIN_INLIERS:
             kind = "能几何对上但不该混淆"
         else:
             kind = "真实误识别"
@@ -167,8 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         if i % 20 == 0:
             log(f"[fp]   {i}/{len(fps)}（{time.time() - t0:.0f}s）")
 
-    log(f"[fp] 归类完成（{time.time() - t0:.0f}s），判据 MIN_INLIERS={MIN_INLIERS} "
-        f"RATIO={RATIO}：")
+    log(f"[fp] 归类完成（{time.time() - t0:.0f}s），判据 DEDUP_MIN_INLIERS="
+        f"{DEDUP_MIN_INLIERS} RATIO={RATIO}：")
     for kind, cnt in kinds.most_common():
         log(f"[fp]   {kind}: {cnt}（{cnt / len(fps):.1%}）")
 
@@ -179,11 +190,12 @@ def main(argv: list[str] | None = None) -> int:
         # 抬阈值的代价会落到召回率上，那就得换别的手段。
         vals = sorted(r["mutual_inliers"] for r in genuine)
         log(f"[fp] 真实误识别的原图互查内点数：最小 {vals[0]} 中位 "
-            f"{vals[len(vals) // 2]} 最大 {vals[-1]}（阈值 {MIN_INLIERS}）")
+            f"{vals[len(vals) // 2]} 最大 {vals[-1]}（归类下限 {DEDUP_MIN_INLIERS}）")
         log("[fp] 注意：这是**原图**互查的内点数，不是查询时的。假阳性发生在"
             "合成扰动后的查询图上，扰动会造出额外的伪内点，实测同一对能从原图"
             "的 21 涨到查询时的 33。所以这一行只能说明两张原图有多不像，"
-            "不能直接拿来定 MIN_INLIERS——要定阈值得量查询时的内点数分布")
+            f"不能直接拿来定 MIN_INLIERS（现为 {MIN_INLIERS}）——那个值要靠"
+            "查询时的分布来定，见 bench/threshold_scan.py")
         for r in genuine[:10]:
             log(f"[fp]   {Path(r['holdout']).name} -> {Path(r['ref_path']).name}"
                 f"  原图内点 {r['mutual_inliers']}  自匹配分 {r['self_score_min']}")

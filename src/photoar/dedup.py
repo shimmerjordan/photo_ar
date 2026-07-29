@@ -16,7 +16,8 @@ ambiguous，两张不能同时入库；不满足就不会混淆，**必须都留
 
 ## 5058 张真实语料上推翻的两条旧设计（不要改回去）
 
-旧实现用"m >= MIN_INLIERS(25)"当判据、并用并查集连通分量"每簇留一张"。
+旧实现用"m >= 25（当时识别侧的内点数下限）"当判据、并用并查集连通分量"每簇留
+一张"。
 在 5058 张 Oxford5k 上实测这两条都是错的：
 
 1. **绝对内点数阈值差了 2.6 倍。** 实测 m 在 25-40 的对，s/m 中位 **3.03**
@@ -59,7 +60,7 @@ from statistics import median
 from typing import Any
 
 from .features import Features
-from .verify import DET_MAX, DET_MIN, MIN_INLIERS, RATIO, verify_pair
+from .verify import DEDUP_MIN_INLIERS, DET_MAX, DET_MIN, RATIO, verify_pair
 
 
 def self_score(
@@ -134,7 +135,7 @@ def scan_pairs(
     features: Sequence[Features],
     candidates: Sequence[Sequence[int]],
     self_scores: Sequence[int],
-    min_inliers: int = MIN_INLIERS,
+    min_inliers: int = DEDUP_MIN_INLIERS,
     ratio: float = RATIO,
     top_k: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -154,6 +155,11 @@ def scan_pairs(
     self_scores 是必需参数而不是可选：默认它就等于回退到纯绝对阈值判据，
     而那个判据在真实语料上剔掉 14.3% 的照片（见模块 docstring）。让调用方
     忘记传就静默退回错误行为，是这个模块最不该有的失败方式。
+
+    min_inliers 默认取 `verify.DEDUP_MIN_INLIERS`（25）而**不是**识别侧的
+    `verify.MIN_INLIERS`（40）。这里的 m 是原图互查的内点数，比查询时系统性
+    偏低（实测同一对 21 -> 33），跟着识别侧抬上去会让本该剔的对留在库里，
+    换来的是永久漏检。理由的完整版写在 `verify.DEDUP_MIN_INLIERS` 的注释里。
     """
     if len(features) != len(candidates):
         raise ValueError(
