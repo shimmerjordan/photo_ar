@@ -89,3 +89,101 @@ def test_build_reports_error_when_arcoreimg_missing(tmp_path, photo_dir, capsys)
     err = capsys.readouterr().err
     assert rc == 2
     assert "入库失败" in err
+
+
+# ---------------------------------------------------------------------------
+# 最终整体审阅追加：C1（eval 内存）、M12（负数 --limit）、I4（损坏语料的
+# 退出码）。
+# ---------------------------------------------------------------------------
+
+
+def test_eval_streams_ref_images_one_at_a_time(tmp_path, photo_dir, capsys, monkeypatch):
+    """C1：_cmd_eval 原来先把 --limit 选中的每一张参考图都 cv2.imread 解码进
+    一个大 dict，再一次性调用 evaluate()——一张 12MP 手机照解码后约 36.6MB，
+    1 万张图库就是约 366GB 常驻内存，0d 第一次真实 eval 会直接 OOM。
+    修复后必须一次只解码一张参考图、调一次 evaluate()（流式），用完立刻可
+    以被回收，不管图库多大，同时活着的解码后参考图最多一张。用 monkeypatch
+    换掉 cli 模块引用的 evaluate 来窥探每次调用收到的 refs 字典大小——
+    这测的是"确实在流式"，而不是"eval 命令没崩溃"（后者旧实现也能通过）。
+    """
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+    capsys.readouterr()
+
+    import photoar.cli as cli_mod
+
+    real_evaluate = cli_mod.evaluate
+    batch_sizes: list[int] = []
+
+    def spy_evaluate(rec, refs, **kwargs):
+        batch_sizes.append(len(refs))
+        return real_evaluate(rec, refs, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "evaluate", spy_evaluate)
+
+    rc = main(["eval", "--corpus", str(corpus), "--samples", "2"])
+    assert batch_sizes, "evaluate() 从未被调用"
+    assert all(n == 1 for n in batch_sizes), (
+        f"C1：必须一次只把一张参考图喂给 evaluate()，实际批次大小 {batch_sizes}"
+    )
+    assert rc in (0, 1)
+
+
+def test_eval_rejects_negative_limit(tmp_path, photo_dir, capsys):
+    """M12：--limit -5 目前会被 Python 切片语义悄悄解释成 entries[:-5]
+    （从末尾截断），而不是"负数是非法输入"。这在 --limit 打字打错负号时会
+    悄悄评估一个跟用户预期完全不同、更小的子集，而不是报错。"""
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+    capsys.readouterr()
+
+    rc = main(["eval", "--corpus", str(corpus), "--limit", "-5"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "-5" in err
+
+
+def test_build_converts_print_width_mm_to_metres_for_arcoreimg(
+    tmp_path, photo_dir, capsys, fake_arcoreimg
+):
+    """I6：cli.py 的 `args.print_width_mm / 1000.0` 转换此前完全没有测试
+    覆盖——fake arcoreimg 原来从不校验清单第三列（宽度），这条转换写错了
+    （比如漏掉 /1000、或者不小心传成别的单位）也不会有任何测试失败。这里
+    传 --print-width-mm 200（对应 0.2 米），配 expected_width_m=0.2 的假
+    arcoreimg，端到端验证这个值真的被正确换算并烘进了 arcoreimg 的清单。
+    """
+    corpus = tmp_path / "corpus"
+    fake = fake_arcoreimg(expected_width_m=0.2)
+    rc = main([
+        "build", "--photos", str(photo_dir), "--out", str(corpus),
+        "--arcoreimg", fake, "--print-width-mm", "200",
+    ])
+    err = capsys.readouterr().err
+    assert rc == 0, f"单位换算错误会让 arcoreimg 因清单宽度不匹配而报错：{err}"
+
+
+def test_eval_on_truncated_desc_store_exits_2_not_1(tmp_path, photo_dir, capsys):
+    """I4：desc.bin 被截断一个 slot 后，manifest/index 仍记录原有数量，三者
+    对不上。旧实现里 _verify_desc_fingerprints 会对着一个少了一个 slot 的
+    store 调 store.read(最后一个下标)，抛出未捕获的 IndexError，进程以
+    Python 默认退出码 1 结束——这违反了退出码约定（1 应该只表示"未达标"，
+    这里其实是语料产物损坏，该是 2）。TwoStageRecognizer.__init__ 本来能
+    干净地捕获这种数量不一致，但它在 load_corpus 里排在指纹校验循环
+    **之后**才构造，救不了。断言退出码恰好是 2，而不只是"非零"——旧的 bug
+    行为下退出码是 1，也是非零，用 assert rc != 0 测不出问题。"""
+    from photoar.corpus import CorpusPaths
+    from photoar.descstore import SLOT_STRIDE
+
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+    capsys.readouterr()
+
+    paths = CorpusPaths.at(corpus)
+    data = paths.desc.read_bytes()
+    assert len(data) % SLOT_STRIDE == 0 and len(data) > SLOT_STRIDE
+    paths.desc.write_bytes(data[:-SLOT_STRIDE])  # 去掉最后一个 slot
+
+    rc = main(["eval", "--corpus", str(corpus)])
+    err = capsys.readouterr().err
+    assert rc == 2, f"损坏的语料必须映射到退出码 2（环境/产物错误），实际是 {rc}"
+    assert err
