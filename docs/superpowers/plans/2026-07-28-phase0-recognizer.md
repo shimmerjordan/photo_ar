@@ -2879,8 +2879,14 @@ def has_faststart(path: str | Path) -> bool:
     """检查 moov 是否出现在 mdat 之前。
 
     直接读文件头判断，比解析 ffprobe 的 trace 输出稳得多。
+
+    ⚠️ 必须用 f.read(n) 读有界前缀，**不能**写成
+    `Path(path).read_bytes()[:n]` —— 后者会先把整个文件读进内存再切片。
+    probe() 每次都调本函数，包括对**转码前的原始大文件**，而「源文件过大」
+    恰恰是本模块存在的理由；4K 手机视频动辄几百 MB。
     """
-    head = Path(path).read_bytes()[:_FASTSTART_PROBE_BYTES]
+    with open(path, "rb") as f:
+        head = f.read(_FASTSTART_PROBE_BYTES)
     moov, mdat = head.find(b"moov"), head.find(b"mdat")
     if moov == -1:
         return False  # 头部没有 moov，说明它在后面
@@ -2907,7 +2913,21 @@ def probe(path: str | Path, ffprobe: str = "ffprobe") -> VideoInfo:
     if video is None:
         raise RuntimeError(f"{path} 里没有视频流")
 
-    duration_s = float(data.get("format", {}).get("duration") or video.get("duration") or 0.0)
+    # 时长取**流**的时长而非容器的 format.duration：AAC 编码器的 priming delay
+    # 被计入容器总时长，实测 format.duration 系统性比流时长多约 24ms
+    # （3 秒素材：format 3.024 而 video/audio 均为 3.000），会让刚好 15 秒的
+    # 转码产物探测成 15024ms 而误触发 needs_transcode。
+    # 用 max() 覆盖音轨长于视轨的情形；候选按「键是否存在」收集，不能按转成
+    # float 后的真假判断，否则合法的 0.0 会被当成缺失。
+    candidates = [
+        float(s["duration"])
+        for s in data.get("streams", [])
+        if s.get("codec_type") in ("video", "audio") and s.get("duration") is not None
+    ]
+    if candidates:
+        duration_s = max(candidates)
+    else:
+        duration_s = float(data.get("format", {}).get("duration") or 0.0)
     return VideoInfo(
         width=int(video["width"]),
         height=int(video["height"]),
