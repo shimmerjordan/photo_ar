@@ -8,7 +8,15 @@ from photoar import corpus as C
 from photoar import features as F
 from photoar import synth
 from photoar import vocab as V
-from photoar.corpus import CorpusIntegrityError, CorpusPaths, build_corpus, load_corpus
+from photoar.corpus import (
+    CorpusIntegrityError,
+    CorpusPaths,
+    build_corpus,
+    load_corpus,
+    load_holdout,
+    select_holdout,
+    write_holdout,
+)
 from photoar.descstore import DescStore, DescStoreWriter
 from photoar.index import InvertedIndexBuilder
 
@@ -309,6 +317,89 @@ def test_load_corpus_rejects_truncated_desc_store_before_fingerprint_loop(tmp_pa
 
     with pytest.raises(CorpusIntegrityError):
         load_corpus(out)
+
+
+# ---------------------------------------------------------------------------
+# finding I8（最终整体审阅追加）：select_holdout 从 build_corpus 的输入照片
+# 里确定性地切出一部分，这部分从此彻底不参与 extract/词汇树训练/倒排索引/
+# manifest——是"库外查询"这个概念在代码里的真正落地：不是"库内某张没被
+# 抽到当 ref"，是识别器的候选库里根本不存在这张照片的任何痕迹。
+# ---------------------------------------------------------------------------
+
+
+def test_select_holdout_excludes_holdout_photos_from_library(photo_dir):
+    _, paths = photo_dir
+    library, holdout = select_holdout(paths, frac=0.25, seed=0)
+    assert len(holdout) == 3  # round(12 * 0.25) = 3
+    assert len(library) == 9
+    assert set(library).isdisjoint(set(holdout))
+    assert set(library) | set(holdout) == set(sorted(paths))
+
+
+def test_select_holdout_is_deterministic_for_the_same_seed(photo_dir):
+    """spec 要求：同一个 seed 两次 build 必须留出同一批照片。"""
+    _, paths = photo_dir
+    lib1, hold1 = select_holdout(paths, frac=0.25, seed=7)
+    lib2, hold2 = select_holdout(paths, frac=0.25, seed=7)
+    assert hold1 == hold2
+    assert lib1 == lib2
+
+
+def test_select_holdout_differs_across_seeds_on_a_large_enough_pool(photo_dir):
+    _, paths = photo_dir
+    _, hold_a = select_holdout(paths, frac=0.25, seed=1)
+    _, hold_b = select_holdout(paths, frac=0.25, seed=2)
+    assert hold_a != hold_b
+
+
+def test_select_holdout_zero_frac_holds_out_nothing(photo_dir):
+    _, paths = photo_dir
+    library, holdout = select_holdout(paths, frac=0.0, seed=0)
+    assert holdout == []
+    assert library == sorted(paths)
+
+
+def test_select_holdout_rejects_frac_that_would_empty_the_library(photo_dir):
+    _, paths = photo_dir
+    with pytest.raises(ValueError):
+        select_holdout(paths, frac=1.0, seed=0)
+
+
+def test_build_corpus_never_ingests_holdout_photos(tmp_path, photo_dir):
+    """端到端确认：select_holdout 切出的留出图确实一张都没有进 build_corpus
+    的产物——manifest 里不会出现它们的 photo_id，desc.bin 的 slot 数也要
+    对得上"库内"那部分的数量，不是全部 12 张。"""
+    d, paths = photo_dir
+    library, holdout = select_holdout(paths, frac=0.25, seed=0)
+    assert len(holdout) == 3
+
+    out = tmp_path / "corpus"
+    entries = build_corpus(library, out, seed=0, arcoreimg=None)
+    assert len(entries) == len(library)
+
+    holdout_ids = {C._photo_id(p) for p in holdout}
+    manifest_ids = {e.photo_id for e in entries}
+    assert holdout_ids.isdisjoint(manifest_ids)
+
+
+def test_write_and_load_holdout_roundtrips(tmp_path, photo_dir):
+    _, paths = photo_dir
+    out = tmp_path / "corpus"
+    out.mkdir()
+    _, holdout = select_holdout(paths, frac=0.25, seed=0)
+    write_holdout(out, holdout)
+
+    loaded = load_holdout(out)
+    assert loaded == holdout
+
+
+def test_load_holdout_returns_empty_list_when_no_holdout_file(tmp_path):
+    """build 时没给 --holdout-frac 的语料没有 holdout.json——这是默认
+    情况，load_holdout 必须返回空列表而不是报错，eval 据此判断"这次没有
+    库外测量"，行为与这个特性存在之前完全一致。"""
+    out = tmp_path / "corpus"
+    out.mkdir()
+    assert load_holdout(out) == []
 
 
 # ---------------------------------------------------------------------------

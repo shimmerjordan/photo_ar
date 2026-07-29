@@ -1,10 +1,17 @@
 """photoar 命令行入口。
 
-    photoar build --photos <目录> --out <语料目录> [--arcoreimg <路径>] [--print-width-mm 152]
+    photoar build --photos <目录> --out <语料目录> [--arcoreimg <路径>]
+                  [--print-width-mm 152] [--holdout-frac 0.1]
     photoar eval  --corpus <语料目录> [--samples 20] [--limit N] [--seed 1]
+                  [--strict-latency]
 
 eval 的退出码：0 = 达到 spec §14.2 基线，1 = 未达标，2 = 用法或环境错误。
 退出码可直接被 CI 使用。
+
+--holdout-frac（finding I8）：build 时按这个比例留出一部分照片彻底不
+入库，写进语料目录的 holdout.json；随后 `photoar eval` 会自动读取它，
+把这些照片当"库外查询"（真实场景里最常见的假阳性来源：用户拍了一张库
+里没有的东西），在报告里单独给出库外误识别率，不与库内数字混在一起。
 """
 
 import argparse
@@ -20,18 +27,21 @@ from .corpus import (
     CorpusIntegrityError,
     build_corpus,
     load_corpus,
+    load_holdout,
+    select_holdout,
+    write_holdout,
 )
-from .evaluate import combine, evaluate
+from .evaluate import combine, combine_out_of_library, evaluate, evaluate_out_of_library
 
 _DEFAULT_PRINT_WIDTH_MM = DEFAULT_PRINT_WIDTH_M * 1000.0
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
     photo_dir = Path(args.photos)
-    paths = sorted(
+    all_paths = sorted(
         p for p in photo_dir.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES
     )
-    if not paths:
+    if not all_paths:
         print(f"在 {photo_dir} 下没有找到图片（支持 {sorted(IMAGE_SUFFIXES)}）",
               file=sys.stderr)
         return 2
@@ -40,9 +50,24 @@ def _cmd_build(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
+    # finding I8：--holdout-frac 从全部照片里确定性地切出一部分，彻底不参与
+    # 下面的 build_corpus——这部分留出图会被写进语料目录的 holdout.json，
+    # 供 `photoar eval` 当"库外查询"测出真正的生产环境假阳性率（用户拍了
+    # 一张库里没有的东西），而不是像此前那样只能测"库内 A 认成库内 B"。
+    # 默认 0.0 不留出任何图，行为与这个特性存在之前完全一致。
+    library_paths, holdout_paths = all_paths, []
+    if args.holdout_frac:
+        try:
+            library_paths, holdout_paths = select_holdout(
+                all_paths, args.holdout_frac, args.seed
+            )
+        except ValueError as exc:
+            print(f"--holdout-frac 参数有问题：{exc}", file=sys.stderr)
+            return 2
+
     try:
         entries = build_corpus(
-            paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg,
+            library_paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg,
             print_width_m=args.print_width_mm / 1000.0,
         )
     except ValueError as exc:
@@ -75,6 +100,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 f".imgdb 体积  最小 {min(sizes)}  中位 {sorted(sizes)[len(sizes)//2]}  "
                 f"最大 {max(sizes)} 字节"
             )
+    if holdout_paths:
+        write_holdout(args.out, holdout_paths)
+        print(
+            f"留出 {len(holdout_paths)} 张作为库外查询测试集（从未入库），"
+            f"写入 {args.out}/holdout.json —— `photoar eval` 会自动用它们"
+            f"测库外误识别率"
+        )
     return 0
 
 
@@ -132,12 +164,48 @@ def _cmd_eval(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    metrics = combine(per_ref_metrics)
+    # finding I8：如果 build 时给了 --holdout-frac，语料目录里会有
+    # holdout.json——这些照片从未进入语料，是真正意义上的"库外查询"（不是
+    # "库内某张没被抽到当 ref"）。用它们当合成查询源，测的就是生产环境里
+    # 最常见的那种假阳性：用户拍了一张库里没有的东西。跟库内参考图（C1）
+    # 同样的理由，一次只解码一张、调一次 evaluate_out_of_library()，不把
+    # 留出图也整批摊进内存。
+    holdout_paths = load_holdout(args.corpus)
+    per_oos_metrics = []
+    oos_unreadable = 0
+    for p in holdout_paths:
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if img is None:
+            oos_unreadable += 1
+            continue
+        per_oos_metrics.append(
+            evaluate_out_of_library(
+                rec, {str(p): img}, samples_per_ref=args.samples, seed=args.seed
+            )
+        )
+
+    if holdout_paths and not per_oos_metrics:
+        print("库外查询图都读不出来，检查 holdout.json 里的路径是否还有效",
+              file=sys.stderr)
+        return 2
+
+    oos_metrics = combine_out_of_library(per_oos_metrics) if holdout_paths else None
+
+    # Minor #10：P95 延迟默认不影响退出码（0a 的暴力检索 P95 534ms 远超
+    # 80ms 目标，但已记录的结论是"达标"——默认折进判定会追溯改写那条历史
+    # 结论）。--strict-latency 是显式 opt-in，只有调用方主动要求才会让超
+    # 延迟的结果把退出码从 0 翻成 1。
+    metrics = combine(per_ref_metrics, oos=oos_metrics, latency_gate=args.strict_latency)
     print(f"图库规模    {len(entries)}")
     eval_line = f"评估参考图  {len(per_ref_metrics)}"
     if unreadable:
         eval_line += f"（另有 {unreadable} 张参考图读取失败，已跳过）"
     print(eval_line)
+    if holdout_paths:
+        oos_line = f"库外查询图  {len(per_oos_metrics)}"
+        if oos_unreadable:
+            oos_line += f"（另有 {oos_unreadable} 张读取失败，已跳过）"
+        print(oos_line)
     print(metrics.as_report())
     return 0 if metrics.meets_baseline else 1
 
@@ -157,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"参考图实际打印宽度（毫米），烘进 .imgdb；仅在提供 --arcoreimg 时"
              f"才会用到，默认 {_DEFAULT_PRINT_WIDTH_MM:g}mm",
     )
+    b.add_argument(
+        "--holdout-frac", type=float, default=0.0,
+        help="按这个比例（0~1，不含两端）从照片里确定性留出一部分，彻底不"
+             "入库，写入语料目录的 holdout.json；`photoar eval` 会自动用它们"
+             "测库外误识别率（finding I8）。默认 0 = 不留出，行为不变",
+    )
     b.set_defaults(func=_cmd_build)
 
     e = sub.add_parser("eval", help="用合成查询图评估识别率")
@@ -164,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--samples", type=int, default=20)
     e.add_argument("--limit", type=int, default=0, help="只评估前 N 张，0 = 全部")
     e.add_argument("--seed", type=int, default=1)
+    e.add_argument(
+        "--strict-latency", action="store_true",
+        help="把 P95 延迟也折进达标判定（默认不折入，因为这会改变已录得的"
+             "0a/0b 历史结论的口径——0a 的暴力检索 P95 就超出目标，见 Minor #10）",
+    )
     e.set_defaults(func=_cmd_eval)
 
     args = parser.parse_args(argv)

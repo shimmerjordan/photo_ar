@@ -162,6 +162,127 @@ def test_build_converts_print_width_mm_to_metres_for_arcoreimg(
     assert rc == 0, f"单位换算错误会让 arcoreimg 因清单宽度不匹配而报错：{err}"
 
 
+# ---------------------------------------------------------------------------
+# finding I8（最终整体审阅追加）：此前所有里程碑都只用库内照片当查询源，
+# "误识别 0"只覆盖了"库内 A 认成库内 B"这一种混淆，没有覆盖生产环境里更
+# 常见的那种——用户拍一张库里从来没有的东西。下面验证 CLI 端到端接线：
+# build --holdout-frac 写出 holdout.json、eval 自动读取并测出库外误识别率，
+# 与库内数字分开报告。
+# ---------------------------------------------------------------------------
+
+
+def test_build_with_holdout_frac_writes_holdout_json_and_shrinks_library(
+    tmp_path, photo_dir, capsys
+):
+    corpus = tmp_path / "corpus"
+    rc = main([
+        "build", "--photos", str(photo_dir), "--out", str(corpus),
+        "--holdout-frac", "0.3",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "留出" in out
+
+    from photoar.corpus import CorpusPaths
+    cp = CorpusPaths.at(corpus)
+    assert cp.holdout.exists()
+
+    import json
+    manifest = json.loads(cp.manifest.read_text())
+    holdout_data = json.loads(cp.holdout.read_text())
+    # photo_dir 有 10 张，round(10*0.3)=3 留出，7 张入库
+    assert len(holdout_data["paths"]) == 3
+    assert len(manifest["photos"]) == 7
+
+
+def test_eval_reports_out_of_library_false_positive_rate_separately(
+    tmp_path, photo_dir, capsys
+):
+    """真正的端到端验收：build 一次（带 --holdout-frac）+ eval 一次，报告
+    必须同时出现库内与库外两套数字，且明确标注、互不混淆。"""
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus),
+          "--holdout-frac", "0.3", "--seed", "0"])
+    capsys.readouterr()
+
+    rc = main(["eval", "--corpus", str(corpus), "--samples", "3"])
+    out = capsys.readouterr().out
+    assert rc in (0, 1)
+    assert "库外查询图" in out
+    assert "库外误识别" in out
+    assert "库外正确拒绝" in out
+    # 库内数字仍然照常出现，两套数字共存于同一份报告
+    assert "正确命中" in out and "误识别" in out
+
+
+def test_eval_without_holdout_omits_out_of_library_section(tmp_path, photo_dir, capsys):
+    """build 时没给 --holdout-frac（默认行为）时，报告里不应该出现库外
+    相关的任何一行——这是这个特性存在之前的完全等价行为。"""
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+    capsys.readouterr()
+
+    rc = main(["eval", "--corpus", str(corpus), "--samples", "3"])
+    out = capsys.readouterr().out
+    assert rc in (0, 1)
+    assert "库外" not in out
+
+
+def test_build_holdout_frac_is_deterministic_across_rebuilds(tmp_path, photo_dir):
+    """同一个 seed 重新 build 两次（不同输出目录），必须留出同一批照片——
+    spec 明确要求的确定性。"""
+    import json
+    from photoar.corpus import CorpusPaths
+
+    corpus1 = tmp_path / "corpus1"
+    corpus2 = tmp_path / "corpus2"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus1),
+          "--holdout-frac", "0.3", "--seed", "9"])
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus2),
+          "--holdout-frac", "0.3", "--seed", "9"])
+
+    h1 = json.loads(CorpusPaths.at(corpus1).holdout.read_text())["paths"]
+    h2 = json.loads(CorpusPaths.at(corpus2).holdout.read_text())["paths"]
+    assert h1 == h2
+
+
+def test_strict_latency_flag_can_flip_exit_code_when_p95_exceeds_target(
+    tmp_path, photo_dir, capsys, monkeypatch
+):
+    """Minor #10：--strict-latency 必须能把一个正确率/误识别率都达标、但
+    延迟超标的结果从退出码 0 翻成 1——不给这个 flag 时保持旧行为不变
+    （已由 test_eval_streams_ref_images_one_at_a_time 等既有测试覆盖）。
+    用 monkeypatch 整个替换掉 evaluate()，构造一份"正确率 100%、延迟明显
+    超标"的确定性结果，不依赖真实 CV 在这个小语料上恰好能不能测到 95% 正确
+    率这种脆弱前提——这里只测 CLI 对 latency_gate 的接线，不是重新测识别率。
+    """
+    import photoar.cli as cli_mod
+    from photoar.evaluate import Metrics
+
+    corpus = tmp_path / "corpus"
+    main(["build", "--photos", str(photo_dir), "--out", str(corpus)])
+    capsys.readouterr()
+
+    def fake_evaluate(rec, refs, **kwargs):
+        n = kwargs["samples_per_ref"]
+        return Metrics(total=n, correct=n, wrong=0, missed=0, latencies_ms=[900.0] * n)
+
+    monkeypatch.setattr(cli_mod, "evaluate", fake_evaluate)
+
+    rc_default = main(["eval", "--corpus", str(corpus), "--samples", "3", "--limit", "3"])
+    out_default = capsys.readouterr().out
+    assert "达标" in out_default and "未达标" not in out_default
+    assert rc_default == 0  # 默认不看延迟
+
+    rc_strict = main([
+        "eval", "--corpus", str(corpus), "--samples", "3", "--limit", "3",
+        "--strict-latency",
+    ])
+    out_strict = capsys.readouterr().out
+    assert "未达标" in out_strict
+    assert rc_strict == 1
+
+
 def test_eval_on_truncated_desc_store_exits_2_not_1(tmp_path, photo_dir, capsys):
     """I4：desc.bin 被截断一个 slot 后，manifest/index 仍记录原有数量，三者
     对不上。旧实现里 _verify_desc_fingerprints 会对着一个少了一个 slot 的

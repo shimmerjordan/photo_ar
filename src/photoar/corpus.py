@@ -7,6 +7,9 @@ Phase 0 的产物是纯文件，不引入 SQLite —— 数据库是 Phase 1 随
     <root>/index.npz       倒排索引
     <root>/manifest.json   photo_id 顺序与元数据（顺序即 slot/doc 下标）
     <root>/imgdb/<id>.imgdb  单目标库（仅在提供 arcoreimg 时生成）
+    <root>/holdout.json    库外查询测试集（仅在 build 时给了 --holdout-frac
+                           才会生成，见 select_holdout/finding I8）——这些
+                           路径对应的照片从未进入上面任何一个产物文件
 
 manifest 里 photos 的顺序就是描述子库 slot 下标与倒排索引 doc 下标，
 三者必须始终一致——这是 load_corpus 里两项完整性校验（描述子指纹、
@@ -26,8 +29,8 @@ import numpy as np
 
 from . import quality as Q
 from . import vocab as V
-from .descstore import DescStore, DescStoreWriter
-from .features import N_FEATURES, extract
+from .descstore import DescStore, DescStoreWriter, truncate_count
+from .features import extract
 from .index import InvertedIndexBuilder, InvertedIndex
 from .recognizer import TOP_K, TwoStageRecognizer
 
@@ -61,6 +64,12 @@ TRAIN_DESC_CAP = 120_000
 # 对版本号，版本不对就给出清晰错误。
 MANIFEST_VERSION = 2
 
+# finding I8：holdout.json 记录 build 时被留出、从未进入语料的照片路径。
+# 这是独立于 manifest 的一份小文件，不参与 MANIFEST_VERSION 的版本号
+# （它不影响 desc/vocab/index 三者的顺序不变量，load_corpus 完全不需要
+# 它就能正常加载语料），但同样加个自己的版本号，为以后演进格式留余地。
+HOLDOUT_MANIFEST_VERSION = 1
+
 
 class CorpusIntegrityError(RuntimeError):
     """语料本身不可信：顺序对不上，或者 manifest 版本不受支持。
@@ -84,6 +93,7 @@ class CorpusPaths:
     index: Path
     manifest: Path
     imgdb_dir: Path
+    holdout: Path
 
     @classmethod
     def at(cls, root: str | Path) -> "CorpusPaths":
@@ -95,6 +105,7 @@ class CorpusPaths:
             index=root / "index.npz",
             manifest=root / "manifest.json",
             imgdb_dir=root / "imgdb",
+            holdout=root / "holdout.json",
         )
 
 
@@ -116,11 +127,86 @@ def _desc_fingerprint(desc: np.ndarray) -> str:
     """算出即将写入描述子库那份字节的 SHA-256（截断到 N_FEATURES 之后）。
 
     必须和 DescStoreWriter.append 实际写入的字节完全一致，否则 load_corpus
-    校验时会对着两份不同的东西比较，产生假阳性或假阴性。
+    校验时会对着两份不同的东西比较，产生假阳性或假阴性。Minor #23：截断
+    规则本身（min(count, N_FEATURES)）以前在这里和 DescStoreWriter.append
+    里各自独立写了一份，两处一旦分叉，fingerprint 校验就会系统性地误判——
+    现在共用 descstore.truncate_count，确保两处永远同步。
     """
-    count = min(desc.shape[0], N_FEATURES)
+    count = truncate_count(desc.shape[0])
     truncated = np.ascontiguousarray(desc[:count], np.uint8)
     return hashlib.sha256(truncated.tobytes()).hexdigest()
+
+
+def select_holdout(
+    image_paths: list[Path], frac: float, seed: int
+) -> tuple[list[Path], list[Path]]:
+    """按 frac 从 image_paths 里确定性地切出一部分，永远不参与 build_corpus。
+
+    finding I8："库外查询"指的是识别器的候选库里根本不存在这张照片的任何
+    描述子/词/倒排项——不是"库内某张恰好没被抽去当 eval 的参考图"。切分
+    必须发生在 build_corpus **之前**：留出的照片一次都不能进 extract /
+    DescStoreWriter / 词汇树训练 / 倒排索引，否则它的内容早就以别的形式
+    渗进了语料（比如被采样进词汇树训练集），"从未入库"这个前提就不成立了。
+
+    用 default_rng(seed).choice 做不放回抽样：给定同一个 seed，两次对
+    同一批 image_paths 调用必须选中同一批留出图（spec 明确要求的确定性），
+    这里先按路径排序再抽样，保证结果与调用方传入 image_paths 的原始顺序
+    无关（跟 build_corpus 自己对 image_paths 排序的做法一致）。
+
+    返回 (library_paths, holdout_paths)；frac<=0 时 holdout_paths 恒为
+    空列表，library_paths 就是排序后的全量——这是默认行为，不留出任何图，
+    与这个特性存在之前完全等价。
+    """
+    ordered = sorted(Path(p) for p in image_paths)
+    n = len(ordered)
+    if frac <= 0:
+        return ordered, []
+    if not (0 < frac < 1):
+        raise ValueError(f"holdout frac 必须在 (0, 1) 之间，收到 {frac!r}")
+    n_holdout = max(1, round(n * frac))
+    if n_holdout >= n:
+        raise ValueError(
+            f"holdout frac={frac!r} 会把 {n} 张图全部留出（算出 {n_holdout} 张）："
+            f"库里至少要留 1 张才能建语料，换一个更小的 frac 或提供更多照片"
+        )
+    rng = np.random.default_rng(seed)
+    holdout_idx = set(rng.choice(n, size=n_holdout, replace=False).tolist())
+    library = [p for i, p in enumerate(ordered) if i not in holdout_idx]
+    holdout = [ordered[i] for i in sorted(holdout_idx)]
+    return library, holdout
+
+
+def write_holdout(out_root: str | Path, holdout_paths: list[Path]) -> None:
+    """把 select_holdout 切出的留出图路径写进语料目录，供 eval 侧读取。
+
+    与 manifest.json 分开是故意的：留出图从未进入 desc/vocab/index/
+    manifest，不影响 load_corpus 的任何完整性校验，是一份纯附加信息。
+    显式 encoding="utf-8"（不依赖进程 locale）——I5 已经证明真实照片目录
+    里非 ASCII 路径近乎必然出现。
+    """
+    paths = CorpusPaths.at(out_root)
+    paths.holdout.write_text(
+        json.dumps(
+            {
+                "version": HOLDOUT_MANIFEST_VERSION,
+                "paths": [str(p) for p in holdout_paths],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_holdout(root: str | Path) -> list[Path]:
+    """读回 write_holdout 写的留出图路径；语料没有 holdout.json（旧语料，
+    或 build 时没开 --holdout-frac）时返回空列表——eval 侧据此判断"这次
+    没有库外测量"，行为与这个特性存在之前完全一致，不报错。"""
+    paths = CorpusPaths.at(root)
+    if not paths.holdout.exists():
+        return []
+    data = json.loads(paths.holdout.read_text(encoding="utf-8"))
+    return [Path(p) for p in data.get("paths", [])]
 
 
 def build_corpus(
