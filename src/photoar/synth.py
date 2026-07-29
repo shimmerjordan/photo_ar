@@ -61,10 +61,17 @@ def _warp(img: np.ndarray, jitter: float, rng: np.random.Generator) -> np.ndarra
 
 def _glare(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     h, w = img.shape[:2]
-    cx = int(rng.integers(w // 4, 3 * w // 4))
-    cy = int(rng.integers(h // 4, 3 * h // 4))
-    rx = int(rng.integers(w // 8, w // 3))
-    ry = int(rng.integers(h // 8, h // 3))
+    # M15：w、h 小于约 8px 时 w//8 == w//3 == 0（3~7px 时两者虽不相等但
+    # w//3 仍可能是 0），rng.integers(low, high) 在 low>=high 时直接抛
+    # ValueError；即使 low<high，抽到的半径也可能是 0，让下游
+    # cv2.GaussianBlur(..., sigmaX=rx/3.0) 因核大小非正而断言失败。用
+    # max(low + 1, high) 保证区间非空，rx/ry 再用 max(1, ...) 保证半径至少
+    # 是 1px——真实入库照片不会这么小，但 synth 是测试基础设施，任何调用方
+    # 传一张随手构造的极小图都不应该让它崩溃。
+    cx = int(rng.integers(w // 4, max(w // 4 + 1, 3 * w // 4)))
+    cy = int(rng.integers(h // 4, max(h // 4 + 1, 3 * h // 4)))
+    rx = max(1, int(rng.integers(w // 8, max(w // 8 + 1, w // 3))))
+    ry = max(1, int(rng.integers(h // 8, max(h // 8 + 1, h // 3))))
 
     mask = np.zeros((h, w), np.float32)
     cv2.ellipse(mask, (cx, cy), (rx, ry), 0, 0, 360, 1.0, -1)

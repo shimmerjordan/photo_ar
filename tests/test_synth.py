@@ -76,3 +76,24 @@ def test_glare_brightens_a_region(textured_image):
     )
     out = synth.apply(img, p)
     assert int(out.max()) > 130
+
+
+# ---------------------------------------------------------------------------
+# M15（最终审阅追加）：_glare 用 rng.integers(w // 8, w // 3) 取高光半径，
+# 图片小于约 8px 宽/高时 w//8 == w//3 == 0，low==high 让 rng.integers 直接
+# 抛 ValueError；3~7px 之间 low<high 但抽到的半径可能是 0，导致下游
+# cv2.GaussianBlur(..., sigmaX=0) 因核大小非正而断言失败——两种崩溃、同一个
+# 根因（半径计算没考虑极小图）。真实入库照片不会这么小，但 synth 是"随手
+# 构造一张图就能跑"的测试基础设施，边界档不住会让写测试的人猝不及防。
+# ---------------------------------------------------------------------------
+
+
+def test_glare_does_not_crash_on_tiny_images():
+    for size in (1, 2, 3, 4, 5, 7, 8):
+        img = np.zeros((size, size, 3), np.uint8)
+        p = synth.SynthParams(
+            corner_jitter=0.0, blur_sigma=0.0, brightness=1.0,
+            warm_shift=0.0, glare=True, jpeg_quality=85,
+        )
+        out = synth.apply(img, p)  # 不应该抛异常
+        assert out.shape == img.shape
