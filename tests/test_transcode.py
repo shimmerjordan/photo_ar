@@ -89,3 +89,22 @@ def test_transcode_produces_compliant_output(tmp_path, sample_video):
     assert info.duration_ms <= T.MAX_DURATION_MS + 500
     assert T.has_faststart(dst)
     assert not T.needs_transcode(info)
+
+
+def test_transcode_does_not_upscale_a_sub_720p_source(tmp_path, sample_video):
+    """M11：scale=-2:720 是绝对目标高度，遇到本来就矮于 720p 的源也会一样
+    被放大到 720。needs_transcode() 判定要不要转码只看"是否已经 faststart"
+    等条件，跟分辨率无关——一个 640x480、缺 faststart 的素材会触发转码，
+    转码过程本不该把它从 480 放大到 720（放大不增加任何真实清晰度，只是
+    白白增加体积和编码时间，且违背"转码只是把不合规的素材整形，不是升清"
+    这条隐含契约）。用 scale=-2:min(720,ih) 代替 scale=-2:720，让目标高度
+    不超过源高度。
+    """
+    src = sample_video("small.mp4", w=640, h=480, seconds=3, faststart=False)
+    dst = tmp_path / "out.mp4"
+    T.transcode(src, dst)
+
+    info = T.probe(dst)
+    assert info.height <= 480, f"源高度只有 480，转码后不应该被放大到 {info.height}"
+    assert info.width % 2 == 0
+    assert T.has_faststart(dst)

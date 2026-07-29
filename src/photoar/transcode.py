@@ -1,7 +1,16 @@
 """ffmpeg/ffprobe 封装：视频探测与转码到播放规格（spec §12）。
 
 +faststart 是硬要求：没有它 moov box 在文件尾部，客户端无法边下边播。
-scale=-2:720 而非 -1:720，保证宽度为偶数（H.264 的要求）。
+scale=-2:min(720,ih) 而非 scale=-2:720：-2 保证宽度为偶数（H.264 的
+要求）；用 min(720,ih) 而不是恒定的 720，是因为 needs_transcode() 判断
+"要不要转码"只看 faststart/时长/宽度奇偶等条件，跟分辨率高矮无关——一个
+640x480、缺 faststart 的素材一样会触发转码（M11）。如果目标高度写死成
+720，这类矮于 720p 的源会被放大到 720：放大不增加任何真实清晰度，只是
+白白增加编码时间与体积，也违背"转码只整形不合规的素材、不升清"这个隐含
+契约。ffmpeg 的 scale 滤镜支持在参数里直接用 min()/ih 表达式，min() 的
+逗号必须转义（写成 \\,）——不转义的话 ffmpeg 的滤镜链解析器会把它当成
+"下一个滤镜"的分隔符，报 "No such filter" 而不是数值意义上的错误（已用
+真实 ffmpeg 二进制实测两种写法的行为）。
 """
 
 import json
@@ -124,7 +133,7 @@ def transcode(
             ffmpeg, "-y", "-v", "error",
             "-i", str(src),
             "-t", f"{max_duration_ms / 1000:.3f}",
-            "-vf", f"scale=-2:{TARGET_HEIGHT}",
+            "-vf", f"scale=-2:min({TARGET_HEIGHT}\\,ih)",
             "-c:v", "libx264", "-preset", "slow", "-crf", CRF,
             "-maxrate", MAX_BITRATE, "-bufsize", BUF_SIZE,
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
