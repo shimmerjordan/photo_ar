@@ -38,17 +38,27 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 # 宽边）。调用方（CLI 的 --print-width-mm，或直接调用 build_corpus 的
 # 代码）可以覆盖它；如果 0d 的照片是别的尺寸打印的，必须显式传入真实值，
 # 否则烘进 .imgdb 的物理宽度会是错的。
-_DEFAULT_PRINT_WIDTH_M = 0.152
+DEFAULT_PRINT_WIDTH_M = 0.152
+
+# manifest.json 的 schema 版本。v1 -> v2：PhotoEntry 新增 desc_sha256 字段
+# （描述子指纹，供 load_corpus 的 _verify_desc_fingerprints 校验描述子库
+# slot 顺序）。v1 的 manifest 没有这个字段，如果直接当 v2 读，会在构造
+# PhotoEntry(**e) 时因缺字段抛不知所云的 TypeError；load_corpus 改为先比
+# 对版本号，版本不对就给出清晰错误。
+MANIFEST_VERSION = 2
 
 
 class CorpusIntegrityError(RuntimeError):
-    """描述子库 / 倒排索引 / manifest 三者的顺序对不上。
+    """语料本身不可信：顺序对不上，或者 manifest 版本不受支持。
 
     TwoStageRecognizer.__init__ 只检查三者的**长度**相等，这防不住"顺序被
     打乱但长度凑巧一致"的情况——那种情况下 recognize() 会自信地返回一张
     别的、错误的照片，正是本项目权重最高的误识别类别。这个异常由
-    load_corpus 的两项完整性校验抛出：描述子指纹校验证明 slot 与
-    manifest 对应；倒排索引自查证明 doc 下标与 slot/manifest 对应。
+    load_corpus 的两项顺序完整性校验抛出：描述子指纹校验证明 slot 与
+    manifest 对应；倒排索引自查证明 doc 下标与 slot/manifest 对应。同一个
+    异常也在 manifest 版本号与 MANIFEST_VERSION 不一致时抛出——版本不对
+    同样意味着"这份语料不能直接当当前 schema 用"，调用方（cli.py）只需
+    一个 except 分支就能把这些情况统一映射到退出码 2。
     """
 
 
@@ -104,7 +114,7 @@ def build_corpus(
     out_root: str | Path,
     seed: int = 0,
     arcoreimg: str | None = None,
-    print_width_m: float = _DEFAULT_PRINT_WIDTH_M,
+    print_width_m: float = DEFAULT_PRINT_WIDTH_M,
 ) -> list[PhotoEntry]:
     if not image_paths:
         raise ValueError("build_corpus 需要至少一张图片")
@@ -166,7 +176,7 @@ def build_corpus(
 
     paths.manifest.write_text(
         json.dumps(
-            {"version": 1, "photos": [asdict(e) for e in entries]},
+            {"version": MANIFEST_VERSION, "photos": [asdict(e) for e in entries]},
             ensure_ascii=False,
             indent=2,
         )
@@ -263,6 +273,13 @@ def load_corpus(root: str | Path) -> tuple[TwoStageRecognizer, list[PhotoEntry]]
             raise FileNotFoundError(f"语料不完整，缺少 {required}")
 
     data = json.loads(paths.manifest.read_text())
+    version = data.get("version")
+    if version != MANIFEST_VERSION:
+        raise CorpusIntegrityError(
+            f"manifest 版本不受支持：期望 {MANIFEST_VERSION}，实际读到 {version!r}。"
+            f"语料可能是用不兼容的旧版本 photoar 构建的（比如缺 desc_sha256 字段），"
+            f"需要用当前版本重新 build_corpus。"
+        )
     entries = [PhotoEntry(**e) for e in data["photos"]]
 
     voc = V.Vocab.load(paths.vocab)

@@ -13,16 +13,17 @@ from pathlib import Path
 
 import cv2
 
+from . import quality as Q
 from .corpus import (
+    DEFAULT_PRINT_WIDTH_M,
     IMAGE_SUFFIXES,
-    _DEFAULT_PRINT_WIDTH_M,
     CorpusIntegrityError,
     build_corpus,
     load_corpus,
 )
 from .evaluate import evaluate
 
-_DEFAULT_PRINT_WIDTH_MM = _DEFAULT_PRINT_WIDTH_M * 1000.0
+_DEFAULT_PRINT_WIDTH_MM = DEFAULT_PRINT_WIDTH_M * 1000.0
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
@@ -39,10 +40,33 @@ def _cmd_build(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    entries = build_corpus(
-        paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg,
-        print_width_m=args.print_width_mm / 1000.0,
-    )
+    try:
+        entries = build_corpus(
+            paths, args.out, seed=args.seed, arcoreimg=args.arcoreimg,
+            print_width_m=args.print_width_mm / 1000.0,
+        )
+    except ValueError as exc:
+        # build_corpus 在"一张都没入库成功"时抛这个——可能是文件本身读不出
+        # 来、提取不到 ORB 特征点，或者（仅在提供 --arcoreimg 时）质量分低于
+        # 阈值。这不是"未达标"（退出码 1 的语义），语料根本没建出来，是用法
+        # /环境问题，归为退出码 2。
+        print(
+            f"入库失败：{exc}\n"
+            f"常见原因：文件本身读不出来、图片提取不到 ORB 特征点，或者"
+            f"（仅在提供 --arcoreimg 时）质量分低于 {Q.MIN_QUALITY_SCORE}。",
+            file=sys.stderr,
+        )
+        return 2
+    except Q.ArcoreimgMissing as exc:
+        print(f"入库失败：{exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        # 覆盖 IncompleteWrite（DescStoreWriter 内部一致性被破坏，理论上不
+        # 应触发）等其余 RuntimeError 子类。不捕获裸 Exception——真正的 bug
+        # 应该继续以 traceback 形式暴露，而不是被这里悄悄转成退出码。
+        print(f"入库失败：{exc}", file=sys.stderr)
+        return 2
+
     print(f"入库 {len(entries)} 张，语料写入 {args.out}")
     if args.arcoreimg:
         sizes = [e.imgdb_bytes for e in entries if e.imgdb_bytes]
