@@ -1,3 +1,7 @@
+import os
+import subprocess
+import sys
+
 import cv2
 import numpy as np
 
@@ -97,3 +101,50 @@ def test_glare_does_not_crash_on_tiny_images():
         )
         out = synth.apply(img, p)  # 不应该抛异常
         assert out.shape == img.shape
+
+
+# ---------------------------------------------------------------------------
+# Minor #4（最终审阅追加）：apply() 原来用内置 hash((四个 float, 一个 bool,
+# 一个 int) 的 tuple) 派生内部 rng 的 seed。审阅者实测确认这在当前 CPython
+# 下跨进程稳定——PYTHONHASHSEED 的随机加盐只作用于 str/bytes/datetime，不
+# 作用于 float/bool/int 组成的 tuple——所以今天没有活 bug。但这份稳定性
+# 完全没有被测试钉住：谁都可能在未来给 SynthParams 加一个 str 字段（比如
+# 一个可读的"profile"标签）而不觉得这有什么问题，届时 hash() 就会因为
+# tuple 里混进了 str 而开始跨进程变化，静默摧毁 phase0-results.md 里记录
+# 的每一个准确率数字的可复现性——没有任何测试会变红，因为改的是加了新
+# 字段这件事本身，不是这个函数。换成 struct.pack + zlib.crc32（都是标准
+# 库、显式小端字节布局）之后不再有这个隐患。
+# ---------------------------------------------------------------------------
+
+
+def test_params_seed_is_pinned_for_a_known_synthparams():
+    """钉住一组已知 SynthParams 派生出的具体 seed 数值。以后不管是换派生
+    算法，还是不小心往 struct.pack 的格式串/参数列表里漏加或多加一个
+    字段，都会被这条断言的失败立刻捕捉到——这正是旧的 hash() 实现缺的
+    那道防线：换派生方式那次改动本身没有任何测试会变红。"""
+    p = synth.SynthParams(
+        corner_jitter=0.1, blur_sigma=0.5, brightness=1.1,
+        warm_shift=-0.05, glare=True, jpeg_quality=70,
+    )
+    assert synth._params_seed(p) == 1180488566
+
+
+def test_params_seed_is_independent_of_pythonhashseed():
+    """Minor #4 的核心担忧不是"今天会不会崩"，而是"这份稳定性有没有被
+    强制"。换成 struct.pack+crc32 后，即使故意用不同的 PYTHONHASHSEED 起
+    三个独立子进程，派生出的 seed 也必须完全一致——不再依赖"SynthParams
+    里从来没有 str 字段"这条从未被代码检查过的隐藏前提。"""
+    code = (
+        "from photoar.synth import SynthParams, _params_seed\n"
+        "p = SynthParams(0.1, 0.5, 1.1, -0.05, True, 70)\n"
+        "print(_params_seed(p))\n"
+    )
+    seeds = set()
+    for hashseed in ("0", "1", "2"):
+        env = dict(os.environ, PYTHONHASHSEED=hashseed)
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, env=env, check=True,
+        )
+        seeds.add(out.stdout.strip())
+    assert len(seeds) == 1, f"PYTHONHASHSEED 不应该影响派生结果，实际得到 {seeds}"

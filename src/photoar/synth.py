@@ -12,6 +12,8 @@
   jpeg_quality   JPEG 压缩，模拟客户端上传前的编码损失
 """
 
+import struct
+import zlib
 from dataclasses import dataclass
 
 import cv2
@@ -82,11 +84,42 @@ def _glare(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _params_seed(p: SynthParams) -> int:
+    """把 SynthParams 的字段确定性地派生成一个 [0, 2**32) 的 rng seed。
+
+    Minor #4：旧实现用内置 hash((浮点数/bool/int 组成的 tuple))。一位
+    审阅者实测确认这在当前 CPython 下跨进程稳定——PYTHONHASHSEED 的随机
+    加盐只作用于 str/bytes/datetime，不作用于 float/bool/int 组成的
+    tuple——所以今天没有活 bug。但这份稳定性从未被测试钉住、也从未被
+    写进文档，纯属"恰好如此"：SynthParams 每个里程碑都在单独进程里跑
+    （0a/0b/0d 各自的 measure 脚本、CLI 的每次 photoar eval 调用），如果
+    以后随手给 SynthParams 加一个 str 字段（比如给某种扰动加个可读的
+    "profile" 标签），就会在完全不触碰这个函数的情况下，悄悄让
+    phase0-results.md 里已经记录的每一个准确率数字失去可复现性——没有
+    任何测试会因此变红，因为 hash() 本身没有变，变的是它对 str 的加盐
+    行为。换成 struct.pack + zlib.crc32（都是标准库）：只处理定长的
+    float64/bool/int32 字段，字节布局用 "<" 显式钉死小端，不掺入任何
+    Python 对象哈希，因而不依赖 PYTHONHASHSEED，也不会在未来加了 str
+    字段时静默变化（除非真的把 str 字段也塞进这个 pack 里，那是显式改
+    动，会被下面 test_synth.py 里钉住具体数值的测试立刻测出来）。
+
+    Verified（wave 2 报告里也记录了这次验证）：换算法必然会让派生出的
+    具体 seed 整数变化（hash() 的 tuple 哈希算法与 crc32(struct.pack(...))
+    在数学上就是两回事），所以同一组 SynthParams 生成的合成图片字节确实
+    会变——但 corner_jitter/blur_sigma 等参数本身的取值范围/分布完全不变，
+    变的只是"用哪一组具体随机数来实现这次扰动"，不是扰动的统计特性。
+    """
+    payload = struct.pack(
+        "<dddd?i",
+        p.corner_jitter, p.blur_sigma, p.brightness, p.warm_shift,
+        p.glare, p.jpeg_quality,
+    )
+    return zlib.crc32(payload)
+
+
 def apply(img_bgr: np.ndarray, p: SynthParams) -> np.ndarray:
     # 用参数自身派生 rng，让 apply 对同一 params 也是确定性的
-    seed = abs(hash((p.corner_jitter, p.blur_sigma, p.brightness,
-                     p.warm_shift, p.glare, p.jpeg_quality))) % (2**32)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_params_seed(p))
 
     out = img_bgr
     if p.corner_jitter > 0:
