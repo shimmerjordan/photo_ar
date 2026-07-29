@@ -45,6 +45,7 @@ PHOTOAR_BRANCHING=16 PHOTOAR_DEPTH=4 python bench/measure_0b.py
 | `fetch_dataset.py` | 取数（HTTP Range 六段并行，约 2.6 MB/s） | 1.9 GB，约 13 分钟 |
 | `dedup_scan.py` | 哪些照片互为近似重复、该留哪一张 | 约 18 分钟 |
 | `classify_fp.py` | 每条库外假阳性是"漏掉的近重复"还是"真实误识别" | 与假阳性条数成正比 |
+| `threshold_scan.py` | 查询时的内点数 / ratio 分布，以及"阈值改成 X 会怎样" | `record` 与 eval 同价，`analyze` 秒级 |
 
 ```bash
 # 1) 取数：标准检索基准集，同一批地标的大量不同视角照片
@@ -63,6 +64,15 @@ photoar eval --corpus ~/photoar-data/corpus --samples 10 --limit 500 --seed 1 \
 # 4) 库外假阳性不为 0 时必做：把每条假阳性归类
 python bench/classify_fp.py --corpus ~/photoar-data/corpus \
     --eval-log ~/photoar-data/eval.log --out ~/photoar-data/fp.json
+
+# 5) 要动 MIN_INLIERS / RATIO 之前必做：量查询时的分布，再离线扫网格
+#    record 的参数必须与第 3 步完全一致，录出来的行才对应同一批查询
+python bench/threshold_scan.py record --corpus ~/photoar-data/corpus \
+    --samples 10 --limit 500 --seed 1 --out ~/photoar-data/rows.jsonl
+#    --fp-min-inliers/--fp-ratio 要填**产出 fp.json 那次 eval 的阈值**。默认取
+#    当前常量；抬过 MIN_INLIERS 之后旧产物必须显式给旧值，否则交叉校验假失败
+python bench/threshold_scan.py analyze --rows ~/photoar-data/rows.jsonl \
+    --fp-json ~/photoar-data/fp.json --fp-min-inliers 25 --fp-ratio 1.5
 ```
 
 ### 第 2 步不能跳过
@@ -74,7 +84,7 @@ python bench/classify_fp.py --corpus ~/photoar-data/corpus \
 判定逻辑在 `photoar.dedup`（有单元测试），`dedup_scan.py` 只是它的命令行外壳。
 
 判据是 **ratio test**（`min(自匹配分) < RATIO × 互查内点数`），不是"内点数超过
-某个绝对阈值"。差别不是调参级的：Oxford5k 5058 张上，`>= MIN_INLIERS` 判出
+某个绝对阈值"。差别不是调参级的：Oxford5k 5058 张上，`>= 25`（绝对下限）判出
 1801 对、ratio test 判出 358 对，配上错误的选择算法会多剔 3.9 倍照片
 （14.3% vs 3.7%）。别照抄先导语料上"内点数直方图有空隙"的结论——那是 153 张
 小语料的假象，5063 张上是连续谱。详见结果文档的"里程碑 0d 上规模"。
@@ -117,6 +127,86 @@ python bench/classify_fp.py --corpus ~/photoar-data/corpus \
 （`[eval] 库内参考图 250/1000  已用 12.3min  预计还需 36.9min`）和库外误识别
 命中详情（第 4 步要吃的就是它）。1000 张 × 20 样本这一档要跑约 1 小时，
 没有进度行就只能靠 `ps` 猜它是在跑还是卡死了。
+
+### 第 5 步：为什么不能直接对着数字调阈值
+
+两条都是实测踩出来的：
+
+- **原图互查内点数 ≠ 查询时的内点数。** 第 4 步量的是原图（`classify_fp.py`
+  不经合成扰动），因为"这两张是不是同一张的另一份编码"是照片本身的属性。但
+  假阳性发生在扰动后的查询图上，扰动会造出额外的伪内点——实测同一对能从原图
+  的 21 涨到查询时的 33。拿原图数字定 `MIN_INLIERS` 会定低。
+- **一个阈值重跑一次 eval 不可行。** 一次 54 分钟，`threshold_scan.py` 默认
+  的 8×6 网格就是 22 小时。
+
+所以是"录一次、离线重放任意阈值"：`record` 把每次查询的 top1/top2 候选分数
+写成 JSONL，`analyze` 在这些行上重算判定。重放是**精确**的，不是近似的——
+`verify_pair` 算出的 inliers/det 与阈值无关（阈值只参与判定），候选排序也只按
+inliers，所以 top1/top2 足以还原任意 `(MIN_INLIERS, RATIO)` 下的结果。
+`tests/test_thresholds.py::TestReplayReproducesTheRealRun` 钉住了这件事：默认
+阈值下重放的计数必须与 `evaluate()` 真跑的计数完全相等。
+
+那条断言跑在 12 张合成语料上。真实语料上还有一道交叉校验，`analyze --fp-json`
+会自己打出来：在 `--fp-min-inliers` / `--fp-ratio` 上重放录到的假阳性**对**
+（去重后）必须与 `fp.json` 的对集逐对相同。它不通过就说明录制和 eval 不是同一批
+查询，网格数字不能用——这是真实语料上唯一能发现参数对错了对象的地方。
+
+那两个参数必须是**产出 `fp.json` 那次 eval 的阈值**，不是当前的模块常量。两者
+一开始相同，抬过 `MIN_INLIERS` 之后就不同了，那时按当前常量比会得到更少的假阳性
+对，交叉校验以"归类表有而没录到 N 对"的形式假失败——症状看着像"录制和 eval 不是
+同一批"，其实只是阈值变了，两种情况的处置完全不同（补个参数 vs 整批数据作废）。
+所以这个失败路径自带诊断：脚本会在网格上找是否**唯一**存在一组阈值能逐对复现，
+找到就直接告诉你该传什么。
+
+判定与计数逻辑在 `photoar.thresholds` 和 `photoar.verify.decide_with`（都有
+测试），脚本只做 IO 和报表。`analyze` 的 `--fp-json` 会把库外假阳性按第 4 步
+的归类拆开——**不拆开就会对着"同一被摄物体的不同照片"调阈值**，那是语料属性，
+调阈值治不好它，只会伤召回。
+
+`record` 的参数必须与产出对照数字的那次 `photoar eval` 逐字相同（`--samples`
+`--limit` `--seed`，以及同一个语料目录）。查询图由 `(seed, photo_id)` 确定性
+派生，所以参数一致就意味着录的是同一批查询图；差一个参数，录出来的行数、报表
+格式都一模一样，但对应的是另一批查询，不会有任何迹象提示对错了对象。
+
+网格表有三处记号要照字面读：
+
+- **达标**列分两种。`全部✅` 是把库外假阳性全算上（`SweepPoint.meets_baseline`，
+  与 `eval` 报告里"达标"两个字同一份代码）；`真实✅` 只算真实误识别那一份。分开
+  标是因为这份语料上前者几乎不可能达标——Oxford5k 就是同一批地标的大量不同视角
+  照片，"能几何对上但不该混淆"占了假阳性的 78.5%，那是语料属性，会掩盖后者的差异。
+- **其中真实**取的是**上界**（真实误识别 + 未归类），不是已归类的那个数。
+  `fp.json` 只在 `--fp-min-inliers` / `--fp-ratio` 那组阈值上归类过；比它松的行
+  会冒出没归类过的假阳性对，按下界算就会显得"放松阈值反而误识别更少"，那是归类表
+  覆盖不全的假象。
+- 带 `?` 的行就是含未归类对的行。要消掉它，得在那个阈值下重跑 `classify_fp.py`。
+
+粗网格之后还有一段**按 1 的细扫**，用来定位可行窗口的两端（下界 = 真实误识别归零
+的最小值，上界 = 命中率仍守住基线的最大值）。窗口宽度就是"取下界"这个选择还剩多少
+对未见语料的余量——粗网格给不出这个数。扫描范围由数据算出，不写死：写死的话换一份
+语料就可能整个窗口都落在范围外，而表格照样打得出来，看着像"没有可行点"。
+
+最后那行推荐按 spec §14.2「一律牺牲漏检率保误识别率」排序（真实误识别升序、命中率
+降序），**不是**按命中率排。两者会给出不同答案：0d 上规模的数据上 `30/1.5` 命中率
+最高但真实误识别 0.092%，`40/1.5` 命中率低 0.5pp 而真实误识别为 0。
+
+### 🔴 拿到扫描结果后：内点数下限有两个，不要统一
+
+这一轮的结论是 `MIN_INLIERS` 25 → **40**，但改的时候必须只改识别侧。`verify.py`
+里现在是两个常量：
+
+| 常量 | 值 | 量的是 | 谁在用 |
+|---|---|---|---|
+| `MIN_INLIERS` | 40 | 扰动查询图 vs 库内原图 | 识别路径（`verify_pair` / `decide_with`） |
+| `DEDUP_MIN_INLIERS` | 25 | 两张原图之间 | `dedup_scan.py`、`classify_fp.py`、`photoar.dedup` |
+
+查询时的内点数系统性高于原图（实测同一对 21 → 33），所以去重的下限必须**低于**
+识别的下限，否则原图 25-39 分那批近重复对不再被剔，而它们在查询时完全可能越过
+40 —— 直接推高「漏掉的近重复」。抬阈值让 dedup 少剔照片，方向看着"更保守"，实际
+是把风险从"误删照片"换成"两份都永久漏检"，而后者用户无从追查。
+
+`tests/test_verify.py::TestTheTwoInlierFloorsStayOrdered` 钉住了这两条，因为违反
+它不会报错、也不会让任何现有 dedup 测试变红（那些测试用的都是远高于/远低于阈值的
+构造数据，差一档照样全绿）。
 
 ## `fetch_real_photos.py`（已弃用，保留作记录）
 
