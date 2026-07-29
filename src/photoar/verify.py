@@ -11,6 +11,10 @@
 
 行列式用带符号值而非绝对值：负行列式意味着镜像变换，而实体照片经
 相机成像永远不会镜像，因此负值必须判否。这比 spec 的 abs(det) 更严。
+
+产品路径调 `decide(results)`；`decide_with(results, min_inliers=..., ratio=...)`
+是同一套判定的参数化版本，供阈值扫描用另一组阈值重放录好的候选分数
+（见 decide_with 的文档与 bench/threshold_scan.py）。
 """
 
 from dataclasses import dataclass
@@ -55,6 +59,20 @@ def _fail(photo_id: str) -> PairResult:
     return PairResult(photo_id=photo_id, inliers=0, det=0.0, ok=False)
 
 
+def _passes(
+    inliers: int, det: float, min_inliers: int, det_min: float, det_max: float
+) -> bool:
+    """前两条判定：内点数下限 + 带符号行列式区间。
+
+    verify_pair 与 decide_with 共用这一个实现，而不是各写一遍同一个表达
+    式。理由是 decide_with 支持用**另一组阈值**重放已经录好的候选分数
+    （bench/threshold_scan.py）：如果两边各算一次，改了一边忘了另一边，
+    重放出来的数字会和真跑不一致，而且不会有任何报错——扫出来的阈值是要
+    直接写回产品的，这种静默漂移代价太大。
+    """
+    return inliers >= min_inliers and det_min <= det <= det_max
+
+
 def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
     if len(query) < MIN_MATCHES_FOR_HOMOGRAPHY or len(ref) < MIN_MATCHES_FOR_HOMOGRAPHY:
         return _fail(photo_id)
@@ -72,21 +90,44 @@ def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
 
     inliers = int(mask.sum())
     det = float(np.linalg.det(H))
-    ok = inliers >= MIN_INLIERS and DET_MIN <= det <= DET_MAX
+    ok = _passes(inliers, det, MIN_INLIERS, DET_MIN, DET_MAX)
     return PairResult(photo_id=photo_id, inliers=inliers, det=det, ok=ok)
 
 
-def decide(results: list[PairResult]) -> Decision:
+def decide_with(
+    results: list[PairResult],
+    *,
+    min_inliers: int = MIN_INLIERS,
+    ratio: float = RATIO,
+    det_min: float = DET_MIN,
+    det_max: float = DET_MAX,
+) -> Decision:
+    """用**指定的**阈值做三条判定，而不是用模块常量。
+
+    存在的理由：0d 上规模跑出库外误识别 6.951%，要回答"把 MIN_INLIERS 或
+    RATIO 调到多少能关掉这个缺口、代价是多少漏检"，唯一诚实的做法是把一次
+    真跑里每个查询的候选分数录下来，再用不同阈值重放——而不是各调一个值重
+    跑一次（一次 54 分钟）、更不是靠原图内点数估（实测同一对能从原图 21 涨
+    到查询时 33）。
+
+    重放是**精确**的，不是近似：verify_pair 算出的 inliers/det 与阈值无关
+    （阈值只参与判定），候选排序也只按 inliers，所以录下 top1/top2 就足以
+    还原任意 (min_inliers, ratio) 下的判定。提高 min_inliers 不会让 top2
+    顶上来——top1 过不了就直接判 weak，这是 decide 的既有语义。
+
+    这里重新计算前两条判定，不复用 PairResult.ok：ok 是 verify_pair 用模块
+    常量算的，重放时那个值正是要被替换掉的东西。
+    """
     if not results:
         return Decision(matched=False, photo_id=None, inliers=0, reason="empty")
 
     ranked = sorted(results, key=lambda r: -r.inliers)
     top1 = ranked[0]
-    if not top1.ok:
+    if not _passes(top1.inliers, top1.det, min_inliers, det_min, det_max):
         return Decision(matched=False, photo_id=None, inliers=top1.inliers, reason="weak")
 
     runner_up = ranked[1].inliers if len(ranked) > 1 else 0
-    if top1.inliers < RATIO * runner_up:
+    if top1.inliers < ratio * runner_up:
         return Decision(
             matched=False, photo_id=None, inliers=top1.inliers, reason="ambiguous"
         )
@@ -94,3 +135,8 @@ def decide(results: list[PairResult]) -> Decision:
     return Decision(
         matched=True, photo_id=top1.photo_id, inliers=top1.inliers, reason="ok"
     )
+
+
+def decide(results: list[PairResult]) -> Decision:
+    """产品路径的判定：decide_with 配 spec §8.3 的那组阈值。"""
+    return decide_with(results)

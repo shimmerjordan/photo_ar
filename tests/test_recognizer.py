@@ -95,3 +95,54 @@ def test_id_count_must_match_index_and_store(corpus):
     _, ids, voc, index, store = corpus
     with pytest.raises(ValueError):
         TwoStageRecognizer(voc, index, store, ids[:-1])
+
+
+class TestVerifyCandidates:
+    """暴露原始候选分数，供 bench/threshold_scan.py 录制后离线重放阈值。
+
+    这一段本来内联在 recognize() 里。拆出来的理由不是美观：扫描脚本需要
+    每个候选的 inliers/det，如果脚本自己抄一遍粗排+精排，"扫描用的管线"就会
+    和产品管线各自漂移，而扫出来的阈值是要直接写回产品的。
+    """
+
+    def test_recognize_is_exactly_decide_over_verify_candidates(self, corpus):
+        """recognize() 必须等于 decide(verify_candidates())，不是"大致等于"。
+
+        这条是重放法的地基：如果 recognize 里还藏着别的判定逻辑，录下来的
+        候选分数就还原不出真实判定，整套扫描结论都不成立。
+        """
+        from photoar.verify import decide
+
+        images, ids, voc, index, store = corpus
+        rec = TwoStageRecognizer(voc, index, store, ids)
+        for i in (0, 7, 23, 39):
+            query, _ = synth.generate(images[i], count=1, seed=i + 1)[0]
+            assert rec.recognize(query) == decide(rec.verify_candidates(query))
+
+    def test_returns_at_most_top_k_scored_candidates(self, corpus):
+        images, ids, voc, index, store = corpus
+        rec = TwoStageRecognizer(voc, index, store, ids, top_k=5)
+        query, _ = synth.generate(images[3], count=1, seed=9)[0]
+        results = rec.verify_candidates(query)
+        assert 0 < len(results) <= 5
+        assert all(r.photo_id in ids for r in results)
+
+    def test_candidate_scores_do_not_depend_on_the_thresholds(self, corpus):
+        """inliers/det 与阈值无关——这是"录一次、任意阈值重放"能成立的另一半
+        前提。改掉模块常量后重跑同一个查询，分数必须逐个字节相同，只有 ok
+        这个派生字段会跟着变。
+        """
+        import photoar.verify as V
+
+        images, ids, voc, index, store = corpus
+        rec = TwoStageRecognizer(voc, index, store, ids)
+        query, _ = synth.generate(images[11], count=1, seed=2)[0]
+
+        before = [(r.photo_id, r.inliers, r.det) for r in rec.verify_candidates(query)]
+        original = V.MIN_INLIERS
+        try:
+            V.MIN_INLIERS = 999
+            after = [(r.photo_id, r.inliers, r.det) for r in rec.verify_candidates(query)]
+        finally:
+            V.MIN_INLIERS = original
+        assert before == after

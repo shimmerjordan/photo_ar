@@ -11,7 +11,7 @@ import numpy as np
 from .descstore import DescStore
 from .features import extract
 from .index import InvertedIndex
-from .verify import Decision, decide, verify_pair
+from .verify import Decision, PairResult, decide, verify_pair
 from .vocab import Vocab
 
 TOP_K = 20
@@ -44,7 +44,15 @@ class TwoStageRecognizer:
     def candidates(self, img_bgr: np.ndarray) -> list[str]:
         return [self._ids[d] for d in self._coarse(img_bgr)]
 
-    def recognize(self, img_bgr: np.ndarray) -> Decision:
+    def verify_candidates(self, img_bgr: np.ndarray) -> list[PairResult]:
+        """粗排 + 逐候选几何校验，返回**还没经过判定**的原始候选分数。
+
+        recognize() 只吐一个 Decision（是非题 + 一个 photo_id），但阈值扫描
+        要的是它背后那张分数表：每个候选的 inliers/det。把这一段单独暴露出
+        来，bench/threshold_scan.py 就不必把下面这几行抄一遍——抄一遍就意味
+        着"扫描用的管线"会和产品管线各自漂移，而扫出来的阈值本来就是要直接
+        写回产品的。
+        """
         # Minor #16：这里没有调用 self._coarse(img_bgr) 再另外拿 query，
         # 而是重复了 _coarse 里 extract+words_of+index.query 这三行——是
         # 故意的，不是没注意到重复。recognize() 精排阶段（下面的
@@ -57,7 +65,9 @@ class TwoStageRecognizer:
         query = extract(img_bgr)
         words = self._vocab.words_of(query.desc)
         docs = [doc for doc, _ in self._index.query(words, self._top_k)]
-        results = [
+        return [
             verify_pair(query, self._store.read(doc), self._ids[doc]) for doc in docs
         ]
-        return decide(results)
+
+    def recognize(self, img_bgr: np.ndarray) -> Decision:
+        return decide(self.verify_candidates(img_bgr))

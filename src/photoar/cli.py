@@ -153,8 +153,12 @@ def _progress_every(n: int) -> int:
     return max(1, n // _PROGRESS_LINES)
 
 
-def _progress(label: str, i: int, n: int, t0: float, every: int) -> None:
+def _progress(label: str, i: int, n: int, t0: float, every: int, tag: str = "eval") -> None:
     """往 stderr 打一行 `i/n + 已用时间 + 预计剩余`。
+
+    tag 是行首那个方括号里的东西。默认 "eval"，`bench/threshold_scan.py`
+    复用这个函数时传自己的 tag——否则它的进度行会自称 `[eval]`，跟 eval 的
+    日志混在一起时分不清是哪次跑。
 
     为什么必须有：0d 上规模的一次 eval 是 29740 次查询、约 1 小时，而在这
     之前整个过程零输出——日志文件一小时都停在 0 字节，从外面完全分不清它
@@ -173,7 +177,7 @@ def _progress(label: str, i: int, n: int, t0: float, every: int) -> None:
     elapsed = time.time() - t0
     eta = elapsed / i * (n - i) if i else 0.0
     print(
-        f"[eval] {label} {i}/{n}  已用 {elapsed / 60:.1f}min  "
+        f"[{tag}] {label} {i}/{n}  已用 {elapsed / 60:.1f}min  "
         f"预计还需 {eta / 60:.1f}min",
         file=sys.stderr,
         flush=True,

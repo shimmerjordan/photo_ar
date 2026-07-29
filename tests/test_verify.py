@@ -150,3 +150,87 @@ def test_ratio_test_counts_candidates_below_inlier_threshold():
 def test_decide_rejects_out_of_range_determinant():
     d = V.decide([_res("a", 80, ok=False, det=0.001)])
     assert not d.matched
+
+
+# ---------------------------------------------------------------------------
+# decide_with：同一套判定的参数化版本，供阈值扫描重放录好的候选分数。
+# 0d 上规模跑出库外误识别 6.951%，要回答"阈值调到多少能关掉、代价多少漏检"，
+# 重跑一次 eval 是 54 分钟，一个 5×5 网格 22 小时——所以必须能离线重放。
+# ---------------------------------------------------------------------------
+
+
+class TestDecideWith:
+    def test_defaults_are_byte_identical_to_decide(self):
+        """默认参数下必须与 decide 完全一致，否则重放口径和产品口径就是两套。
+
+        遍历覆盖四种结局（ok / weak / ambiguous / empty）的候选表，逐个比对
+        整个 Decision（不只是 matched）——reason 也不能变，它是判断"这次不匹配
+        是因为分不够还是因为歧义"的唯一依据。
+        """
+        cases = [
+            [],
+            [_res("a", 0)],
+            [_res("a", 24)],
+            [_res("a", 100)],
+            [_res("a", 100), _res("b", 20)],
+            [_res("a", 30), _res("b", 25)],
+            [_res("a", 26), _res("b", 24)],
+            [_res("a", 80, ok=False, det=0.001)],
+            [_res("a", 80, ok=False, det=-1.2)],
+            [_res("a", 60), _res("b", 30), _res("c", 10)],
+        ]
+        for results in cases:
+            assert V.decide_with(results) == V.decide(results), f"候选表 {results} 上不一致"
+
+    def test_does_not_read_the_precomputed_ok_flag(self):
+        """PairResult.ok 是 verify_pair 用**模块常量**算的，重放时那个值正是
+        要被替换掉的东西。这里给一个"分数足够但 ok=False"的候选：如果
+        decide_with 读了 ok，它会判 weak；正确行为是按传入阈值重算后判 ok。
+        """
+        stale = V.PairResult(photo_id="a", inliers=100, det=1.0, ok=False)
+        d = V.decide_with([stale])
+        assert d.matched and d.reason == "ok", "decide_with 不能相信 ok 字段"
+
+    def test_raising_min_inliers_turns_a_hit_into_weak(self):
+        results = [_res("a", 40), _res("b", 10)]
+        assert V.decide_with(results, min_inliers=25).matched
+        d = V.decide_with(results, min_inliers=50)
+        assert not d.matched and d.reason == "weak"
+
+    def test_raising_min_inliers_does_not_promote_the_runner_up(self):
+        """提高 min_inliers 后 top1 过不了，不能让 top2 顶上来——这是 decide
+        的既有语义（top1 不过直接判 weak），也是"录 top1/top2 就够"这个结论
+        成立的前提。top2 是 90 分，足以过任何这里用到的阈值，但仍不该被选中。
+        """
+        d = V.decide_with([_res("a", 95), _res("b", 90)], min_inliers=94)
+        assert not d.matched
+        assert d.photo_id is None
+        assert d.inliers == 95, "报的应该是 top1 的分数，不是 top2 的"
+
+    def test_raising_ratio_turns_a_hit_into_ambiguous(self):
+        results = [_res("a", 100), _res("b", 50)]
+        assert V.decide_with(results, ratio=1.5).matched  # 100 >= 75
+        d = V.decide_with(results, ratio=2.5)  # 100 < 125
+        assert not d.matched and d.reason == "ambiguous"
+
+    def test_det_window_is_also_parameterizable(self):
+        """det 区间不是本轮要扫的旋钮，但一并参数化：否则重放时它会悄悄用
+        模块常量，而调用方以为自己控制了全部判定条件。
+        """
+        results = [_res("a", 80, ok=False, det=30.0)]
+        assert not V.decide_with(results).matched
+        assert V.decide_with(results, det_max=50.0).matched
+
+    def test_passes_is_the_single_source_for_the_first_two_conditions(self):
+        """verify_pair 的 ok 与 decide_with 的前两条判定必须来自同一个实现。
+        随机撒一批 (inliers, det) 组合，两边算出来的必须一致——两边各写一遍
+        表达式的话，改了一边忘了另一边不会有任何报错，重放数字会静默失真。
+        """
+        rng = np.random.default_rng(0)
+        for _ in range(200):
+            inliers = int(rng.integers(0, 60))
+            det = float(rng.uniform(-2.0, 30.0))
+            expected = V.PairResult(photo_id="a", inliers=inliers, det=det, ok=False)
+            by_verify_pair = V._passes(inliers, det, V.MIN_INLIERS, V.DET_MIN, V.DET_MAX)
+            by_decide = V.decide_with([expected]).reason != "weak"
+            assert by_verify_pair == by_decide, f"inliers={inliers} det={det} 两边判定不一致"
