@@ -605,6 +605,23 @@ Oxford5k 4385 张入库、20000 次库内查询 + 9740 次库外查询，`MIN_IN
 的真缺陷（识别库 slot 错位、上传后 keep-alive 读死连接）。详见
 `docs/superpowers/plans/2026-07-30-phase1-server.md`。
 
+### Phase 2 的实际状态（2026-07-30）
+
+出口条件「真机 AR 体验可接受」：**未达成，且当前无法判定** —— 手上没有 Android
+真机，ARCore 的 Augmented Images 不能在模拟器上跑。
+
+| 验证方式 | 结果 |
+|---|---|
+| `:arview:testDebugUnitTest` | 115 个全绿（状态机 43 / 解析 27 / 客户端 18 / 几何 15 / 抽帧 12） |
+| `:app:assembleDebug` | BUILD SUCCESSFUL，`app-debug.apk` 4.77MB |
+| 真机 AR 体验 | **一次都没跑过**，§14.5 手测清单一条未执行 |
+
+代码分层刻意把全部判断收进不 import android 的 `ScanController`（450 行），
+ARCore / GLES / 相机 / 播放各层只做搬运。所以「未验证」的具体是：跟踪稳定性、
+四边形贴合精度、羽化与淡入的观感、端到端延迟、无 ARCore 机型的兜底、真机上
+`org.json` 的空值行为。**Phase 2 记作代码完成、出口条件挂起。** 详见
+`docs/superpowers/plans/2026-07-30-phase2-arview.md`。
+
 ## 16. 风险与已知限制
 
 | 风险 | 影响 | 缓解 |
@@ -626,7 +643,7 @@ Oxford5k 4385 张入库、20000 次库内查询 + 9740 次库外查询，`MIN_IN
 | 选择 | 替代方案 | 为什么这样选 |
 |---|---|---|
 | ARCore Augmented Images | MindAR(Web)、ARKit、Vuforia | 单库 1000 张但**库数量不限**，配合"云识别 + 单目标下发"即无上限；有 `arcoreimg` 离线预生成；跟踪质量优于 Web AR。MindAR 多目标会崩移动浏览器（[issue #22](https://github.com/hiukim/mind-ar-js/issues/22)）；ARKit 需 $99/年账号 |
-| [SceneView/sceneform-android](https://github.com/SceneView/sceneform-android) | 已归档的 Google Sceneform、裸 Filament | Sceneform 的活跃维护版（Filament 引擎），原生支持 Augmented Images + 视频（`ExternalTexture`） |
+| ~~[SceneView/sceneform-android](https://github.com/SceneView/sceneform-android)~~ → **裸 ARCore + 手写 GLES 2.0**（Phase 2 改） | SceneView、已归档的 Google Sceneform、裸 Filament | 原选 SceneView 是因为它原生支持 Augmented Images + `ExternalTexture`。Phase 2 实做时改掉了：§11.8 的羽化+淡入需要自定义 fragment shader，Filament 材质得用 `matc` 离线编译成 `.filamat`（等于再加一个 Google 闭源工具）；而整个场景只有两个四边形，用不上场景图/光照/PBR/glTF，为它背 ~10MB 不划算；`SurfaceTexture` → `GL_TEXTURE_EXTERNAL_OES` 也是 ExoPlayer 出图最直的路。代价是 EGL 生命周期、`setDisplayGeometry`、`getTransformMatrix` 全得自己管对，`gl/` 共 546 行 |
 | [fbow](https://github.com/rmsalinas/fbow) / [DBoW3](https://github.com/rmsalinas/DBow3) | FAISS + CLIP、pHash | ORB 二进制描述子 + 层次词汇树，纯 CPU 万级库查询 10-50ms，ORB-SLAM 同款。pHash 抗不住透视与光照；CLIP 在 N5095 上偏慢且对裁切敏感 |
 | **识别跑在 NAS** | ECS 2C2G | N5095 是 4C@2.9GHz / 8G 可扩 16G，明显强于 ECS；数据本就在 NAS，无需同步；识别包仅 50KB，走隧道毫无压力。**这一条让 ECS 完全退出，并消除了 v1 的双库同步问题** |
 | **媒体存 NAS，不上云** | Cloudflare R2 + AES-CTR 加密 + 冷热分层 | 存储与带宽两个瓶颈都不存在（§10.1）。不出内网 → 不需要加密 → 不需要分层 → 不需要密钥体系。**v1 约 60% 的复杂度来自一个不存在的问题** |

@@ -9,3 +9,11 @@ venv/
 tools/arcoreimg
 data/
 deploy/config.json
+
+# Android（build/ 已在上面覆盖，Gradle 名字就叫 build）
+.gradle/
+local.properties
+*.apk
+*.aab
+captures/
+.cxx/

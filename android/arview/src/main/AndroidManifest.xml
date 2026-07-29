@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- required="false"：§13 要求不支持 ARCore 的机型退化成「识别后全屏播放」，
+         功能不丢。写成 true 会让 Play 商店直接把这些机型过滤掉。 -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+    <application
+        android:usesCleartextTraffic="true">
+
+        <!-- optional：同上。checkAvailability() 在运行时判定，不装 ARCore 也能开 App。 -->
+        <meta-data android:name="com.google.ar.core" android:value="optional" />
+
+        <!-- Activity 声明放在 library 里，这样 Phase 3 的 Flutter 外壳把 :arview
+             依赖进来就自动有了，不需要在它的清单里再抄一遍。 -->
+        <activity
+            android:name="app.photoar.arview.ui.ArScanActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+    </application>
+</manifest>
