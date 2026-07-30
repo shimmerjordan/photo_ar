@@ -21,7 +21,7 @@
 - **误识别率优先于漏检率**（spec §14.2）：调参时两者冲突，一律牺牲漏检保误识别。任何降低判定严格度的改动都要在提交信息里说明对误识别率的影响。
 - **Phase 0 不引入 SQLite**。产物是文件（描述子库、索引、`.imgdb`、JSON manifest）。数据库是 Phase 1 随服务一起引入的。
 - **Phase 0 不写任何服务、不写任何 Android 代码。**
-- **git**：仓库已于 2026-07-28 初始化（默认分支 `main`），commit 步骤正常执行。**只本地 commit，永不 push**。commit message 里不得出现 `Co-Authored-By` 之类的署名。若 git 报缺少身份，用 `git -c user.name=xyz -c user.email=<你的邮箱> commit ...`。
+- **git**：仓库已于 2026-07-28 初始化（默认分支 `main`），commit 步骤正常执行。**只本地 commit，永不 push**。commit message 里不得出现 `Co-Authored-By` 之类的署名。若 git 报缺少身份，用 `git -c user.name=<你> -c user.email=<你的邮箱> commit ...`。
 
 ## 与 spec 的偏离（已确认）
 

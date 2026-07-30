@@ -53,8 +53,12 @@ docker compose exec photo-ar-server python -c \
 
 ## 3. 加一条 cloudflared ingress
 
-**不新建 tunnel，也不改 DNS。** `*.<你的域名>` 的通配符 CNAME 已经指向
+**不新建 tunnel，也不改 DNS。** 你自己域名的通配符 CNAME（`*.<你的域名>`）已经指向
 现有的 `nas-adan` tunnel，加一条 ingress 规则即可。
+
+> 下面出现的 `<你的域名>`、`<NAS>` 都是占位符。真实地址只填两处：服务端填
+> `deploy/config.json`（已 gitignore），客户端填 App 的「设置 → 通道」——
+> 仓库里不写死。
 
 编辑 NAS 上 cloudflared 的配置（QNAP 上通常是
 `/share/Container/cloudflared/config.yml`），在 `ingress:` 列表里、**404 兜底那条

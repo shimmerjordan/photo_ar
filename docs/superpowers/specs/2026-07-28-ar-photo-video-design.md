@@ -33,10 +33,14 @@
 | 资源 | 现状 | 本项目如何用 |
 |---|---|---|
 | QNAP TS-464C2 | Celeron N5095（4C4T@2.9GHz），8GB DDR4 可扩 16GB，Container Station | 跑 `photo-ar-server`，含识别 |
-| cloudflared `nas-adan` | 本机直连 Cloudflare，域名 `*.<你的域名>` 通配符已配 | **只需加一条 ingress**，DNS 侧零改动 |
+| cloudflared `nas-adan` | 本机直连 Cloudflare，域名通配符 `*.<你的域名>` 已配 | **只需加一条 ingress**，DNS 侧零改动 |
 | CloudDrive2 | 已在 19798 端口运行，`cd2.<你的域名>` | 网盘挂载点即普通路径，网盘支持零代码获得 |
-| Tailscale | tailnet `<你的 tailnet>`，ECS 自建 DERP RegionID 901，**手机已装 App** | 媒体通道首选（外网时） |
-| ECS <ECS 公网 IP> | 3M 带宽 | **本项目不使用**（除了它承载的 Tailscale DERP 是 Tailscale 基础设施的一部分） |
+| Tailscale | 已有 tailnet，ECS 自建 DERP RegionID 901，**手机已装 App** | 媒体通道首选（外网时） |
+| 一台小带宽 ECS | 3M 带宽 | **本项目不使用**（除了它承载的 Tailscale DERP 是 Tailscale 基础设施的一部分） |
+
+> 具体的域名、tailnet 名、内网地址一律**不写进仓库**：App 里在「设置 → 通道」填，
+> 服务端在 `deploy/config.json`（已 gitignore）里填。文档中出现的
+> `<你的域名>` / `192.168.x.x` / `100.x.y.z` 都是占位符。
 
 ### 1.3 环境已知限制（必须遵守）
 
@@ -83,8 +87,8 @@
 │    └─ file-serve   Range 支持的静态吐流                   │
 │                                                           │
 │  【复用】cloudflared nas-adan                             │
-│      + ingress: arphoto.<你的域名> → :8964        │
-│      （*.<你的域名> 通配符已存在，DNS 零改动）    │
+│      + ingress: arphoto.<你的域名> → :8964                │
+│      （*.<你的域名> 通配符已存在，DNS 零改动）            │
 │  【复用】CloudDrive2 :19798 挂载点 → 普通路径             │
 │  【复用】Tailscale（NAS 与手机均已在 tailnet）            │
 └──────────────────────────────────────────────────────────┘
@@ -389,12 +393,16 @@ N5095 是 4 核 2.9GHz，比 v1 假设的 ECS 2 核更宽裕，且不必与其�
 
 ```json
 [
-  {"name": "LAN",       "base": "http://192.168.1.20:8964",           "prefer": ["media", "api"]},
-  {"name": "Tailscale", "base": "http://100.x.y.z:8964",              "prefer": ["media"]},
-  {"name": "Tunnel",    "base": "https://arphoto.<你的域名>", "prefer": ["api"]},
-  {"name": "DDNS",      "base": "",  "enabled": false,                "prefer": ["media", "api"]}
+  {"name": "LAN",       "base": "http://192.168.1.20:8964",    "prefer": ["media", "api"]},
+  {"name": "Tailscale", "base": "http://100.x.y.z:8964",       "prefer": ["media"]},
+  {"name": "Tunnel",    "base": "https://arphoto.<你的域名>",  "prefer": ["api"], "tunnel": true},
+  {"name": "DDNS",      "base": "", "enabled": false,          "prefer": ["media", "api"]}
 ]
 ```
+
+上面的地址**全是占位符**。代码里这四张卡的 `base` 默认都是空字符串
+（`EndpointConfig.DEFAULT`），开关和「适合」已经设对，**地址由用户在 App
+「设置 → 通道」里填**，不写死在仓库里。地址为空的卡不参与探活。
 
 `DDNS` 项预留空位，将来 NAS 拿到公网 IP 后填入即可，无需改代码 —— 这就是"可配置的 URL 前缀"。
 
