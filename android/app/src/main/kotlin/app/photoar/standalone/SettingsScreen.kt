@@ -234,7 +234,7 @@ private fun CandidateCard(
                 value = c.base,
                 onValueChange = { onChange(c.copy(base = it.trim())) },
                 label = { Text("地址") },
-                placeholder = { Text("http://10.0.0.9:8770") },
+                placeholder = { Text("http://10.0.0.9:8964") },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()

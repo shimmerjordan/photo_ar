@@ -89,7 +89,7 @@ docker restart cloudflared     # 或 Container Station 里重启
 curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" https://arphoto.<你的域名>/v1/ping
 ```
 
-### 隧道上的两条硬限制
+### 隧道上的三条硬限制（详见部署文档 §7.1）
 
 | 限制 | 后果 | 应对 |
 |---|---|---|
@@ -99,7 +99,7 @@ curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" https://arphoto.<你的域名
 
 ## 4. 入库
 
-Phase 1 只有 HTTP 入口（Phase 3 的 Flutter 外壳会给它做界面）：
+入口是 HTTP（Android 外壳的「关联新照片」页调的也是它）。单条：
 
 ```bash
 curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" -H 'Content-Type: application/json' \
@@ -110,8 +110,18 @@ curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" -H 'Content-Type: application
   http://<NAS>:8964/v1/photo
 ```
 
+批量（串行、可续跑，只用标准库）：
+
+```bash
+python3 tools/batch_ingest.py --base http://127.0.0.1:8964 \
+    --photos /share/Photo/某个目录 --videos /share/Video/某个目录 \
+    --recursive --width-mm 152 --limit 5 --dry-run     # 先看配对，再去掉这两个参数
+```
+
 `printWidthMm` 是**打印出来的照片实际宽度**，不是像素宽度。跟踪精度直接依赖
-它，所以没有默认值。常见规格：6 寸 152mm、5 寸 127mm、4 寸 102mm。
+它，所以没有默认值。常见规格：6 寸 152mm、5 寸 127mm、4 寸 102mm ——
+但冲印店的「6 寸」未必正好 152，**拿尺量画面本身，白边不算**
+（见部署文档 §5.3）。
 
 会被拒的几种情况，都带明确原因：
 
