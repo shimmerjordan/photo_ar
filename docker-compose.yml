@@ -15,6 +15,19 @@ services:
     # cloudflared / CloudDrive2 / QTS 自己，不然扫描时整台 NAS 都发木。
     cpus: "3.0"
     mem_limit: 3g
+    # 核显透进容器，转码走 h264_vaapi 而不是 libx264。软编实测（本机 3 核配额，
+    # 一条 30 秒 1080p）：preset veryfast 18.2s、slow 89.2s；折算到 N5095
+    # 分别约 56 秒和 4.6 分钟一条。入库的 attach 是同步请求，而 Cloudflare 的
+    # Proxy Read Timeout 是 125 秒 —— 软编 + 慢 preset 走隧道入库必然 524。
+    # 没有这一段（或者节点不存在）不会报错，服务自己回退软编——所以想确认
+    # 硬编真的生效，把 config.json 的 video_encoder 显式写成 "h264_vaapi"，
+    # 探测不到会直接报错（见 transcode.resolve_encoder）。
+    devices:
+      - /dev/dri:/dev/dri
+    # QTS 上 /dev/dri/renderD128 通常属 root:root 且 0666，如果发现容器内
+    # 打不开设备，用 `stat -c '%g' /dev/dri/renderD128` 查到 GID 后填进来。
+    # group_add:
+    #   - "44"
     ports:
       # 只监听 LAN/Tailscale。外网走已有的 cloudflared，不在这里暴露。
       - "8964:8964"

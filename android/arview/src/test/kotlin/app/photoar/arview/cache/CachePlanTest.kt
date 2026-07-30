@@ -209,10 +209,13 @@ class CachePlanTest {
 
     // ---- 视频：预算与 LRU ----
 
+    /** 空缓存时一条按上限估，所以预算要按上限的倍数给，不能写死 MB 数。 */
+    private fun budgetFor(videos: Int): Long = CachePlanner.MAX_VIDEO_BYTES * videos
+
     @Test
     fun `有视频的照片按预算下视频`() {
         val server = (1..3).map { summary("p$it", hasVideo = true, createdAt = it.toLong()) }
-        val plan = CachePlanner.plan(server, emptyList(), CacheSpec(maxVideoBytes = 10 * MB))
+        val plan = CachePlanner.plan(server, emptyList(), CacheSpec(maxVideoBytes = budgetFor(3)))
         assertEquals(listOf("p3", "p2", "p1"), plan.addVideo)
     }
 
@@ -224,12 +227,68 @@ class CachePlanTest {
 
     @Test
     fun `预算放不下就少缓存几条而不是超支`() {
-        // 未知大小按 §12 的上限 3MB 估。7MB 的预算只放得下 2 条。
+        // 空缓存时未知大小按 §12 的上限估，所以 2.5 条的预算只放得下 2 条。
         val server = (1..5).map { summary("p$it", hasVideo = true, createdAt = it.toLong()) }
-        val plan = CachePlanner.plan(server, emptyList(), CacheSpec(maxVideoBytes = 7 * MB))
-        assertEquals(listOf("p5", "p4"), plan.addVideo)
+        val budget = CachePlanner.MAX_VIDEO_BYTES * 5 / 2
+        val plan = CachePlanner.plan(server, emptyList(), CacheSpec(maxVideoBytes = budget))
         // 预算紧张时留下的是排在前面（= 最近扫到）的那几条
-        assertEquals(2 * CachePlanner.ESTIMATED_VIDEO_BYTES <= 7 * MB, true)
+        assertEquals(listOf("p5", "p4"), plan.addVideo)
+    }
+
+    // ---- 未知大小怎么估（2026-07-30：一条从 3MB 变 16.2MB 上限） ----
+
+    @Test
+    fun `一条都没缓存过时按上限估`() {
+        // 空缓存下超预算是直接多占用户几百 MB，这是唯一该保守的时刻
+        assertEquals(
+            CachePlanner.MAX_VIDEO_BYTES,
+            CachePlanner.estimateVideoBytes(emptyList(), 999 * MB),
+        )
+    }
+
+    @Test
+    fun `预算比一条上限还小时按预算估而不是按上限`() {
+        // 防死锁：按上限估会一条都排不下 → 永远没有样本 → 永远按上限估，
+        // 哪怕实际一条只有 1MB 也一条都不缓存，而且不报错
+        assertEquals(10 * MB, CachePlanner.estimateVideoBytes(emptyList(), 10 * MB))
+    }
+
+    @Test
+    fun `预算为零时估值也不能是零`() {
+        // 0 会让预算判据 used + estimate > maxVideoBytes 恒假，于是「关掉视频缓存」
+        // 变成「每条视频都下」—— 见下面那条端到端的 `视频预算为零时一条都不下`
+        assertEquals(1L, CachePlanner.estimateVideoBytes(emptyList(), 0))
+    }
+
+    @Test
+    fun `有样本时按已缓存视频的实际平均值估`() {
+        val sample = listOf(
+            cached("a", videoBytes = 6 * MB),
+            cached("b", videoBytes = 10 * MB),
+        )
+        assertEquals(8 * MB, CachePlanner.estimateVideoBytes(sample, 999 * MB))
+    }
+
+    @Test
+    fun `没缓存视频的条目不算进平均值`() {
+        // videoBytes = 0 是「只有缩略图」，把它算进平均会把估值拉到接近零，
+        // 于是一次排下装不下的量，下完就超预算 —— 表现是反复下了又删。
+        val sample = listOf(cached("a", videoBytes = 8 * MB), cached("b"))
+        assertEquals(8 * MB, CachePlanner.estimateVideoBytes(sample, 999 * MB))
+    }
+
+    @Test
+    fun `实际视频比上限小的时候能多缓存几条`() {
+        // 这条是改档后新增判据的收益侧：一律按 16.2MB 上限估会让 2048MB 预算
+        // 只排 126 条，而实际 8MB 一条放得下 250 条 —— 用户设的预算白闲一半。
+        val server = (1..4).map { summary("p$it", hasVideo = true, createdAt = it.toLong()) }
+        val local = listOf(cached("p1", videoBytes = 2 * MB, lastSeenAt = 9L))
+        // 预算只有 1.5 条上限那么大：按上限估只能再放 0 条，按实际 2MB 估放得下
+        val plan = CachePlanner.plan(
+            server, local, CacheSpec(maxVideoBytes = CachePlanner.MAX_VIDEO_BYTES * 3 / 2),
+        )
+        assertTrue(plan.dropVideo.isEmpty())
+        assertTrue("按实际大小估应该还能再下几条", plan.addVideo.size >= 3)
     }
 
     @Test

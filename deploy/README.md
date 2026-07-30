@@ -3,6 +3,11 @@
 目标环境：QNAP TS-464C2（Celeron N5095，4C/4T，8GB），Container Station。
 复用已有的 cloudflared `nas-adan` 与 CloudDrive2 挂载，**不新建任何服务**。
 
+> 第一次部署请按
+> [docs/nas-deploy-and-cloudflare.md](../docs/nas-deploy-and-cloudflare.md) 走 ——
+> 那份是带验证步骤的完整流程（含**核显硬编怎么确认真的生效**、三条通道的分工、
+> Cloudflare 加速哪几招值得做）。这份是命令速查。
+
 ## 1. 准备
 
 ```bash
@@ -38,6 +43,12 @@ docker compose logs -f photo-ar-server
 ```bash
 curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" http://<NAS 的 LAN IP>:8964/v1/ping
 # {"ok": true, "version": "phase1", "serverTime": 1753...}
+
+# 硬编到底有没有生效（软编回退是静默的，只能这样问）
+docker compose exec photo-ar-server vainfo 2>&1 | grep -c VAEntrypointEncSlice
+docker compose exec photo-ar-server python -c \
+  "from photoar import transcode as T; print(T.resolve_encoder('auto'))"
+# h264_vaapi = 硬编可用；libx264 = 回退了，查 /dev/dri 有没有透进来
 ```
 
 ## 3. 加一条 cloudflared ingress
@@ -83,7 +94,8 @@ curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" https://arphoto.<你的域名
 | 限制 | 后果 | 应对 |
 |---|---|---|
 | Cloudflare 免费版请求体 **100MB** 上限 | 上传原片会被 413 掉 | 客户端在识别到走隧道时隐藏上传入口；服务端见到 `CF-Ray` 头的上传请求直接 413 并说明原因 |
-| 代理视频流属于 ToS 灰区 | 账号风险 | 媒体默认走 LAN/Tailscale。隧道只跑 API 小包（上行 50KB / 下行 <50KB） |
+| Proxy Read Timeout **125 秒**，非 Enterprise 不可调 | 带视频入库是同步请求，软编慢 preset 必然 524 | 批量入库走 LAN；软编默认 preset 已经是 `veryfast`（见 spec §12.3） |
+| 代理视频流**明文违反** CDN 服务条款（不是灰区：非 Enterprise 套餐要通过 CDN 提供视频/大文件必须另买 Stream/Images，Cloudflare 保留停用权且通知不保证提前） | 赔的是整个账号，`nas-adan` 上其它服务一起没 | 媒体只走 LAN/Tailscale。隧道只跑 API 小包（上行约 50KB / 下行 <2KB） |
 
 ## 4. 入库
 

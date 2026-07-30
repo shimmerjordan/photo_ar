@@ -240,7 +240,9 @@ def ingest_photo(
             out = cfg.playable_dir / f"{photo_id}.mp4"
             try:
                 transcode.transcode(
-                    video_path, out, ffmpeg=cfg.ffmpeg
+                    video_path, out, ffmpeg=cfg.ffmpeg,
+                    encoder=cfg.video_encoder, preset=cfg.video_preset,
+                    vaapi_device=cfg.vaapi_device,
                 )
             except Exception as exc:
                 raise IngestRejected(
@@ -315,7 +317,11 @@ def attach_video(
     info = transcode.probe(video_path, ffprobe=cfg.ffprobe)
     if transcode.needs_transcode(info):
         out = cfg.playable_dir / f"{photo_id}.mp4"
-        transcode.transcode(video_path, out, ffmpeg=cfg.ffmpeg)
+        transcode.transcode(
+            video_path, out, ffmpeg=cfg.ffmpeg,
+            encoder=cfg.video_encoder, preset=cfg.video_preset,
+            vaapi_device=cfg.vaapi_device,
+        )
         transcoded = True
         playable_asset_id = _upsert_file_asset(
             catalog, out, "video", probe_video=True, cfg=cfg

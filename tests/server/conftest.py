@@ -75,6 +75,11 @@ def fake_ffmpeg(tmp_path):
             if {fail!r}:
                 sys.stderr.write("boom\\n"); sys.exit(1)
             out = sys.argv[-1]
+            # "-" 是 stdout 而不是文件名（真 ffmpeg 的 `-f null -` 什么都不写）。
+            # 照着当文件名写的话，硬编探测那条命令会在**当前工作目录**留下一个
+            # 名字叫 `-` 的垃圾文件 —— 而 rm 掉它还得先想起来加 `--`。
+            if out == "-" or out.startswith("pipe:"):
+                sys.exit(0)
             pathlib.Path(out).write_bytes(
                 b"\\x00\\x00\\x00\\x18ftypisom" + b"moov" + b"\\x00" * 64
                 + b"mdat" + b"\\xab" * 4096
@@ -258,6 +263,16 @@ def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg
             "arcoreimg": fake_arcoreimg(score=quality_score),
             "ffprobe": fake_ffprobe(),
             "ffmpeg": fake_ffmpeg(),
+            # 指到一个不存在的路径，让编码器解析**确定地**落到软编。
+            #
+            # 不指的话默认是 /dev/dri/renderD128，而那个节点在带核显或独显的
+            # 开发机上是真实存在的（本机就是 nvidia 的 render 节点）—— 于是
+            # transcode.hardware_ready() 会去跑假 ffmpeg，假 ffmpeg 一律退出 0，
+            # 于是整套服务端测试在「有 /dev/dri 的机器」上走 h264_vaapi 分支、
+            # 在没有的机器上走 libx264 分支。同一份测试在两台机器上测的是两条
+            # 不同的代码路径，而且谁都不会发现 —— 直到某天只有一台机器红。
+            # 硬编那条路由 tests/test_transcode.py 显式 monkeypatch 后单独测。
+            "vaapi_device": str(tmp_path / "no-such-render-node"),
             "self_score_samples": self_score_samples,
         }
         if media is not None:

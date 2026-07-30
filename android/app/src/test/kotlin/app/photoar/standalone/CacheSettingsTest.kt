@@ -63,9 +63,12 @@ class CacheSettingsTest {
 
     @Test
     fun `MB 换成字节不会溢出`() {
-        val spec = CacheSettings.spec(200, CacheSettings.VIDEO_MB_OPTIONS.max())
-        // 2048MB = 2GB，用 Int 乘会溢出成负数，那时 require(maxVideoBytes >= 0) 会炸
-        assertEquals(2048L * 1024 * 1024, spec.maxVideoBytes)
-        assertTrue(spec.maxVideoBytes > Int.MAX_VALUE.toLong() / 2)
+        val top = CacheSettings.VIDEO_MB_OPTIONS.max()
+        val spec = CacheSettings.spec(200, top)
+        // 最大一档现在是 4096MB = 4GB。用 Int 乘的话 4096*1024*1024 恰好是 2^32，
+        // 溢出成 0 —— 而 require(maxVideoBytes >= 0) 拦不住 0，表现是「把预算调到
+        // 最大之后一条视频都不缓存」，比抛异常难查得多。2048 那一档溢出成负数会抛。
+        assertEquals(top.toLong() * 1024 * 1024, spec.maxVideoBytes)
+        assertTrue(spec.maxVideoBytes > Int.MAX_VALUE.toLong())
     }
 }

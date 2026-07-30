@@ -20,6 +20,15 @@
   "_arcoreimg": "ARCore SDK 里的二进制，镜像里在 /opt/photoar/tools/arcoreimg（已在 PATH 里）。",
   "arcoreimg": "arcoreimg",
 
+  "_video_encoder": "转码编码器。\"auto\"（默认）探测到核显就用 h264_vaapi，探测不到静默回退 libx264。想确认硬编真的生效，就显式写 \"h264_vaapi\"：探测失败会直接报错而不是悄悄软编（那种情况唯一的发现方式是掐表）。需要 docker-compose.yml 里的 devices: /dev/dri。",
+  "video_encoder": "auto",
+
+  "_video_preset": "只对 libx264 生效（走 VAAPI 硬编时这个值不起作用）。默认 veryfast 是量出来的：本机 3 核配额下同一条 30s/1080p 源，slow 89s、veryfast 18s，产物体积几乎一样（高码率源下 maxrate 先撞上，crf 没约束到），所以慢档换的是同码率画质不是体积。折算到 N5095，slow 约 4.6 分钟一条，会撞入库请求的超时。想要画质就调 medium/slow，知道代价即可。",
+  "video_preset": "veryfast",
+
+  "_vaapi_device": "核显的 render 节点。一般不用改；一台机器上有多块 GPU 时才需要指定。",
+  "vaapi_device": "/dev/dri/renderD128",
+
   "_media": "媒体 URL 解析策略链（spec §10）。默认只有 nas_serve —— 本服务自己吐流，CloudDrive2 已经把网盘挂成本地路径，这一条覆盖全部需求。direct_link 是留给以后接 OpenList 的优化位。",
   "media": {
     "strategies": ["nas_serve"]

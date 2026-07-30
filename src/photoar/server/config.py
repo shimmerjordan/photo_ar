@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import transcode
 from ..quality import ARCOREIMG
 from .mediaresolve import DEFAULT_STRATEGIES
 
@@ -42,6 +43,12 @@ class ServerConfig:
     arcoreimg: str = ARCOREIMG
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
+    # 转码编码器。"auto"（缺省）探测到核显就走 h264_vaapi，否则静默回退
+    # libx264；显式写 "h264_vaapi" 时探测失败会直接报错，是部署时验证硬编
+    # 到底有没有生效的唯一可靠手段（见 transcode.resolve_encoder）。
+    video_encoder: str = transcode.ENCODER_AUTO
+    video_preset: str = transcode.SW_PRESET  # 只对 libx264 生效
+    vaapi_device: str = transcode.VAAPI_DEVICE
     media_strategies: tuple[str, ...] = DEFAULT_STRATEGIES
     media_custom_prefix: str | None = None
     self_score_samples: int = SELF_SCORE_SAMPLES
@@ -112,6 +119,9 @@ class ServerConfig:
             arcoreimg=str(doc.get("arcoreimg", ARCOREIMG)),
             ffmpeg=str(doc.get("ffmpeg", "ffmpeg")),
             ffprobe=str(doc.get("ffprobe", "ffprobe")),
+            video_encoder=str(doc.get("video_encoder", transcode.ENCODER_AUTO)),
+            video_preset=str(doc.get("video_preset", transcode.SW_PRESET)),
+            vaapi_device=str(doc.get("vaapi_device", transcode.VAAPI_DEVICE)),
             media_strategies=tuple(media.get("strategies", DEFAULT_STRATEGIES)),
             media_custom_prefix=media.get("custom_prefix"),
             self_score_samples=int(doc.get("self_score_samples", SELF_SCORE_SAMPLES)),
@@ -125,6 +135,7 @@ class ServerConfig:
                     "token", "roots", "data_dir", "vocab_path", "bind", "port",
                     "arcoreimg", "ffmpeg", "ffprobe", "media", "self_score_samples",
                     "upload_dir_root", "version",
+                    "video_encoder", "video_preset", "vaapi_device",
                 }
             },
         )

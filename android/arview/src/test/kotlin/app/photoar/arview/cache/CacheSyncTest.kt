@@ -349,6 +349,11 @@ class CacheSyncTest {
         transport.photos["a"] = true
         transport.photos["b"] = true
         transport.videoBytes = 1_000_000
+        // 同步两轮：未知大小第一轮按 min(单条上限, 预算) 估（10MB 的预算只排得下
+        // 一条），下完拿到实际 1MB 这个样本，第二轮才收敛到「放得下十条」。
+        // 这不是缺陷而是刻意的——空缓存时宁可少下一轮，也不要一次排下装不下的量
+        // 然后下完就被淘汰（白吃流量）。见 CachePlanner.estimateVideoBytes。
+        sync(CacheSpec(maxVideoBytes = 10_000_000))
         sync(CacheSpec(maxVideoBytes = 10_000_000))
         assertEquals(2, cache.stats().withVideo)
 

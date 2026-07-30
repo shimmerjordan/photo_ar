@@ -15,10 +15,14 @@ data class CacheSpec(
     /** 索引里最多留多少张。ARCore 单个库上限 1000，200 是 spec 定的。 */
     val maxPhotos: Int = 200,
     /**
-     * 视频缓存的字节预算。§12 一条 15 秒 720p 约 1.5–3MB，512MB 够放 200 条还有余，
-     * 而手机上 512MB 是个不会让人皱眉的数字。
+     * 视频缓存的字节预算。§12 一条 30 秒 1080p ≤4Mbps 约 15MB（实测最坏 14.9MB），
+     * 2048MB 够放约 136 条 —— 和 [maxPhotos] 默认的 200 张大致配套。
+     *
+     * 这个数**必须跟着服务端播放规格改**：2026-07-30 规格提档后，原来的 512MB
+     * 从「够放两百条还有余」变成只够 34 条。少了不会报错，表现是随机某些照片
+     * 扫出来要等网络（视频被挤出去了，缩略图还在，所以照片认得出、画面出不来）。
      */
-    val maxVideoBytes: Long = 512L * 1024 * 1024,
+    val maxVideoBytes: Long = 2048L * 1024 * 1024,
 ) {
     init {
         require(maxPhotos > 0) { "maxPhotos 必须为正" }
@@ -177,6 +181,9 @@ object CachePlanner {
         val evicted = dropVideo.filter { it !in stale }.toSet()
 
         val addVideo = ArrayList<String>()
+        val estimate = estimateVideoBytes(
+            cachedInKeep.filter { it.photoId !in dropVideo }, spec.maxVideoBytes,
+        )
         // 按 keep 的顺序（= 最近扫到的在前）来加，预算用完就停。这样预算紧张时
         // 留下的是常扫的那几条，而不是碰巧先遍历到的。
         keep.forEach { p ->
@@ -184,18 +191,55 @@ object CachePlanner {
             if (p.photoId in evicted) return@forEach
             val cached = byId[p.photoId]
             if (cached != null && cached.videoCached && p.photoId !in dropVideo) return@forEach
-            // 大小未知（还没下过），按 §12 的上限 3MB 估。估小了会超预算一点，
-            // 估大了会少缓存几条 —— 宁可少缓存，超预算是要占用户空间的。
-            if (used + ESTIMATED_VIDEO_BYTES > spec.maxVideoBytes) return@forEach
-            used += ESTIMATED_VIDEO_BYTES
+            if (used + estimate > spec.maxVideoBytes) return@forEach
+            used += estimate
             addVideo.add(p.photoId)
         }
 
         return VideoPlan(add = addVideo, drop = dropVideo.toList())
     }
 
-    /** §12：720p / ≤1.5Mbps / ≤15 秒 → 约 1.5–3MB。取上限估。 */
-    const val ESTIMATED_VIDEO_BYTES = 3L * 1024 * 1024
+    /**
+     * 还没下过的那些视频，一条按多少字节估。
+     *
+     * **优先用已缓存视频的实际平均值**，只有一条都没缓存过时才退回上限
+     * [MAX_VIDEO_BYTES]。原因是两个方向都有真实代价，而固定值必须往一边偏：
+     * - 估小了（旧代码写死 3MB，而 §12 改档后一条上限 16.2MiB，实测常见 5-10MiB）
+     *   会一次排下 5 倍装不下的量，真下完就超预算，下次同步再被 LRU 淘汰掉一批 ——
+     *   表现是「反复下了又删」，白吃流量。
+     * - 估大了（一律按 16.2MiB）会少缓存一半：2048MB 预算只排 126 条，而实际
+     *   放得下约 250 条，用户的预算白闲着一半，表现是「明明设了 2G，还是老要等网络」。
+     *
+     * 用实际平均值就两边都不偏，而且这个数**已经在手上**（[CachedPhoto.videoBytes]），
+     * 不需要服务端多返回一个字段。首次同步（没有样本）时取上限，那是唯一该保守的
+     * 时刻 —— 空缓存下超预算是直接多占用户几百 MB。
+     *
+     * 平均值偏小导致的超预算是**暂时的**：下一次同步开头的 LRU 会把 used 削回预算内。
+     *
+     * `min(上限, 预算)` 那一步不是保险，是**防死锁**：预算比一条上限还小时（预算是
+     * 自由参数，界面上最小一档 128MB 撞不到，但代码里 10MB 是合法值），按上限估会
+     * 一条都排不下 → 永远没有样本 → 永远按上限估。哪怕实际一条只有 1MB、放得下
+     * 十条，也一条都不缓存，而且不报错。取 min 让第一轮至少下一条把样本拿到手，
+     * 第二轮就收敛到实际大小，且从头到尾没有超过预算。
+     *
+     * 估值**永远不为 0**：0 会让任何预算看起来装得下无限条（预算判据
+     * `used + estimate > maxVideoBytes` 在两边都是 0 时恒假），而
+     * `maxVideoBytes = 0`（把视频缓存关掉）经过上面那个 min 正好会走到那里 ——
+     * 表现是「关掉视频缓存，反而把每条视频都下下来」。
+     */
+    internal fun estimateVideoBytes(cached: List<CachedPhoto>, maxVideoBytes: Long): Long {
+        val known = cached.filter { it.videoCached && it.videoBytes > 0 }
+        if (known.isEmpty()) return minOf(MAX_VIDEO_BYTES, maxVideoBytes).coerceAtLeast(1L)
+        return (known.sumOf { it.videoBytes } / known.size).coerceAtLeast(1L)
+    }
+
+    /**
+     * §12 一条播放版的字节上限（= 服务端 `transcode.MAX_PLAYABLE_BYTES`）。
+     *
+     * 30 秒 × (4000k 视频 + 128k 音频) ÷ 8 × 1.1 余量。**这个数必须跟服务端一起改**：
+     * 服务端不会发出超过它的播放版，所以它是唯一安全的「未知大小」上界。
+     */
+    const val MAX_VIDEO_BYTES = 17_028_000L
 }
 
 /**

@@ -6,7 +6,7 @@
 
 import json
 
-from photoar import synth
+from photoar import synth, transcode
 from photoar.server import fsbrowser
 
 
@@ -479,9 +479,14 @@ def test_stream_bad_asset_id_is_404(env):
 
 
 def test_transcode_path_when_video_is_oversized(make_env, fake_ffprobe, fake_ffmpeg):
-    """1080p 源 → 必须转码，产物落服务自有目录，不污染用户的视频目录。"""
+    """4K 源 → 必须转码，产物落服务自有目录，不污染用户的视频目录。
+
+    这里原来用 1080p 当"超规格"。2026-07-30 播放规格提到 1080p 之后 1080p 本身
+    合规了，所以换成 4K —— 只改数字不够，「体积超标但分辨率合规」是新的一条
+    路径，由下面那条测试单独覆盖。
+    """
     env = make_env()
-    env.cfg.ffprobe = fake_ffprobe(name="ffprobe1080", height=1080, width=1920)
+    env.cfg.ffprobe = fake_ffprobe(name="ffprobe4k", height=2160, width=3840)
     env.srv.cfg = env.cfg
     video = env.write_video("videos/big.mp4")
     resp = env.ingest(env.write_image("photos/u.jpg", seed=57), video=video)
@@ -493,6 +498,27 @@ def test_transcode_path_when_video_is_oversized(make_env, fake_ffprobe, fake_ffm
     assert detail["videoPath"] == str(video), "原始视频路径要保留（用户的文件）"
     media = env.body_json(env.get(f"/v1/photo/{pid}/media"))
     assert str(env.cfg.playable_dir) in media["nasPath"], "播的应是转码产物"
+
+
+def test_transcode_path_when_video_is_only_too_large(make_env, fake_ffprobe, fake_ffmpeg):
+    """分辨率、时长、faststart 全合规，只是体积超标 → 仍必须转码。
+
+    这是把 TARGET_HEIGHT 提到 1080 之后新出现的路径，也是最容易漏的一条：手机
+    拍的就是 1080p，唯一超标的地方是码率（20-25Mbps，规格的五六倍）。漏了这条
+    的表现不是报错，而是把一个 90MB 的原片原样发给客户端 —— AR 里认出照片后
+    要等半分钟才出画，两端都不报任何错。
+    """
+    env = make_env()
+    env.cfg.ffprobe = fake_ffprobe(name="ffprobeBig", height=1080, width=1920)
+    env.srv.cfg = env.cfg
+    video = env.write_video("videos/highbitrate.mp4")
+    # 稀疏文件：st_size 是真的（probe 就是读它），但不真占磁盘
+    with open(video, "r+b") as f:
+        f.truncate(transcode.MAX_PLAYABLE_BYTES + 1)
+
+    resp = env.ingest(env.write_image("photos/hb.jpg", seed=58), video=video)
+    assert resp.status == 201, env.body_json(resp)
+    assert env.body_json(resp)["transcoded"] is True
 
 
 # ---- 列表 / 详情 ----
