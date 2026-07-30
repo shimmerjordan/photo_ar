@@ -476,6 +476,37 @@ IDLE ──startScan──> SCANNING ──命中──> LOADING_TARGET ──> 
 
 `session.configure()` 更换目标库会短暂重置 session。状态机必须显式建模 `LOADING_TARGET` 中间态，容忍这期间的 tracking 中断，不能误判为"丢失"。
 
+### 11.3 修订：离线识别不用 ORB，改走 ARCore 多图库（Phase 4，2026-07-30）
+
+上面第 3 条原话是「先查本地缓存索引（最近 200 张的 ORB 描述子，约 2MB）」。实做时改了，
+三处偏离连同理由记在这里：
+
+**一、端上不做 ORB 匹配。** 那要在 APK 里塞 OpenCV（每个 ABI 几十 MB 的 `.so`），
+还要把 `recognizer.py` 的两阶段管线用 Kotlin 重写一遍 —— 而重写出来的那份没有任何
+办法单测（合成查询图回归测试跑在 Python 侧）。改成把缓存里那 200 张缩略图喂给
+**ARCore 自己的 `AugmentedImageDatabase`**（`addImage(photoId, bitmap, printWidthM)`
++ `serialize()`），扫描开始时整库装进 session。ARCore 本来就在**每帧连续做**这件事，
+识别和跟踪合成一步，抽帧与本地匹配那一层整个不需要了。`AugmentedImage.name` 就是
+`photoId`（Phase 2 已经这么用），物理宽度照旧从 `addImage` 传进去。
+
+代价说清楚：640px 缩略图提出来的特征比服务端 `arcoreimg build-db` 用原图建的弱一档，
+也就是已有的 `IMGDB_FALLBACK` 那种降级。所以一次本地命中是「质量降一档，但完全不用
+网络」，界面上要说出来 —— `NoticeKind.LOCAL_HIT` 存在的全部理由。
+
+**二、建库推迟到下次扫描启动。** `AugmentedImageDatabase(session)` 的构造要一个
+ARCore Session，而「缓存管理」页点「现在同步」时相机没开、也可能没有相机权限。为建库
+单独造一个 Session 是错的（要权限、要 ARCore 装着，跟「把文件下下来」无关）。所以同步
+只负责下齐缩略图并把库标成过期（删掉 `local.imgdb`），真正建库在下一次扫描启动时的
+后台线程上做（约几百毫秒 / 200 张），只有 `session.configure()` 那一步回 GL 线程 ——
+合成一个方法会把特征提取压到 GL 线程，表现为启动扫描时预览卡一下。
+
+**三、过期判定用文件 mtime，不另存 dirty 标记。** `local.imgdb` 比 `index.json` 旧
+就是过期。多一个标记文件就多一个会和现实不一致的状态（标记写成了库没写成、或反过来），
+而那种不一致的表现是离线识别**静默**失效。
+
+一个本地命中**不走** `loadTarget`：那个方法会用单张 `.imgdb` 重新 `configure()`，
+而 `configure()` 重置 session，会把此刻正在跟踪的这张图丢掉。
+
 ## 12. 视频规格
 
 ```
@@ -648,6 +679,45 @@ ARCore / GLES / 相机 / 播放各层只做搬运。所以「未验证」的具�
 **Phase 3 记作代码完成、出口条件挂起**，与 Phase 2 同一状态 —— 两者的出口条件
 在同一次真机上手里一起判。详见 `docs/superpowers/plans/2026-07-30-phase3-shell.md`。
 
+### Phase 4 的实际状态（2026-07-30）
+
+出口条件「常扫照片离线可用」：**未达成，且当前无法判定** —— 同前两个阶段，没有
+Android 真机。离线识别这一条尤其没法靠单测判：整条链路的最后一步是 ARCore 在
+真实相机帧里认出一张 640px 缩略图建出来的目标，而那正是模拟器上跑不了的部分。
+
+| 验证方式 | 结果 |
+|---|---|
+| `./gradlew testDebugUnitTest` | 366 个全绿（arview 333 / app 33）。全仓库 764 |
+| `./gradlew :app:assembleDebug` | BUILD SUCCESSFUL，`app-debug.apk` 11.8MB（Phase 3 是 11.7MB —— 没加任何依赖） |
+| 真机离线扫描 | **一次都没跑过** |
+
+**§11.3 的 ORB 方案换成了 ARCore 多图库**，三处偏离与理由写在 §11.3 的修订小节里。
+分层照旧：能不 import android 的都放进纯 Kotlin（`CacheIndex` / `CachePlanner` /
+`CacheSync` / `CacheSettings`），落盘与 ARCore 只做搬运。
+
+新增覆盖的行为里，值得单独记一笔的是这几条不报错的失败模式 —— 它们都是先想到、
+再写测试或注释锁住的，不是测出来的：
+
+- `PhotoCache` 必须进程内唯一（`OfflineCache`）。两个实例各持一份内存索引，谁最后
+  `flush()` 谁赢 —— 表现为「刚同步完的 47 张，回到扫描页又变回 0 张」，不报错。
+- 退出一张照片后必须把本地多图库**装回去**（`LocalTargetDb.reinstall`）。
+  `clearTarget()` 把库清空了，不装回来的话「退出第一张照片之后离线识别就没了」，
+  同样不报错。
+- 缓存根目录用 `filesDir` 不用 `cacheDir`：后者系统可随时清，而「被清掉之后离线
+  用不了」正好是这份缓存存在的唯一理由。
+- `VIDEO_NOT_CACHED` 与 `VIDEO_UNPLAYABLE` 是两条不同的提示：前者用户连上网就能
+  解决，后者不能。合成一条会让人对着能解决的问题干等。
+- 一次本地命中**不调** `loadTarget` —— 那会 `configure()` 重置 session，把此刻
+  正在跟踪的图丢掉。
+
+**未验证的具体项**：640px 缩略图建出来的库在真实相机下认不认得出、认出来之后跟踪
+比联网时差多少、200 张建库在真机上到底几百毫秒还是几秒、缓存管理页的实际观感、
+以及 ARCore 会拒掉多少张自家照片（纯色/糊/大片天空）—— 最后这一项决定「可离线识别
+N 张」和「缓存 N 张」差多远，只能拿真照片量。
+
+**Phase 4 记作代码完成、出口条件挂起。** Phase 2/3/4 的出口条件在同一次真机上手里
+一起判。详见 `docs/superpowers/plans/2026-07-30-phase4-cache.md`。
+
 ## 16. 风险与已知限制
 
 | 风险 | 影响 | 缓解 |
@@ -671,6 +741,7 @@ ARCore / GLES / 相机 / 播放各层只做搬运。所以「未验证」的具�
 | ARCore Augmented Images | MindAR(Web)、ARKit、Vuforia | 单库 1000 张但**库数量不限**，配合"云识别 + 单目标下发"即无上限；有 `arcoreimg` 离线预生成；跟踪质量优于 Web AR。MindAR 多目标会崩移动浏览器（[issue #22](https://github.com/hiukim/mind-ar-js/issues/22)）；ARKit 需 $99/年账号 |
 | ~~[SceneView/sceneform-android](https://github.com/SceneView/sceneform-android)~~ → **裸 ARCore + 手写 GLES 2.0**（Phase 2 改） | SceneView、已归档的 Google Sceneform、裸 Filament | 原选 SceneView 是因为它原生支持 Augmented Images + `ExternalTexture`。Phase 2 实做时改掉了：§11.8 的羽化+淡入需要自定义 fragment shader，Filament 材质得用 `matc` 离线编译成 `.filamat`（等于再加一个 Google 闭源工具）；而整个场景只有两个四边形，用不上场景图/光照/PBR/glTF，为它背 ~10MB 不划算；`SurfaceTexture` → `GL_TEXTURE_EXTERNAL_OES` 也是 ExoPlayer 出图最直的路。代价是 EGL 生命周期、`setDisplayGeometry`、`getTransformMatrix` 全得自己管对，`gl/` 共 546 行 |
 | ~~Flutter 外壳~~ → **Kotlin + Jetpack Compose**（Phase 3 改） | Flutter + MethodChannel/EventChannel、React Native、原生 View/XML | 地基是 ARCore，只有 Android，Flutter 的跨平台价值为零；代价却是把 §7 契约实现两遍（Dart 重写请求与解析，或把每个 API 都包成 MethodChannel，六个界面的每次列目录/取缩略图都过桥）。`EndpointResolver` 按 §5.7 本就在原生侧，「当前走哪条通道」这个全局状态还得再推过去；缩略图要带 `Authorization` 头，`Image.network` 用不了，"控件生态省事"也不成立。改 Compose 后同进程直接调用，无桥、无第二份契约。代价是 `@Composable` 层跑不了 JVM 单测，故把易错的格式化与校验抠进纯函数 `Fmt.kt` |
+| ~~端上 ORB 缓存索引~~ → **ARCore 多图库（`addImage` + `serialize`）**（Phase 4 改） | 在 APK 里塞 OpenCV 做 ORB 匹配、或干脆不做离线 | §11.3 原写「本地缓存最近 200 张的 ORB 描述子」。实做时改掉：那要每个 ABI 背几十 MB `.so`，还要把 `recognizer.py` 的两阶段管线用 Kotlin 重写一份**而且没法单测**（合成查询图回归测试在 Python 侧）。改成把 200 张缩略图喂进 ARCore 自己的 `AugmentedImageDatabase` —— ARCore 本来就在每帧连续做识别，抽帧 + 本地匹配那一层整个消失，`AugmentedImage.name` 直接就是 `photoId`。代价是 640px 缩略图的特征比服务端 `arcoreimg build-db` 用原图建的弱一档（等于已有的 `IMGDB_FALLBACK` 降级），所以界面明说「离线识别，贴合可能略有偏差」。这也正好是 §16 里「极端情况改用端上 `addImage()` 运行时构建」那条缓解措施的提前落地 |
 | **打印尺寸按纸张预设 + 手输毫米（10–2000）** | 只给手输、或从 EXIF/DPI 反推 | `print_width_m` 是参考图**水平方向**的物理宽度，横放取长边、竖放取短边（6寸 = 152 / 102），方向由缩略图像素比判定。填错**不会报错**，只会让 AR 里的视频一直飘 —— 所以既要预设降低出错率，也要范围校验挡住笔误。EXIF 里没有实物打印尺寸，反推不出来 |
 | **缩略图自己解码 + `LruCache`** | Coil、Glide | 每张图要带 `Authorization: Bearer`，且 api/media 是两条会各自变化的通道，缓存键得绕开 URL。配图片库的 header 注入 + 自定义客户端 + 自定义键，工作量不比 `BitmapFactory` + 8MB `LruCache` 少，还多一棵依赖树 |
 | [fbow](https://github.com/rmsalinas/fbow) / [DBoW3](https://github.com/rmsalinas/DBow3) | FAISS + CLIP、pHash | ORB 二进制描述子 + 层次词汇树，纯 CPU 万级库查询 10-50ms，ORB-SLAM 同款。pHash 抗不住透视与光照；CLIP 在 N5095 上偏慢且对裁切敏感 |

@@ -29,6 +29,14 @@ sealed interface Route {
     data class Detail(val photoId: String) : Route
 
     /**
+     * 离线缓存管理（§5.8）。
+     *
+     * 不给它一个底栏 tab：这一页是「出门前准备一次」的页面，日常不需要，
+     * 而底栏的四个格子每多一个都会让最常用的那两个变窄。
+     */
+    data object Cache : Route
+
+    /**
      * NAS 浏览。[dir] 为 null 是白名单根目录列表。
      *
      * 每进一层目录就 push 一页，所以系统返回键天然等于「上一级」—— 自己维护一个

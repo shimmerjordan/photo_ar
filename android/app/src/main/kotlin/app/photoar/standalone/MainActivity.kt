@@ -155,6 +155,7 @@ fun AppRoot() {
                 is Route.Detail -> PhotoDetailScreen(shell, route.photoId)
                 is Route.Browse -> BrowseScreen(shell, route)
                 Route.Create -> CreateScreen(shell)
+                Route.Cache -> CacheScreen(shell)
             }
         }
     }
@@ -170,6 +171,7 @@ private fun titleOf(route: Route): String = when (route) {
         else -> "挑一段视频 · " + Fmt.dirTitle(route.dir)
     }
     Route.Create -> "关联新照片"
+    Route.Cache -> "离线缓存"
 }
 
 /**

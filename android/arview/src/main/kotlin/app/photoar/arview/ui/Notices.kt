@@ -26,6 +26,12 @@ object Notices {
         NoticeKind.NO_SEEK -> "这个视频不支持拖动进度"
         NoticeKind.VIDEO_UNPLAYABLE -> "视频播不了，照片还认得住"
         NoticeKind.TRACKING_LOST -> "照片离开画面，已暂停"
+        // 「离线」这个词是刻意露给用户的：这一次跟踪质量比联网时低一档（用的是
+        // 端上现算的特征而不是服务端预建的库），贴合略偏时人得知道原因。
+        NoticeKind.LOCAL_HIT -> "离线识别（本地缓存），贴合可能略有偏差"
+        // 和 VIDEO_UNPLAYABLE 分开的理由在 NoticeKind 那边写了：这条用户能自己
+        // 解决，所以文案要给出办法，而不是只报告坏消息。
+        NoticeKind.VIDEO_NOT_CACHED -> "这条视频还没缓存，联网后可播"
     }
 
     /** 提示要不要自动消失。瞬时状态会自己好，硬故障要留在屏幕上。 */
@@ -34,7 +40,10 @@ object Notices {
         NoticeKind.ASSET_MISSING,
         NoticeKind.VIDEO_UNPLAYABLE,
         NoticeKind.REF_STALE,
+        // 「没缓存」在这次扫描里不会自己变好，消失了只会让人对着空白照片等下去
+        NoticeKind.VIDEO_NOT_CACHED,
         -> false
+        // LOCAL_HIT 走这边：它只是说明这次是怎么认出来的，看一眼就够了
         else -> true
     }
 }

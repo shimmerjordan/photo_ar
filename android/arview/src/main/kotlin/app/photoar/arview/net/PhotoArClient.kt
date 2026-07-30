@@ -39,6 +39,13 @@ class PhotoArClient(
         const val DOWNLOAD_TIMEOUT_MS = 10_000
 
         /**
+         * 缓存视频用的超时。一条 3MB 的视频在 1Mbps 的上行下要 24 秒 —— 用
+         * [DOWNLOAD_TIMEOUT_MS] 的 10s 会把「网慢」判成失败，而缓存是后台活儿，
+         * 慢一点没人等。
+         */
+        const val CACHE_VIDEO_TIMEOUT_MS = 60_000
+
+        /**
          * 入库要跑 eval-img + ORB + build-db + ffmpeg 转码（§8.1），一条视频几十秒
          * 很正常。这条超时不是「网络慢」而是「服务端在干活」，所以给到 3 分钟 ——
          * 比它更短会在 N5095 上把正常的长视频入库判成失败。
@@ -71,6 +78,32 @@ class PhotoArClient(
         val ep = endpoints()
         val reply = transport.get(ep.api(relativeUrl), headers(ep), DOWNLOAD_TIMEOUT_MS)
         check(reply, relativeUrl)
+        return reply.body
+    }
+
+    /**
+     * 把一条视频整个拉下来存缓存（Phase 4）。
+     *
+     * 走 **media** 通道而不是 api：一条视频 1.5–3MB，从隧道拉是给 Cloudflare
+     * 白送流量，而在家时 mediaBase 就是局域网直连。[MediaInfo.absolute] 为真
+     * （`via == "direct_link"`）时 [MediaInfo.resolvedUrl] 会跳过前缀，那条 URL
+     * 自带签名，不该再带 Authorization —— 所以请求头是按 absolute 分岔的。
+     *
+     * @throws HttpFailure 视频不可播（服务端说 missing）、或者取不到。
+     */
+    fun downloadMedia(media: MediaInfo): ByteArray {
+        val ep = endpoints()
+        if (!media.playable) {
+            throw HttpFailure(NetErrorKind.BAD_RESPONSE, null, "视频不可用：${media.reason ?: "missing"}")
+        }
+        val url = media.resolvedUrl(ep)
+            ?: throw HttpFailure(NetErrorKind.BAD_RESPONSE, null, "视频没有地址")
+        val h = if (media.absolute) emptyMap() else headers(ep)
+        val reply = transport.get(url, h, CACHE_VIDEO_TIMEOUT_MS)
+        check(reply, "视频下载")
+        if (reply.body.isEmpty()) {
+            throw HttpFailure(NetErrorKind.BAD_RESPONSE, null, "视频下载：拿到 0 字节")
+        }
         return reply.body
     }
 

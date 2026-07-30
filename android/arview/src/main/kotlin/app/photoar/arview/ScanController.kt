@@ -47,6 +47,22 @@ enum class NoticeKind {
     /** 丢失跟踪，已暂停并保留播放位置。 */
     TRACKING_LOST,
 
+    /**
+     * 离线命中：ARCore 从本地多图库认出来的，没走网络（Phase 4 / §11.3）。
+     *
+     * 要提示，因为这条路的跟踪质量比服务端预建的 `.imgdb` 低一档 —— 本地库是用
+     * 640px 缩略图现建的。用户看到框抖得比平时厉害时，这条提示能解释为什么。
+     */
+    LOCAL_HIT,
+
+    /**
+     * 认出来了，但视频既没缓存、此刻又没网（Phase 4）。
+     *
+     * 和 [VIDEO_UNPLAYABLE] 分开是刻意的：「没缓存」用户能自己解决（联网 / 同步
+     * 一次），「坏了」不能。归成一句会让人去查 NAS 上那个文件。
+     */
+    VIDEO_NOT_CACHED,
+
     /** 清掉当前提示。 */
     CLEARED,
 }
@@ -78,9 +94,23 @@ interface ScanEffects {
     /** 下载 .imgdb 并 `session.configure()`；失败时按 §13 降级用 thumb 现场构建。 */
     fun loadTarget(hit: Hit)
 
-    /** 取 `GET /v1/photo/{id}/media`。 */
+    /**
+     * 取视频地址。
+     *
+     * Phase 4 起先看缓存：缓存里有就直接回一个 `file://` 的 [MediaInfo]（见
+     * `cache.localMedia`），不请求 `GET /v1/photo/{id}/media`。缓存里没有又没网时
+     * 调 [ScanController.onMediaNotCached]，别用 [ScanController.onMediaFailed] ——
+     * 两件事的提示文案不一样。
+     */
     fun fetchMedia(hit: Hit)
 
+    /**
+     * 卸掉当前目标。
+     *
+     * **Phase 4 起还要把本地多图库装回 session**：[loadTarget] 用单张 `.imgdb`
+     * 做过 `session.configure()`，那一下会把本地库顶掉。不装回去的话，退出这张
+     * 照片之后离线识别就没了 —— 而且是静默没的，表现为「昨天还能离线认，今天不行」。
+     */
     fun releaseTarget()
     fun preparePlayer(hit: Hit, media: MediaInfo)
     fun playVideo()
@@ -93,11 +123,26 @@ interface ScanEffects {
     fun emit(event: ScanEvent)
 }
 
+/**
+ * 本地缓存索引的查询口（Phase 4 / §11.3）。
+ *
+ * 扫描期间 ARCore 的 session 里装的是本地多图库，它认出来的 `AugmentedImage.name`
+ * 就是 photoId（Phase 2 定的）。状态机拿这个 id 来问一句「缓存里有它吗」，有就是
+ * 一次离线命中。真机上实现是 `PhotoCache`，单测里给个 map。
+ *
+ * 返回 null 表示「不认识」—— 状态机会继续按 400ms 的节奏走服务端识别。
+ */
+fun interface LocalIndex {
+    fun lookup(photoId: String): Hit?
+}
+
 class ScanController(
     private val fx: ScanEffects,
     private val clock: Clock,
     /** false 表示机型不支持 ARCore：§13 要求退化成「识别后全屏播放」，功能不丢。 */
     private val arAvailable: Boolean = true,
+    /** 默认「本地什么都没有」，于是行为与 Phase 2/3 完全一致。 */
+    private val localIndex: LocalIndex = LocalIndex { null },
 ) {
 
     companion object {
@@ -272,14 +317,23 @@ class ScanController(
         // 其余情况静默重试：§13 明确「不阻塞相机预览」。
     }
 
-    fun onTargetLoaded(photoId: String, usedThumbFallback: Boolean = false) {
+    /**
+     * @param alreadyTracking 目标此刻**已经**在画面里被跟踪着 —— 离线命中就是这种
+     *   情况：是 ARCore 先认出来才有这次命中的，不存在「装好了但还没找到」的空窗，
+     *   所以那 10 秒的 [NoticeKind.TARGET_NOT_FOUND] 判定不该启动。
+     */
+    fun onTargetLoaded(
+        photoId: String,
+        usedThumbFallback: Boolean = false,
+        alreadyTracking: Boolean = false,
+    ) {
         if (photoId != current?.photoId || state != ScanState.LOADING_TARGET) return
         if (usedThumbFallback) notice(NoticeKind.IMGDB_FALLBACK)
-        everTracked = !arAvailable
-        tracking = !arAvailable
+        everTracked = alreadyTracking || !arAvailable
+        tracking = alreadyTracking || !arAvailable
         // AR 模式下此刻还没找到图，10 秒判定从现在开始算；全屏兜底模式没有
         // 「跟踪」这件事，所以不设。
-        notTrackingSince = if (arAvailable) clock.nowMs() else null
+        notTrackingSince = if (arAvailable && !alreadyTracking) clock.nowMs() else null
         setState(ScanState.TRACKING)
         maybeStartPlayback()
     }
@@ -309,6 +363,16 @@ class ScanController(
     fun onMediaFailed(photoId: String, detail: String? = null) {
         if (photoId != current?.photoId) return
         notice(NoticeKind.VIDEO_UNPLAYABLE, detail)
+    }
+
+    /**
+     * 视频没缓存、此刻又没网（Phase 4）。
+     *
+     * 跟踪照旧 —— 用户还能看到框，也才有地方放「联网后再看」这句话。
+     */
+    fun onMediaNotCached(photoId: String) {
+        if (photoId != current?.photoId) return
+        notice(NoticeKind.VIDEO_NOT_CACHED)
     }
 
     fun onPlayerReady() {
@@ -341,11 +405,16 @@ class ScanController(
      * ARCore 每帧的跟踪状态。[photoId] 为 null 表示画面里没有任何被跟踪的图。
      */
     fun onTracking(photoId: String?, isTracking: Boolean) {
+        // Phase 4：扫描期间 session 里装的是本地多图库（§11.3），所以 ARCore 在这个
+        // 状态下认出来的东西**就是一次离线命中** —— 不用等那 400ms 一轮的服务端识别，
+        // 也不用有网。这是 spec 里「常扫照片离线可用」真正落地的地方。
+        if (state == ScanState.SCANNING) {
+            if (photoId != null && isTracking) tryLocalHit(photoId)
+            return
+        }
         // §11 最后一段：session.configure() 换库会短暂重置 session，
         // LOADING_TARGET 期间的跟踪中断必须容忍，不能误判成「丢失」。
-        if (state == ScanState.LOADING_TARGET || state == ScanState.IDLE ||
-            state == ScanState.SCANNING
-        ) return
+        if (state == ScanState.LOADING_TARGET || state == ScanState.IDLE) return
         val hit = current ?: return
         if (photoId != null && photoId != hit.photoId) return
 
@@ -379,7 +448,28 @@ class ScanController(
 
     // ---- 内部 ----
 
-    private fun acceptHit(hit: Hit) {
+    /**
+     * 离线命中。
+     *
+     * ARCore 报的名字就是 photoId（Phase 2 定的），但只有缓存索引里确实有这一条时
+     * 才当命中 —— 库和索引理论上同步，真出现不一致（索引被清了、库还在 session 里）
+     * 时宁可继续走服务端那条路，也不要拿一条没有元数据的命中往下走。
+     */
+    private fun tryLocalHit(photoId: String) {
+        if (isBlocked(photoId, clock.nowMs())) return
+        val hit = localIndex.lookup(photoId) ?: return
+        acceptHit(hit, local = true)
+    }
+
+    /**
+     * @param local 离线命中。两处不同：**不调 [ScanEffects.loadTarget]**，以及直接
+     *   进入「已在跟踪」。
+     *
+     *   不调 loadTarget 是硬要求而不是省一次网络：那个方法会用单张 `.imgdb` 做
+     *   `session.configure()`，而换库会重置 session —— 把此刻正被跟踪的这张图弄丢，
+     *   于是刚认出来就立刻「丢失跟踪」。库已经在 session 里了，什么都不用做。
+     */
+    private fun acceptHit(hit: Hit, local: Boolean = false) {
         current = hit
         media = null
         playerReady = false
@@ -394,12 +484,13 @@ class ScanController(
         if (hit.refStale) notice(NoticeKind.REF_STALE)
         setState(ScanState.LOADING_TARGET)
         fx.fetchMedia(hit)
-        if (arAvailable) {
-            fx.loadTarget(hit)
-        } else {
+        when {
+            local -> onTargetLoaded(hit.photoId, alreadyTracking = true)
+            arAvailable -> fx.loadTarget(hit)
             // 不支持 ARCore：没有目标库要装，直接进入「已装载」。
-            onTargetLoaded(hit.photoId)
+            else -> onTargetLoaded(hit.photoId)
         }
+        if (local) notice(NoticeKind.LOCAL_HIT)
     }
 
     private fun maybeStartPlayback() {

@@ -7,7 +7,10 @@ import android.os.Looper
 import android.util.Log
 import android.view.SurfaceView
 import app.photoar.arview.ar.ArSessionHolder
+import app.photoar.arview.ar.LocalTargetDb
 import app.photoar.arview.ar.TargetLoader
+import app.photoar.arview.cache.OfflineCache
+import app.photoar.arview.cache.localMedia
 import app.photoar.arview.camera.Camera2Source
 import app.photoar.arview.gl.ArRenderer
 import app.photoar.arview.media.VideoPlayer
@@ -65,6 +68,11 @@ class ScanRuntime(
 
     private val targetLoader = TargetLoader(client, activity.cacheDir)
 
+    /** 离线缓存（Phase 4）。和「缓存管理」页共用同一个实例，见 [OfflineCache]。 */
+    private val cache = OfflineCache.of(activity.filesDir)
+
+    private val localDb = if (arAvailable) LocalTargetDb(cache) else null
+
     private val ar = if (arAvailable) ArSessionHolder(activity) else null
     private val videoTexture = if (arAvailable) VideoTexture() else null
     private var renderer: ArRenderer? = null
@@ -73,7 +81,15 @@ class ScanRuntime(
     private var camera: Camera2Source? = null
     private var videoView: SurfaceView? = null
 
-    val controller = ScanController(this, Clock { System.currentTimeMillis() }, arAvailable)
+    val controller = ScanController(
+        this,
+        Clock { System.currentTimeMillis() },
+        arAvailable,
+        // ARCore 从本地多图库里认出来的名字就是 photoId（Phase 2 定的）。这里再查一遍
+        // 索引：库和索引理论上同步，真不同步时（索引清了、库还在 session 里）宁可
+        // 当成没命中继续走服务端，也不要拿一条没有元数据的命中往下走。
+        localIndex = LocalIndex { id -> cache.byId(id)?.takeIf { it.usableAsTarget }?.toHit() },
+    )
 
     private val player = VideoPlayer(
         context = activity,
@@ -155,8 +171,37 @@ class ScanRuntime(
                 listener.onFatal("相机打不开，可能被别的应用占用")
                 return
             }
+            installLocalDb(holder)
         }
         controller.start()
+    }
+
+    /**
+     * 把离线多图库装进会话（§11.3 / Phase 4）。
+     *
+     * 建库和装库分在两个线程上：建库要跑几百毫秒的特征提取，放 GL 线程上就是启动
+     * 扫描时预览卡一下；而装库会 `session.configure()`，必须在 GL 线程。
+     *
+     * 失败不影响扫描 —— 离线识别没了就退回「每 400ms 问一次服务端」，也就是
+     * Phase 2/3 的行为。所以这里只记日志，不弹提示。
+     */
+    private fun installLocalDb(holder: ArSessionHolder) {
+        val db = localDb ?: return
+        net.execute {
+            val session = holder.session ?: return@execute
+            try {
+                db.rebuildIfStale(session)?.let { r ->
+                    if (r.failure != null) {
+                        Log.w(TAG, "本地库重建失败：${r.failure}")
+                    } else {
+                        Log.i(TAG, "本地库重建：${r.accepted} 张可认，${r.rejected.size} 张被拒")
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "本地库重建炸了（不影响联网扫描）", e)
+            }
+            onGl { db.install(holder)?.let { Log.w(TAG, "本地库装载失败：$it") } }
+        }
     }
 
     fun onPause() {
@@ -167,6 +212,20 @@ class ScanRuntime(
         ar?.pause()
         glView?.onPause()
         camera?.stop()
+        localDb?.onSessionGone()
+        // 这一轮扫到过哪些照片（lastSeenAt）在这里落盘 —— markSeen 自己不写盘，
+        // 因为扫描时每帧都可能命中。丢一次的代价只是排序略旧一点。
+        flushCache()
+    }
+
+    private fun flushCache() {
+        net.execute {
+            try {
+                cache.flush()
+            } catch (e: Throwable) {
+                Log.w(TAG, "缓存索引落盘失败", e)
+            }
+        }
     }
 
     fun destroy() {
@@ -228,7 +287,7 @@ class ScanRuntime(
                     if (err != null) {
                         controller.onTargetFailed(hit.photoId, err)
                     } else {
-                        renderer?.setTarget(hit.printWidthM, hit.refAspect)
+                        // 尺寸已经在 Matched 那里设过了（见 emit）
                         controller.onTargetLoaded(hit.photoId, fallbackReason != null)
                     }
                 }
@@ -236,15 +295,46 @@ class ScanRuntime(
         }
     }
 
+    /**
+     * 缓存优先（Phase 4）。
+     *
+     * 本地那份视频就是从同一个地址下下来的字节，画质完全一样，而且省掉一次
+     * media 元数据 RTT 和整段流传输 —— 命中到出画会明显快一截。断网时它还是
+     * 唯一能播的东西。
+     *
+     * 这里在主线程上摸了两下磁盘（文件存在 + 长度）。是刻意的：两个 stat 是
+     * 微秒级，而为它开一趟线程切换会让「本地命中秒出画」这件事白白多一帧延迟。
+     */
     override fun fetchMedia(hit: Hit) {
+        val cached = cache.byId(hit.photoId)
+        cache.localVideoUrl(hit.photoId)?.let { url ->
+            controller.onMedia(
+                hit.photoId,
+                localMedia(url, cached?.videoBytes ?: 0L, cached?.videoDurationMs),
+            )
+            return
+        }
         net.execute {
             try {
                 val info = client.media(hit)
                 main.post { controller.onMedia(hit.photoId, info) }
             } catch (e: Throwable) {
-                main.post { controller.onMediaFailed(hit.photoId, e.message) }
+                main.post {
+                    // 「没缓存 + 此刻没网」和「视频坏了」要分开报：前者用户联网就好，
+                    // 后者不能。判据就是这次失败是不是网络层的。
+                    if (offlineFailure(e)) {
+                        controller.onMediaNotCached(hit.photoId)
+                    } else {
+                        controller.onMediaFailed(hit.photoId, e.message)
+                    }
+                }
             }
         }
+    }
+
+    private fun offlineFailure(e: Throwable): Boolean {
+        val kind = (e as? HttpFailure)?.kind ?: return true // 连 HttpFailure 都不是：更底层的 IO
+        return kind == NetErrorKind.TRANSPORT || kind == NetErrorKind.TIMEOUT
     }
 
     override fun releaseTarget() {
@@ -254,7 +344,14 @@ class ScanRuntime(
         }
         videoTexture?.markStale()
         videoView?.visibility = android.view.View.GONE
-        ar?.let { holder -> onGl { holder.clearTarget() } }
+        ar?.let { holder ->
+            onGl {
+                holder.clearTarget()
+                // §15：clearTarget 把库清空了，本地多图库必须装回去 ——
+                // 不装的话退出第一张照片之后离线识别就没了，而且是静默没的。
+                localDb?.reinstall(holder)?.let { Log.w(TAG, "本地库装回失败：$it") }
+            }
+        }
     }
 
     override fun preparePlayer(hit: Hit, media: MediaInfo) {
@@ -294,6 +391,16 @@ class ScanRuntime(
     }
 
     override fun emit(event: ScanEvent) {
+        // lastSeenAt 是「最近 200 张」的排序键（CachePlanner.rank）。在线命中也要记：
+        // 不记的话排序退化成入库时间，墙上那张天天扫的会被刚打印的一批顶掉，
+        // 而「常扫照片离线可用」正是这份缓存的出口条件。
+        if (event is ScanEvent.Matched) {
+            cache.markSeen(event.hit.photoId, System.currentTimeMillis())
+            // 四边形的物理尺寸在这里设，而不是在 loadTarget 里：离线命中根本不调
+            // loadTarget（换库会重置 session），设在那边就会让离线命中的视频按上
+            // 一张照片的尺寸去贴。Matched 在两条路上都会走到，而且更早。
+            renderer?.setTarget(event.hit.printWidthM, event.hit.refAspect)
+        }
         listener.onScanEvent(event)
     }
 

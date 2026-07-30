@@ -178,6 +178,20 @@ fun SettingsScreen(shell: Shell, resolution: Resolution?) {
             }
         }
 
+        Section("离线缓存")
+        Text(
+            text = "把最近扫到的照片和视频存到手机上，没网也能扫（§15）。" +
+                "缓存多少、什么时候同步都在那一页里。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(
+            onClick = { shell.push(Route.Cache) },
+            modifier = Modifier.padding(top = 8.dp),
+        ) {
+            Text("管理离线缓存")
+        }
+
         Text(
             text = "令牌明文存在 SharedPreferences 里，没上 Keystore：这台机器的门槛是锁屏，" +
                 "而拿到 root 的人一样能读出 Keystore 解出来的明文。",

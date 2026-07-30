@@ -510,7 +510,146 @@ class ScanControllerTest {
         assertEquals(ScanState.PLAYING, c.state)
     }
 
+    // ---- 离线命中（§15 / Phase 4）----
+
+    @Test
+    fun `扫描时 ARCore 认出缓存里的照片就是一次命中`() {
+        // 这一条是「常扫照片离线可用」的全部：没有 recognize 请求，没有网络，
+        // 光靠 session 里那份本地多图库就走完了识别。
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+
+        assertEquals(ScanState.TRACKING, local.state)
+        assertEquals(1, fx.events.filterIsInstance<ScanEvent.Matched>().size)
+        assertTrue(NoticeKind.LOCAL_HIT in fx.notices())
+        assertEquals("视频还是要问的，只是可能问到缓存", 1, fx.count("fetchMedia:${hit().photoId}"))
+    }
+
+    @Test
+    fun `离线命中不去装单张目标库`() {
+        // 换库要 session.configure()，那会重置 session 把此刻正跟踪的这张图弄丢 ——
+        // 于是刚认出来就立刻「丢失跟踪」。库已经在里面了，什么都不该做。
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        assertEquals(0, fx.count("loadTarget:${hit().photoId}"))
+    }
+
+    @Test
+    fun `离线命中不会误报认出来但没找到`() {
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        fx.clear()
+        clock.advance(30_000)
+        local.tick()
+        assertFalse(NoticeKind.TARGET_NOT_FOUND in fx.notices())
+        assertEquals(ScanState.TRACKING, local.state)
+    }
+
+    @Test
+    fun `离线命中后播放器一就绪就播`() {
+        // 不用再等一次 onTracking：是 ARCore 先跟踪上才有这次命中的
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        local.onMedia(hit().photoId, media())
+        local.onPlayerReady()
+        assertEquals(ScanState.PLAYING, local.state)
+    }
+
+    @Test
+    fun `缓存里没有的照片不算命中扫描继续`() {
+        // 库和索引理论上同步。真不同步时宁可继续走服务端那条路，
+        // 也不要拿一条没有元数据的命中往下走。
+        val local = controllerWith(null)
+        local.start()
+        local.onTracking(hit().photoId, true)
+        assertEquals(ScanState.SCANNING, local.state)
+        assertEquals(0, fx.events.filterIsInstance<ScanEvent.Matched>().size)
+        clock.advance(400)
+        local.tick()
+        assertEquals("照旧抽帧问服务端", 1, fx.count("captureFrame"))
+    }
+
+    @Test
+    fun `装库失败被拉黑的照片也不走离线命中`() {
+        val local = controllerWith(hit())
+        local.start()
+        local.tick()
+        val seq = fx.lastCaptureSeq!!
+        local.onFrame(seq, ByteArray(1))
+        local.onRecognized(seq, RecognizeOutcome.Matched(hit()))
+        local.onTargetFailed(hit().photoId, "imgdb 版本不匹配")
+        fx.clear()
+
+        local.onTracking(hit().photoId, true)
+        assertEquals("拉黑期内一样不认", ScanState.SCANNING, local.state)
+        assertFalse(NoticeKind.LOCAL_HIT in fx.notices())
+    }
+
+    @Test
+    fun `离线命中期间不再抽帧`() {
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        fx.clear()
+        clock.advance(10_000)
+        local.tick()
+        assertEquals(0, fx.count("captureFrame"))
+    }
+
+    @Test
+    fun `离线命中的参考图过期照样提示`() {
+        val local = controllerWith(hit(refStale = true))
+        local.start()
+        local.onTracking(hit().photoId, true)
+        assertTrue(NoticeKind.REF_STALE in fx.notices())
+    }
+
+    @Test
+    fun `视频没缓存时给出能自己解决的提示并继续跟踪`() {
+        // 和 VIDEO_UNPLAYABLE 分开是刻意的：这条用户联网就好，那条不能
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        local.onMediaNotCached(hit().photoId)
+        assertTrue(NoticeKind.VIDEO_NOT_CACHED in fx.notices())
+        assertEquals(ScanState.TRACKING, local.state)
+    }
+
+    @Test
+    fun `已经在跟踪别的照片时不再接受新的离线命中`() {
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, true)
+        fx.clear()
+        // 画面里同时进来另一张缓存里的照片
+        local.onTracking("b".repeat(32), true)
+        assertEquals(hit().photoId, local.current?.photoId)
+        assertEquals(0, fx.events.filterIsInstance<ScanEvent.Matched>().size)
+    }
+
+    @Test
+    fun `没跟踪上的报告不会触发离线命中`() {
+        val local = controllerWith(hit())
+        local.start()
+        local.onTracking(hit().photoId, false)
+        assertEquals(ScanState.SCANNING, local.state)
+        local.onTracking(null, true)
+        assertEquals(ScanState.SCANNING, local.state)
+    }
+
     // ---- 辅助 ----
+
+    /** 本地缓存里只有 [found] 这一条（null 表示缓存是空的）。 */
+    private fun controllerWith(found: Hit?): ScanController = ScanController(
+        fx,
+        clock,
+        arAvailable = true,
+        localIndex = LocalIndex { id -> found?.takeIf { it.photoId == id } },
+    )
 
     /** 走到 LOADING_TARGET。 */
     private fun matchOnce() {
