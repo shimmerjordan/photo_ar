@@ -61,6 +61,31 @@ class InvalidListingField(ValueError):
     """
 
 
+# arcoreimg 对纹理太少的图不给分，直接以这句话 + 退出码 1 结束。
+#
+# 靠文案匹配是没办法的事：arcoreimg 是闭源二进制，退出码只有 0/1，没有别的
+# 通道能区分「这张图不行」和「工具自己坏了」。文案哪天变了就退回今天的行为
+# （当成 RuntimeError → 500），不会更糟。
+_NO_KEYPOINTS_MARK = "Failed to get enough keypoints"
+
+
+class NotEnoughKeypoints(ValueError):
+    """arcoreimg 连关键点都提不够 —— 比 [QualityTooLow] 更靠下的同一件事。
+
+    **必须和工具故障分开**：这是输入的问题，重试一万次结果一样。`clean` 数据集上
+    实测约 **2.1%** 的照片是这样（3030 张里 65 张）。分不开的后果是它以 500 +
+    整个 traceback 的形式出现 —— 批量入库一万张就是 200 多个栈刷进日志，把真正
+    的服务端故障淹掉，而调用方看到 5xx 会当成「服务端挂了，值得重试」。
+    """
+
+    def __init__(self, path: str, stderr: str) -> None:
+        super().__init__(
+            f"{path}：arcoreimg 连足够的关键点都提不出来（{stderr}）。"
+            f"这是纹理不足的极端情况，比低分更严重。"
+        )
+        self.path = path
+
+
 class QualityTooLow(ValueError):
     def __init__(self, path: str, score: int) -> None:
         super().__init__(
@@ -71,7 +96,9 @@ class QualityTooLow(ValueError):
         self.score = score
 
 
-def _run(arcoreimg: str, args: list[str]) -> str:
+def _run(
+    arcoreimg: str, args: list[str], *, image_path: str | Path | None = None
+) -> str:
     if shutil.which(arcoreimg) is None and not Path(arcoreimg).is_file():
         raise ArcoreimgMissing(
             f"找不到 arcoreimg（{arcoreimg}）。从 ARCore SDK for Android 的 "
@@ -81,14 +108,21 @@ def _run(arcoreimg: str, args: list[str]) -> str:
         [arcoreimg, *args], capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"arcoreimg {' '.join(args)} 退出码 {proc.returncode}：{proc.stderr.strip()}"
-        )
+        err = proc.stderr.strip()
+        # 「这张图不行」和「工具坏了」共用退出码 1，只能靠文案分。见
+        # [NotEnoughKeypoints]：不分开的话前者会以 500 + traceback 的形式出现。
+        if _NO_KEYPOINTS_MARK in err:
+            raise NotEnoughKeypoints(str(image_path or " ".join(args)), err)
+        raise RuntimeError(f"arcoreimg {' '.join(args)} 退出码 {proc.returncode}：{err}")
     return proc.stdout
 
 
 def eval_img(image_path: str | Path, arcoreimg: str = ARCOREIMG) -> int:
-    out = _run(arcoreimg, ["eval-img", f"--input_image_path={Path(image_path)}"])
+    out = _run(
+        arcoreimg,
+        ["eval-img", f"--input_image_path={Path(image_path)}"],
+        image_path=image_path,
+    )
     scores = _SCORE_RE.findall(out)
     if not scores:
         raise RuntimeError(f"无法从 arcoreimg 输出中解析质量分：{out!r}")
@@ -153,6 +187,7 @@ def build_single_target_db(
                 f"--input_image_list_path={listing}",
                 f"--output_db_path={out_path}",
             ],
+            image_path=image_path,
         )
 
     if not out_path.exists():

@@ -27,7 +27,11 @@ def fake_arcoreimg(tmp_path):
         db_bytes: int = 4_300,
         exit_code: int = 0,
         expected_width_m: float | None = None,
+        stderr: str = "boom",
     ):
+        # stderr 可指定：真 arcoreimg 用退出码 1 同时表示「这张图不行」和
+        # 「工具自己坏了」，只能靠文案分（见 quality.NotEnoughKeypoints），
+        # 所以测试必须能造出那句话。
         script = tmp_path / "arcoreimg"
         script.write_text(
             textwrap.dedent(f"""\
@@ -39,7 +43,7 @@ def fake_arcoreimg(tmp_path):
             import sys, pathlib
             argv = sys.argv[1:]
             if {exit_code} != 0:
-                sys.stderr.write("boom\\n"); sys.exit({exit_code})
+                sys.stderr.write({stderr!r} + "\\n"); sys.exit({exit_code})
 
             EXPECTED_WIDTH_M = {expected_width_m!r}
 

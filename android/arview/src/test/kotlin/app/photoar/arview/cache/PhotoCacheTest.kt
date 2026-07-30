@@ -301,4 +301,42 @@ class PhotoCacheTest {
         assertEquals(4300L, cache.stats().targetBytes)
         assertEquals(4400L, cache.stats().totalBytes)
     }
+
+    // ---- 本地库过期判定的输入（newestThumbMs）----
+    //
+    // LocalTargetDb 拿它比 local.imgdb 的 mtime。这三条锁的是那个判定的**输入**：
+    // 判定本身要 ARCore，JVM 里跑不了，所以只能把「什么会让它变、什么不会」钉在这里。
+
+    @Test
+    fun `一张缩略图都没有时返回 0`() {
+        assertEquals(0L, cache.newestThumbMs())
+    }
+
+    @Test
+    fun `下了缩略图之后有时间`() {
+        cache.putThumb(CachedPhoto.seed(summary("a")), bytes(100))
+        assertTrue(cache.newestThumbMs() > 0L)
+    }
+
+    @Test
+    fun `只更新 lastSeenAt 并落盘 不会让缩略图时间变新`() {
+        // 这一条是复查里找到的那个 bug 的回归：过期判定原先比的是 index.json 的
+        // mtime，而 markSeen + flush 每次扫描结束都会重写索引 —— 于是每次启动扫描
+        // 都白重建一遍 200 张的 ARCore 库（几秒），且不报任何错。
+        cache.putThumb(CachedPhoto.seed(summary("a")), bytes(100))
+        val before = cache.newestThumbMs()
+        cache.markSeen("a", 1_700_000_000_000L)
+        cache.flush()
+        assertEquals(before, cache.newestThumbMs())
+    }
+
+    @Test
+    fun `清视频不影响缩略图时间`() {
+        // 清视频之后离线识别必须照样可用 —— 库不该因此重建，也不该失效。
+        val e = cache.putThumb(CachedPhoto.seed(summary("a", hasVideo = true)), bytes(100))
+        cache.putVideo(e, bytes(500))
+        val before = cache.newestThumbMs()
+        cache.clearVideos()
+        assertEquals(before, cache.newestThumbMs())
+    }
 }

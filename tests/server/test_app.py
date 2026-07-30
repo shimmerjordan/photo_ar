@@ -157,6 +157,29 @@ def test_ingest_rejects_low_quality_with_actionable_detail(make_env):
     assert body["suggestion"]
 
 
+def test_ingest_rejects_keypointless_photo_with_422_not_500(env, fake_arcoreimg):
+    """arcoreimg 连关键点都提不够 → 422，**不是** 500。
+
+    这一条是放量模拟里找到的：3030 次入库尝试有 65 次（2.1%）撞上纹理不足到
+    arcoreimg 拒绝出分的照片，全部返回 500 + 一整个 traceback。两个后果都真实：
+    调用方看到 5xx 会当成「服务端故障」去重试（同一张图重试一万次结果一样），
+    而一万张的批量入库会往日志里灌两百多个栈，把真正的服务端故障淹掉。
+
+    用 quality_too_low 这同一个 code：对调用方和用户，该做的事一模一样（换图）。
+    """
+    ref = env.write_image("photos/flat.jpg", seed=21)
+    env.cfg.arcoreimg = fake_arcoreimg(
+        exit_code=1, stderr="Failed to get enough keypoints from target image."
+    )
+    r = env.ingest(ref)
+    assert r.status == 422
+    body = env.body_json(r)
+    assert body["error"] == "quality_too_low"
+    # score 0 = 连分都没算出来，落在最差那一档
+    assert body["score"] == 0 and body["minScore"] == 75
+    assert body["suggestion"]
+
+
 def test_ingest_same_path_twice_is_409(env):
     ref = env.write_image("photos/e.jpg", seed=9)
     pid = env.ingest_ok(ref)

@@ -11,6 +11,7 @@ RANSAC），N5095 只有 4 核，所以真正的并发上限由 `_RECOGNIZE_SLOT
 """
 
 import argparse
+import contextlib
 import json
 import socket
 import socketserver
@@ -30,11 +31,40 @@ from .library import PhotoLibrary
 _RECOGNIZE_SLOTS = 3
 _recognize_gate = threading.BoundedSemaphore(_RECOGNIZE_SLOTS)
 
+# 排队等槽位的上限，超了直接 503。
+#
+# **不能无限期等**，而这一条不显然：客户端的 `RECOGNIZE_TIMEOUT_MS` 是 2 秒，
+# 排队超过 2 秒的请求，客户端早已放弃并发下一帧了 —— 服务端却仍会老实地拿到
+# 槽位、跑完整个 ORB + RANSAC、再往一条已经关掉的 socket 上写。那一次识别的
+# CPU 完全白烧，而它本该给还有人在等的那个请求。
+#
+# 于是形成闭环：越积压越多请求作废，越多作废越没 CPU 处理新请求。单人扫描
+# 撞不到（一次只有一个在途），几台手机同时扫、或网页版几十人同时进来就会 ——
+# 表现是「所有人都认不出来」，而每一条日志看着都正常（200、耗时也不长）。
+#
+# 1 秒是这么定的：明显小于客户端的 2 秒超时，所以 1 秒内抢到槽位的请求还来得及
+# 正常返回结果，不浪费；抢不到的直接让客户端丢帧（[ScanController.onRecognizeFailed]
+# 对 5xx 就是静默丢帧、400ms 后重来），正是拥塞时想要的行为。
+_RECOGNIZE_QUEUE_S = 1.0
+
+# 单个连接上每次读/写的超时。
+#
+# stdlib 默认是 None（永久阻塞）—— 一条连上就不发数据、或者手机进了电梯直接
+# 半开的连接，会占住一个线程直到 TCP keepalive 发现（默认两小时以上）。
+# `ThreadingHTTPServer` 又不限线程数，攒几次就是线程泄漏，而服务本身「看起来
+# 还活着」。这个口子还经 Cloudflare tunnel 暴露在公网上。
+#
+# 它是**每次系统调用**的超时而不是整个请求的，所以流式发一条十几 MB 的视频
+# （§12 改档后一条上限 16.2MiB）不会被误杀：只要 30 秒内 socket 缓冲区腾出过
+# 一次空间就继续。
+_SOCKET_TIMEOUT_S = 30
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "photoar"
     sys_version = ""
     protocol_version = "HTTP/1.1"  # Range/206 与 keep-alive 都需要 1.1
+    timeout = _SOCKET_TIMEOUT_S  # 见那个常量：不设就是线程泄漏
 
     @property
     def _app(self) -> app.Server:
@@ -63,10 +93,27 @@ class _Handler(BaseHTTPRequestHandler):
         req = self._build_request()
         t0 = time.perf_counter()
         gated = req.method == "POST" and req.path == "/v1/recognize"
-        if gated:
-            _recognize_gate.acquire()
+        held = gated and _recognize_gate.acquire(timeout=_RECOGNIZE_QUEUE_S)
+        if gated and not held:
+            # 排太久了，客户端多半已经放弃。理由见 _RECOGNIZE_QUEUE_S。
+            resp = app.json_response(
+                503,
+                {"error": "busy", "message": "识别忙，排队超时"},
+                **{"Retry-After": "1"},
+            )
+            self.log_message("POST /v1/recognize -> 503（排队 >%.1fs）", _RECOGNIZE_QUEUE_S)
+            self._drain(req)
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
+                self._write(req, resp)
+            return
         try:
             resp = self._app.handle(req)
+        except TimeoutError as exc:
+            # socket 超时（见 _SOCKET_TIMEOUT_S）。客户端半路走了属于正常现象 ——
+            # 打栈会把日志刷满，而且 500 也写不出去了。关连接就是全部处理。
+            self.log_message("%s %s 读写超时：%s", req.method, req.path, exc)
+            self.close_connection = True
+            return
         except Exception as exc:  # noqa: BLE001
             # 任何未预料的异常都要变成 500 而不是断连接：客户端在扫描循环里，
             # 断连和超时对它是同一种表现，看不出服务端出了什么问题。
@@ -77,7 +124,7 @@ class _Handler(BaseHTTPRequestHandler):
                 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             )
         finally:
-            if gated:
+            if held:
                 _recognize_gate.release()
 
         # 请求体没读完就回响应，keep-alive 的下一个请求会从残留字节开始解析。
@@ -86,8 +133,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             self._write(req, resp)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             # 扫描时用户挪开手机，客户端会取消在途请求。属于正常现象，不打栈。
+            # TimeoutError 同一类：慢到 30 秒没挪动一个字节（见 _SOCKET_TIMEOUT_S），
+            # 对面基本等于已经走了。不接住的话 socketserver 会为每次弱网中断的
+            # 视频下载打一整个栈。
             self.close_connection = True
             return
         ms = (time.perf_counter() - t0) * 1000

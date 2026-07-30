@@ -149,6 +149,11 @@ class CacheSync(
 
         // 库在最后重建，用**这一刻**索引里真有缩略图的那些 —— 上面失败的几条自然
         // 就不在里面，而不需要在失败分支里各自维护一份名单。
+        //
+        // 注意它排在下面那句 `cache.flush()` 前面，而 [LocalTargetDb.stale] 判过期时
+        // **不看** index.json 的时间（看缩略图的，见 PhotoCache.newestThumbMs）——
+        // 两件事必须一起成立。若哪天把过期判定改回索引时间，这里刚建好的库会被下一句
+        // flush 立刻判成过期，于是每轮同步都白建一次，而且不报错。
         var rejected = 0
         var accepted = 0
         if (plan.rebuildTarget || thumbs > 0) {

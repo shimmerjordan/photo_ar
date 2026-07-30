@@ -1,0 +1,137 @@
+{
+  "cpus": "3.0",
+  "memory": "3g",
+  "photos": 300,
+  "ingest": {
+    "tried": 869,
+    "accepted": 300,
+    "rejected_422": 569,
+    "failed": 0,
+    "reject_reasons": {
+      "quality_too_low": 569
+    },
+    "failed_codes": {},
+    "failed_samples": [],
+    "wall_s": 393.2,
+    "per_photo_ms_median": 817.1,
+    "per_photo_ms_p95": 893.6
+  },
+  "scale_curve": [
+    {
+      "n": 200,
+      "matched": 199,
+      "correct": 199,
+      "errors": 0,
+      "false_positive": 0,
+      "concurrency": 1,
+      "p50": 67.0,
+      "p95": 69.6,
+      "p99": 74.3,
+      "max": 90.4,
+      "wall_s": 13.5,
+      "rps": 14.86,
+      "index_size": 50
+    },
+    {
+      "n": 200,
+      "matched": 197,
+      "correct": 197,
+      "errors": 0,
+      "false_positive": 0,
+      "concurrency": 1,
+      "p50": 66.4,
+      "p95": 69.0,
+      "p99": 72.8,
+      "max": 73.8,
+      "wall_s": 13.3,
+      "rps": 14.99,
+      "index_size": 100
+    },
+    {
+      "n": 200,
+      "matched": 198,
+      "correct": 198,
+      "errors": 0,
+      "false_positive": 0,
+      "concurrency": 1,
+      "p50": 68.2,
+      "p95": 71.9,
+      "p99": 74.0,
+      "max": 74.7,
+      "wall_s": 13.7,
+      "rps": 14.57,
+      "index_size": 200
+    },
+    {
+      "n": 200,
+      "matched": 200,
+      "correct": 200,
+      "errors": 0,
+      "false_positive": 0,
+      "concurrency": 1,
+      "p50": 67.0,
+      "p95": 70.7,
+      "p99": 76.1,
+      "max": 102.3,
+      "wall_s": 13.5,
+      "rps": 14.82,
+      "index_size": 300
+    }
+  ],
+  "recognize_concurrent": {
+    "n": 200,
+    "matched": 199,
+    "correct": 199,
+    "errors": 0,
+    "false_positive": 0,
+    "concurrency": 4,
+    "p50": 127.2,
+    "p95": 177.0,
+    "p99": 189.1,
+    "max": 212.7,
+    "wall_s": 6.8,
+    "rps": 29.5
+  },
+  "ingest_default_samples": {
+    "n": 5,
+    "samples": 20,
+    "median_ms": 1674.4,
+    "min_ms": 1645.1,
+    "max_ms": 1724.3,
+    "est_10k_hours": 4.7
+  },
+  "video": {
+    "source_mb": 52.88,
+    "transcoded": [
+      {
+        "name": "playable/d66f23da21e24d21b29059b514832143.mp4",
+        "mb": 14.72
+      }
+    ],
+    "attach_status": 200,
+    "attach_s": 27.3,
+    "attach_body": {
+      "photoId": "d66f23da21e24d21b29059b514832143",
+      "videoAssetId": "48e9773e18c648f0b8bfa83159bf2f28",
+      "playableAssetId": "2b822ecb383944ccb4b7bdee51acbf1b",
+      "transcoded": true
+    },
+    "ceiling_mb": 16.24,
+    "ceiling_note": "transcode.py: 1080p / 30s / maxrate 4000k / aac 128k / crf 23",
+    "preset": "veryfast",
+    "encoder": "libx264"
+  },
+  "disk": {
+    "data 总计": "50M",
+    "catalog.db": "0.3M",
+    "imgdb": "3.8M",
+    "library": "4.3M",
+    "playable": "15M",
+    "thumb": "20M",
+    "vocab.npz": "2.0M"
+  },
+  "peak_mem_mb": 1060.9,
+  "peak_cpu_pct": 308.2,
+  "stat_samples": 183,
+  "container_state": "false|0|running"
+}

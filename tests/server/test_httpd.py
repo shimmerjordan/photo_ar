@@ -11,6 +11,7 @@ keep-alive 下一个请求会不会从上一个请求的残留字节开始解析
 import contextlib
 import http.client
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -256,6 +257,85 @@ def test_traversal_over_real_socket(live):
     _, base = live
     resp = _open(_req(base + "/v1/fs/list?path=%2Fetc%2Fpasswd"))
     assert resp.status == 403
+
+
+# ---- 过载与半开连接 ----
+#
+# 这两组测的都是「服务看起来还活着，但已经不干活了」那一类。它们不靠真把 CPU
+# 打满或真等 30 秒来触发 —— 那样既慢又不确定 —— 而是把限流闸门和超时换成
+# 可控的值，测契约本身。
+
+
+@contextlib.contextmanager
+def _gate_full(monkeypatch):
+    """把识别闸门换成一个已经占满的，并把排队预算压到几十毫秒。"""
+    full = threading.BoundedSemaphore(1)
+    assert full.acquire(blocking=False)
+    monkeypatch.setattr(httpd, "_recognize_gate", full)
+    monkeypatch.setattr(httpd, "_RECOGNIZE_QUEUE_S", 0.05)
+    yield
+
+
+def test_recognize_sheds_load_instead_of_queueing(live, monkeypatch):
+    """槽位排满时识别必须 503，不能无限期排队。
+
+    排队超过客户端那 2 秒超时的请求，客户端早已放弃并发下一帧了，服务端却仍会
+    跑完整个 ORB + RANSAC 再往关掉的 socket 上写 —— 那份 CPU 本该给还有人在等的
+    请求。于是越积压越多请求作废，越多作废越没 CPU 处理新的。
+
+    503 让客户端丢帧（`ScanController` 对 5xx 就是静默丢帧、400ms 后重来），
+    而不是让服务端替一个没人要的结果干活。
+    """
+    _, base = live
+    with _gate_full(monkeypatch):
+        resp = _open(
+            _req(
+                base + "/v1/recognize",
+                method="POST",
+                data=b"x" * 100,
+                headers={"Content-Type": "multipart/form-data; boundary=b"},
+            )
+        )
+        assert resp.status == 503
+        # 没有 Retry-After 的 503 会让规矩的客户端立刻重试，等于没限流
+        assert resp.headers["Retry-After"] == "1"
+        assert json.loads(resp.read())["error"] == "busy"
+
+
+def test_load_shedding_does_not_touch_other_routes(live, monkeypatch):
+    """闸门只管识别。
+
+    把 `gated` 的判断写宽一点（比如漏掉 path 判断）就会让视频下载和 ping 一起
+    排在识别后面 —— 表现是「认出来了但视频半天不开始播」，而识别日志全是正常的。
+    """
+    env, base = live
+    pid = env.ingest_ok(
+        env.write_image("photos/f.jpg", seed=11), video=env.write_video("videos/f.mp4")
+    )
+    with _gate_full(monkeypatch):
+        assert _open(_req(base + "/v1/ping")).status == 200
+        url = json.loads(_open(_req(f"{base}/v1/photo/{pid}/media")).read())["url"]
+        assert _open(_req(base + url)).status == 200
+
+
+def test_idle_connection_is_closed_by_socket_timeout(live, monkeypatch):
+    """连上不发数据的连接必须被服务端关掉。
+
+    stdlib 默认没有 socket 超时。手机进电梯留下的半开连接会占住一个线程直到 TCP
+    keepalive 发现（默认两小时以上），而 `ThreadingHTTPServer` 不限线程数 ——
+    攒几次就是线程泄漏，服务本身「看着还活着」。这个口子还经 Cloudflare tunnel
+    暴露在公网上。
+    """
+    _, base = live
+    monkeypatch.setattr(httpd._Handler, "timeout", 0.3)
+    host, port = base.removeprefix("http://").rsplit(":", 1)
+    conn = socket.create_connection((host, int(port)), timeout=5)
+    try:
+        # 一个字节都不发。recv 返回 b"" 表示对端已关 —— 若超时没生效，
+        # 这里会一直阻塞到 socket 自己的 5 秒超时并抛 TimeoutError。
+        assert conn.recv(64) == b""
+    finally:
+        conn.close()
 
 
 def test_304_has_no_body(live):

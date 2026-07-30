@@ -77,6 +77,32 @@ fun CacheScreen(shell: Shell) {
         usable = cache.entries().count { it.usableAsTarget }
     }
 
+    /**
+     * 清理走 IO 线程。
+     *
+     * 「全清」是 `deleteRecursively` 一整个上 GB 的目录（视频上限默认 2048MB），
+     * 「只清视频」是删几百个文件加写一遍索引 —— 两个都不能放主线程。放主线程不会
+     * 报错，只会在慢一点的存储上直接卡出 ANR，而用户看到的是「按了没反应」。
+     */
+    fun clean(label: String, tone: Tone, note0: String, block: () -> Unit) {
+        running = true
+        note = null
+        scope.launch {
+            progress = label
+            try {
+                withContext(Dispatchers.IO) { block() }
+                noteTone = tone
+                note = note0
+            } catch (e: Throwable) {
+                noteTone = Tone.BAD
+                note = "清理没成：${Fmt.errText(e)}"
+            }
+            running = false
+            progress = null
+            refreshStats()
+        }
+    }
+
     Column(
         Modifier
             .verticalScroll(rememberScrollState())
@@ -190,10 +216,10 @@ fun CacheScreen(shell: Shell) {
             }
             OutlinedButton(
                 onClick = {
-                    cache.clearVideos()
-                    refreshStats()
-                    noteTone = Tone.OK
-                    note = "视频清了，照片照样认得出（只是认出来没东西放）"
+                    clean(
+                        "清视频…", Tone.OK,
+                        "视频清了，照片照样认得出（只是认出来没东西放）",
+                    ) { cache.clearVideos() }
                 },
                 enabled = !running,
             ) {
@@ -227,10 +253,9 @@ fun CacheScreen(shell: Shell) {
                 Button(
                     onClick = {
                         confirmClearAll = false
-                        cache.clearAll()
-                        refreshStats()
-                        noteTone = Tone.WARN
-                        note = "清空了。下次同步会从零重建。"
+                        clean("全清…", Tone.WARN, "清空了。下次同步会从零重建。") {
+                            cache.clearAll()
+                        }
                     },
                 ) {
                     Text("全清")

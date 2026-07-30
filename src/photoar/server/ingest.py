@@ -38,6 +38,14 @@ from .integrity import sha256_file, stat_fingerprint
 from .library import Conflict, PhotoLibrary
 
 
+# 两处 quality_too_low 共用（分数偏低、以及连关键点都不够）。用户该做的事一样，
+# 文案就该一样 —— 抄两份迟早只改一处。
+_LOW_QUALITY_SUGGESTION = (
+    "换一张纹理更丰富的照片；大片天空、纯色背景、过曝或严重模糊的"
+    "照片都拿不到高分。也可以给照片加一圈细纹理边框再打印。"
+)
+
+
 class IngestRejected(Exception):
     """入库被拒绝。`code` 决定 HTTP 状态码，`detail` 原样进响应体。
 
@@ -139,6 +147,19 @@ def ingest_photo(
         score = quality.eval_img(ref_path, arcoreimg=cfg.arcoreimg)
     except quality.ArcoreimgMissing as exc:
         raise IngestRejected(503, "arcoreimg_missing", str(exc)) from exc
+    except quality.NotEnoughKeypoints as exc:
+        # 连关键点都提不够 —— 就是 quality_too_low 最下面那一档，**不是**服务端故障。
+        # 用同一个 code 而不是新开一个：对调用方和用户，该做的事一模一样（换图），
+        # 多一个分支只会多一处要各自处理的地方。score=0 表达「连分都没算出来」。
+        # 实测这类照片占 `clean` 数据集的 2.1%，放量入库时不是个别现象。
+        raise IngestRejected(
+            422,
+            "quality_too_low",
+            f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
+            score=0,
+            minScore=quality.MIN_QUALITY_SCORE,
+            suggestion=_LOW_QUALITY_SUGGESTION,
+        ) from exc
     if score < quality.MIN_QUALITY_SCORE:
         raise IngestRejected(
             422,
@@ -147,10 +168,7 @@ def ingest_photo(
             f"{quality.MIN_QUALITY_SCORE}，跟踪会明显抖动",
             score=score,
             minScore=quality.MIN_QUALITY_SCORE,
-            suggestion=(
-                "换一张纹理更丰富的照片；大片天空、纯色背景、过曝或严重模糊的"
-                "照片都拿不到高分。也可以给照片加一圈细纹理边框再打印。"
-            ),
+            suggestion=_LOW_QUALITY_SUGGESTION,
         )
 
     features = extract(img)

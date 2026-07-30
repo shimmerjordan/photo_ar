@@ -31,6 +31,36 @@ def test_eval_img_raises_on_nonzero_exit(image_file, fake_arcoreimg):
         Q.eval_img(image_file, arcoreimg=fake_arcoreimg(exit_code=3))
 
 
+# ---- 「这张图不行」与「工具坏了」必须分开 ----
+#
+# 真 arcoreimg 两种情况都是退出码 1，唯一的区别在 stderr 的文案。分不开的代价
+# 实测过：放量入库 3030 张里 65 张（2.1%）是纹理不足的照片，全部以 500 +
+# traceback 的形式出现 —— 调用方看到 5xx 会重试（结果一样），而真正的服务端
+# 故障被这些栈淹掉。
+
+
+def test_not_enough_keypoints_is_not_a_runtime_error(image_file, fake_arcoreimg):
+    fake = fake_arcoreimg(
+        exit_code=1, stderr="Failed to get enough keypoints from target image."
+    )
+    with pytest.raises(Q.NotEnoughKeypoints) as exc:
+        Q.eval_img(image_file, arcoreimg=fake)
+    # 出错信息里要有是哪张图 —— 批量入库时这是唯一能定位到照片的线索
+    assert image_file.name in str(exc.value)
+
+
+def test_other_nonzero_exits_stay_runtime_errors(image_file, fake_arcoreimg):
+    """反向：别的失败仍是 RuntimeError（→ 500）。
+
+    把匹配写宽（比如只看退出码）会把真正的工具故障也静默降级成「照片不合格」，
+    那样一整批照片会被逐张跳过而没人发现 arcoreimg 根本没在工作。
+    """
+    fake = fake_arcoreimg(exit_code=1, stderr="Cannot open shared library")
+    with pytest.raises(RuntimeError) as exc:
+        Q.eval_img(image_file, arcoreimg=fake)
+    assert not isinstance(exc.value, Q.NotEnoughKeypoints)
+
+
 def test_assert_quality_accepts_good_image(image_file, fake_arcoreimg):
     assert Q.assert_quality(image_file, arcoreimg=fake_arcoreimg(score=80)) == 80
 

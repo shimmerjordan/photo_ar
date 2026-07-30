@@ -32,9 +32,13 @@ import java.io.FileOutputStream
  *
  * ## 过期判定用文件时间而不是另存一个标记
  *
- * `local.imgdb` 比 `index.json` 旧就是过期。多一个「dirty 标记文件」意味着多一个
- * 会和现实不一致的状态 —— 标记写成功而库没写成功、或者反过来，都会让离线识别
- * 静默失效。文件 mtime 是内核维护的，不会漏。
+ * `local.imgdb` 比**最新的那张缩略图**旧就是过期。多一个「dirty 标记文件」意味着
+ * 多一个会和现实不一致的状态 —— 标记写成功而库没写成功、或者反过来，都会让离线
+ * 识别静默失效。文件 mtime 是内核维护的，不会漏。
+ *
+ * 比的是缩略图而**不是 `index.json`**：索引每次扫描结束都会因为 `lastSeenAt` 被重写
+ * 一遍（见 [PhotoCache.markSeen]），拿它判过期等于每次启动扫描都白重建一次库。
+ * 详见 [PhotoCache.newestThumbMs]。
  */
 class LocalTargetDb(private val cache: PhotoCache) {
 
@@ -59,18 +63,18 @@ class LocalTargetDb(private val cache: PhotoCache) {
         const val MAX_IMAGES = 1000
     }
 
-    private val indexFile = File(cache.targetDbFile.parentFile, "index.json")
-
     /** 当前装进 session 的那份库对应的文件时间戳，0 表示还没装过。 */
     private var installedStamp = 0L
 
-    /** 库不存在或比索引旧。 */
+    /** 库不存在，或者有缩略图比它新。 */
     val stale: Boolean
         get() {
             val db = cache.targetDbFile
             if (!db.isFile || db.length() <= 0) return true
-            if (!indexFile.isFile) return false // 索引都没有，库里那些是仅存的信息
-            return db.lastModified() < indexFile.lastModified()
+            val newest = cache.newestThumbMs()
+            // 一张缩略图都没有：没有任何输入能重建，库里那些是仅存的信息
+            if (newest == 0L) return false
+            return db.lastModified() < newest
         }
 
     /**

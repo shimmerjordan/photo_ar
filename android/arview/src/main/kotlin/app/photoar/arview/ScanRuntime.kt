@@ -63,6 +63,19 @@ class ScanRuntime(
         Thread(r, "photoar-net").apply { isDaemon = true }
     }
 
+    /**
+     * 只跑本地多图库的重建（[installLocalDb]）。
+     *
+     * **不能和 [net] 共用**：[net] 是单线程的，而重建 200 张缩略图要跑好几秒的特征
+     * 提取。共用的话每 400ms 一次的识别请求会整整排在它后面 —— 表现为「刚同步完，
+     * 举起手机头几秒怎么都认不出来」，而且不报任何错。
+     *
+     * 单线程即可：重建是幂等的，同时排两次没有意义。
+     */
+    private val dbWork = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "photoar-localdb").apply { isDaemon = true }
+    }
+
     private val transport = UrlTransport()
     private val client = PhotoArClient(transport, endpoints, viaLabel)
 
@@ -179,15 +192,16 @@ class ScanRuntime(
     /**
      * 把离线多图库装进会话（§11.3 / Phase 4）。
      *
-     * 建库和装库分在两个线程上：建库要跑几百毫秒的特征提取，放 GL 线程上就是启动
-     * 扫描时预览卡一下；而装库会 `session.configure()`，必须在 GL 线程。
+     * 建库和装库分在两个线程上：建库要跑几秒的特征提取，放 GL 线程上就是启动扫描时
+     * 预览卡住；而装库会 `session.configure()`，必须在 GL 线程。建库那一步走 [dbWork]
+     * 而不是 [net]，理由见那里 —— 和识别请求共线程会把识别整整堵住几秒。
      *
      * 失败不影响扫描 —— 离线识别没了就退回「每 400ms 问一次服务端」，也就是
      * Phase 2/3 的行为。所以这里只记日志，不弹提示。
      */
     private fun installLocalDb(holder: ArSessionHolder) {
         val db = localDb ?: return
-        net.execute {
+        dbWork.execute {
             val session = holder.session ?: return@execute
             try {
                 db.rebuildIfStale(session)?.let { r ->
@@ -234,6 +248,7 @@ class ScanRuntime(
         ar?.destroy()
         camera?.stop()
         net.shutdownNow()
+        dbWork.shutdownNow()
         // 纹理只能在 GL 线程上删；Activity 已经在关了，走不到就随进程一起没
         glView?.queueEvent { videoTexture?.release() }
     }

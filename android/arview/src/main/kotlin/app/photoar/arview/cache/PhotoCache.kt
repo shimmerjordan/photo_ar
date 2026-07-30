@@ -85,6 +85,22 @@ class PhotoCache(root: File) {
     @Synchronized
     fun entries(): List<CachedPhoto> = index.values.toList()
 
+    /**
+     * 缩略图目录里最新的文件时间，0 表示一张都没有。
+     *
+     * [app.photoar.arview.ar.LocalTargetDb] 用它判断本地 ARCore 库过不过期。
+     *
+     * **为什么不是 `index.json` 的时间**：索引每次扫描结束都会因为 `lastSeenAt`
+     * （见 [markSeen]）被重写一遍，而那件事跟「库里该放哪些图」毫无关系。用索引
+     * 时间判过期的后果是**每次启动扫描都白重建一遍库** —— 200 张 `addImage` 要几秒，
+     * 而且那几秒和识别请求挤在一起，表现为「刚举起手机那几秒怎么都认不出来」。
+     *
+     * 缩略图文件动过才是真的要重建，而「哪些缩略图」正是库的全部输入。
+     */
+    @Synchronized
+    fun newestThumbMs(): Long =
+        thumbDir.listFiles()?.filter { it.isFile }?.maxOfOrNull { it.lastModified() } ?: 0L
+
     @Synchronized
     fun byId(photoId: String): CachedPhoto? = index[photoId]
 
