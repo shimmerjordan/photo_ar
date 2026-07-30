@@ -43,8 +43,7 @@ import app.photoar.arview.Resolution
 /**
  * 外壳的唯一 Activity。
  *
- * §5.8 原本写的是 Flutter 外壳，这里改成 Kotlin + Compose，理由见
- * `docs/superpowers/plans/2026-07-30-phase3-shell.md`：ARCore 只有 Android，
+ * §5.8 原本写的是 Flutter 外壳，这里改成 Kotlin + Compose：ARCore 只有 Android，
  * Flutter 的跨平台收益是零，代价却是把 §7 契约在 Dart 里再实现一遍（Kotlin 侧
  * 已经有 243 个单测盯着它），而 §5.7 的 EndpointResolver 本来就在 Android 侧。
  *
