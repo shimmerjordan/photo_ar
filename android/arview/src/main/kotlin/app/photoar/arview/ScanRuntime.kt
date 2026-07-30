@@ -37,6 +37,10 @@ class ScanRuntime(
     private val endpoints: () -> Endpoints,
     val arAvailable: Boolean,
     private val listener: Listener,
+    /** 当前 api 通道的名字，写进 `X-PhotoAR-Endpoint`（服务端记进识别历史）。 */
+    private val viaLabel: () -> String? = { null },
+    /** 状态机连续失败 2 次时重新探活（§9.2）。默认空实现，单机壳里可以不接。 */
+    private val onEndpointRefresh: () -> Unit = {},
 ) : ScanEffects {
 
     private companion object {
@@ -57,11 +61,7 @@ class ScanRuntime(
     }
 
     private val transport = UrlTransport()
-    private val client = PhotoArClient(transport, endpoints, { viaLabel })
-
-    /** Phase 3 的 EndpointResolver 会写这里，服务端把它记进识别历史。 */
-    @Volatile
-    var viaLabel: String? = null
+    private val client = PhotoArClient(transport, endpoints, viaLabel)
 
     private val targetLoader = TargetLoader(client, activity.cacheDir)
 
@@ -287,8 +287,10 @@ class ScanRuntime(
     }
 
     override fun requestEndpointRefresh() {
-        // Phase 3：EndpointResolver 在这里重新探活 LAN → Tailscale → 隧道。
-        Log.i(TAG, "请求重新探活 endpoint（Phase 3 接入）")
+        // 交给 EndpointCenter：它是异步 + 带节流的，所以这里直接调不会卡主线程，
+        // 也不会因为状态机每 2 次失败就请求一次而变成探活风暴。
+        Log.i(TAG, "连续失败，请求重新探活 endpoint")
+        onEndpointRefresh()
     }
 
     override fun emit(event: ScanEvent) {

@@ -21,8 +21,8 @@ class HttpFailure(
 ) : IOException(message)
 
 /**
- * 只有两个动作：GET 和 POST 一张 JPEG。抽成接口是为了让 [PhotoArClient] 能在
- * JVM 单测里跑（真机上换成 [UrlTransport]）。
+ * 三个动作：GET、POST 一张 JPEG（识别）、POST 一段 JSON（入库 / 关联）。抽成
+ * 接口是为了让 [PhotoArClient] 能在 JVM 单测里跑（真机上换成 [UrlTransport]）。
  */
 interface HttpTransport {
     fun get(url: String, headers: Map<String, String>, timeoutMs: Int): HttpReply
@@ -31,6 +31,13 @@ interface HttpTransport {
         url: String,
         field: String,
         jpeg: ByteArray,
+        headers: Map<String, String>,
+        timeoutMs: Int,
+    ): HttpReply
+
+    fun postJson(
+        url: String,
+        json: String,
         headers: Map<String, String>,
         timeoutMs: Int,
     ): HttpReply
@@ -72,6 +79,19 @@ class UrlTransport : HttpTransport {
             body,
         )
     }
+
+    override fun postJson(
+        url: String,
+        json: String,
+        headers: Map<String, String>,
+        timeoutMs: Int,
+    ): HttpReply = run(
+        url,
+        "POST",
+        headers + ("Content-Type" to "application/json; charset=utf-8"),
+        timeoutMs,
+        json.toByteArray(Charsets.UTF_8),
+    )
 
     private fun run(
         url: String,

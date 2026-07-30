@@ -18,7 +18,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import app.photoar.arview.Endpoints
+import app.photoar.arview.EndpointCenter
 import app.photoar.arview.NoticeKind
 import app.photoar.arview.ScanEvent
 import app.photoar.arview.ScanRuntime
@@ -28,32 +28,26 @@ import app.photoar.arview.ar.ArCheck
 
 /**
  * 扫描界面。布局用代码写，不用 XML：整个界面就是「一层相机 + 一条提示 + 一个
- * 退出按钮」，而这个 Activity 声明在 **library** 的清单里，Phase 3 的 Flutter
- * 外壳把 `:arview` include 进去就自动有它，不需要再抄一遍资源。
+ * 退出按钮」，而这个 Activity 声明在 **library** 的清单里，外壳把 `:arview`
+ * 依赖进来就自动有它，不需要再抄一遍资源。
  *
- * 端点从 Intent 传进来（[start]）。Phase 3 换成 EndpointResolver 之后，外壳仍然
- * 只需要塞这三个值。
+ * 端点**不**从 Intent 传：Phase 3 起由 [EndpointCenter] 现取现用。这不是为了少
+ * 传三个参数 —— 扫描过程中可能换网（走出局域网、Tailscale 刚连上），而 Intent
+ * 里的值是启动那一刻的快照，换网后 `endpoints()` 必须能给出新的那一条。
  */
 class ArScanActivity : Activity(), ScanRuntime.Listener {
 
     companion object {
-        private const val EXTRA_API = "apiBase"
-        private const val EXTRA_MEDIA = "mediaBase"
-        private const val EXTRA_TOKEN = "token"
         private const val REQ_CAMERA = 1001
 
-        fun start(context: Context, endpoints: Endpoints) {
-            context.startActivity(intent(context, endpoints))
+        fun start(context: Context) {
+            context.startActivity(intent(context))
         }
 
-        fun intent(context: Context, endpoints: Endpoints): Intent =
-            Intent(context, ArScanActivity::class.java)
-                .putExtra(EXTRA_API, endpoints.apiBase)
-                .putExtra(EXTRA_MEDIA, endpoints.mediaBase)
-                .putExtra(EXTRA_TOKEN, endpoints.token)
+        fun intent(context: Context): Intent = Intent(context, ArScanActivity::class.java)
     }
 
-    private lateinit var endpoints: Endpoints
+    private lateinit var center: EndpointCenter
     private var runtime: ScanRuntime? = null
 
     private lateinit var root: FrameLayout
@@ -68,17 +62,17 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        endpoints = Endpoints(
-            apiBase = intent.getStringExtra(EXTRA_API) ?: "",
-            mediaBase = intent.getStringExtra(EXTRA_MEDIA)
-                ?: intent.getStringExtra(EXTRA_API) ?: "",
-            token = intent.getStringExtra(EXTRA_TOKEN) ?: "",
-        )
+        center = EndpointCenter.get(this)
+        center.watchNetwork()
         buildUi()
-        if (endpoints.apiBase.isBlank()) {
-            showNotice("没有配置服务器地址", sticky = true)
+        if (!center.configured) {
+            showNotice("还没配置服务器地址和令牌", sticky = true)
             return
         }
+        // 进扫描先探一次：从别的界面过来时可能已经探过（有节流兜着），但「直接
+        // 从桌面图标进扫描」这条路上还没有任何探活结果，endpoints() 会退回第一个
+        // 候选 —— 在外时那就是打不通的 LAN。
+        center.refreshAsync()
         if (!ArCheck.hasCamera(this)) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
         }
@@ -165,7 +159,14 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
     }
 
     private fun setup(arReady: Boolean) {
-        val rt = ScanRuntime(this, { endpoints }, arReady, this)
+        val rt = ScanRuntime(
+            activity = this,
+            endpoints = { center.endpoints() },
+            arAvailable = arReady,
+            listener = this,
+            viaLabel = { center.viaLabel() },
+            onEndpointRefresh = { center.requestRefresh() },
+        )
         runtime = rt
         if (arReady) {
             val gl = GLSurfaceView(this)

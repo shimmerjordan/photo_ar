@@ -4,7 +4,9 @@ import app.photoar.arview.Endpoints
 import app.photoar.arview.Hit
 import app.photoar.arview.NetErrorKind
 import app.photoar.arview.RecognizeOutcome
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -17,6 +19,8 @@ class PhotoArClientTest {
         val headers: Map<String, String>,
         val timeoutMs: Int,
         val bodySize: Int,
+        /** 只有 JSON 请求有；识别的 JPEG 体不留内容。 */
+        val jsonBody: String? = null,
     )
 
     private class FakeTransport(
@@ -41,6 +45,17 @@ class PhotoArClientTest {
             timeoutMs: Int,
         ): HttpReply {
             calls += Recorded("POST", url, headers, timeoutMs, jpeg.size)
+            failure?.let { throw it }
+            return HttpReply(status, body.toByteArray())
+        }
+
+        override fun postJson(
+            url: String,
+            json: String,
+            headers: Map<String, String>,
+            timeoutMs: Int,
+        ): HttpReply {
+            calls += Recorded("POST", url, headers, timeoutMs, json.length, json)
             failure?.let { throw it }
             return HttpReply(status, body.toByteArray())
         }
@@ -234,5 +249,127 @@ class PhotoArClientTest {
         } catch (e: HttpFailure) {
             assertEquals(expected, e.kind)
         }
+    }
+
+    // ---- 外壳侧接口（Phase 3）----
+
+    @Test
+    fun `ping 打的是 v1 ping 且不抛异常只返回布尔`() {
+        val t = FakeTransport(body = """{"ok":true}""")
+        assertTrue(client(t).ping())
+        assertEquals("http://10.0.0.9:8770/v1/ping", t.last.url)
+
+        val bad = FakeTransport(status = 401, body = "{}")
+        assertFalse(client(bad).ping())
+    }
+
+    @Test
+    fun `photos 走 api 通道`() {
+        val t = FakeTransport(body = """{"photos":[],"total":0}""")
+        client(t).photos()
+        assertEquals("http://10.0.0.9:8770/v1/photos", t.last.url)
+        assertEquals(PhotoArClient.META_TIMEOUT_MS, t.last.timeoutMs)
+    }
+
+    @Test
+    fun `fsList 不给路径时不带 query`() {
+        val t = FakeTransport(body = """{"path":null,"parent":null,"entries":[]}""")
+        client(t).fsList(null)
+        assertEquals("http://10.0.0.9:8770/v1/fs/list", t.last.url)
+    }
+
+    @Test
+    fun `fsList 的路径被 URL 编码`() {
+        val t = FakeTransport(body = """{"path":"/a","parent":null,"entries":[]}""")
+        client(t).fsList("/share/我的 照片/2024")
+        val url = t.last.url
+        // 空格与中文都不能裸着进 query；斜杠编成 %2F 由服务端 parse_qs 还原
+        assertTrue("裸空格没被编码：$url", !url.contains(" "))
+        assertTrue(url.startsWith("http://10.0.0.9:8770/v1/fs/list?path="))
+        assertTrue(url.contains("%2Fshare%2F"))
+    }
+
+    @Test
+    fun `fsThumb 走 api 通道且用下载超时`() {
+        val t = FakeTransport(body = "jpegbytes")
+        client(t).fsThumb("/share/a.jpg")
+        assertEquals(PhotoArClient.DOWNLOAD_TIMEOUT_MS, t.last.timeoutMs)
+        assertTrue(t.last.url.startsWith("http://10.0.0.9:8770/v1/fs/thumb?path="))
+    }
+
+    @Test
+    fun `history 带 limit`() {
+        val t = FakeTransport(body = """{"entries":[]}""")
+        client(t).history(limit = 30)
+        assertEquals("http://10.0.0.9:8770/v1/history?limit=30", t.last.url)
+    }
+
+    @Test
+    fun `createPhoto 发 JSON 体并用入库超时`() {
+        val t = FakeTransport(status = 201, body = """{"photoId":"p1","qualityScore":88}""")
+        val out = client(t).createPhoto("/share/a.jpg", "/share/v.mp4", 152.0, "外婆生日")
+        assertEquals("POST", t.last.method)
+        assertEquals("http://10.0.0.9:8770/v1/photo", t.last.url)
+        // 入库要跑 build-db + ffmpeg，超时必须比 META 长得多
+        assertEquals(PhotoArClient.INGEST_TIMEOUT_MS, t.last.timeoutMs)
+        assertEquals(180_000, PhotoArClient.INGEST_TIMEOUT_MS)
+        val body = JSONObject(t.last.jsonBody!!)
+        assertEquals("/share/a.jpg", body.getString("refPath"))
+        assertEquals("/share/v.mp4", body.getString("videoPath"))
+        assertEquals(152.0, body.getDouble("printWidthMm"), 1e-9)
+        assertEquals("外婆生日", body.getString("title"))
+        assertEquals("p1", out.photoId)
+        assertEquals(88, out.qualityScore)
+    }
+
+    @Test
+    fun `createPhoto 不带视频和标题时这两个字段不出现`() {
+        val t = FakeTransport(status = 201, body = """{"photoId":"p1"}""")
+        client(t).createPhoto("/share/a.jpg", null, 152.0, null)
+        val body = JSONObject(t.last.jsonBody!!)
+        assertFalse(body.has("videoPath"))
+        assertFalse(body.has("title"))
+    }
+
+    @Test
+    fun `质量分不达标是 HttpFailure 并带上服务端说的理由`() {
+        val t = FakeTransport(
+            status = 422,
+            body = """{"code":"low_quality","message":"质量分 61 < 75：纹理太少"}""",
+        )
+        try {
+            client(t).createPhoto("/share/a.jpg", null, 152.0, null)
+            fail("应该抛出")
+        } catch (e: HttpFailure) {
+            assertEquals(NetErrorKind.BAD_RESPONSE, e.kind)
+            assertTrue(e.message!!.contains("质量分 61"))
+        }
+    }
+
+    @Test
+    fun `attachVideo 打到照片的 video 子路径`() {
+        val t = FakeTransport(body = """{"photoId":"p1","transcoded":true}""")
+        val out = client(t).attachVideo("p1", "/share/v.mp4")
+        assertEquals("http://10.0.0.9:8770/v1/photo/p1/video", t.last.url)
+        assertEquals("/share/v.mp4", JSONObject(t.last.jsonBody!!).getString("videoPath"))
+        assertTrue(out.transcoded)
+    }
+
+    @Test
+    fun `外壳接口的解析错误也归到 BAD_RESPONSE`() {
+        val t = FakeTransport(body = "<html>反代把它换成登录页了</html>")
+        try {
+            client(t).photos()
+            fail("应该抛出")
+        } catch (e: HttpFailure) {
+            assertEquals(NetErrorKind.BAD_RESPONSE, e.kind)
+        }
+    }
+
+    @Test
+    fun `外壳接口也带 via 头`() {
+        val t = FakeTransport(body = """{"entries":[]}""")
+        client(t, via = "tailscale").history()
+        assertEquals("tailscale", t.last.headers["X-PhotoAR-Endpoint"])
     }
 }

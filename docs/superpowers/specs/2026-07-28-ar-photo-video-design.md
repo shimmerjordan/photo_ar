@@ -150,8 +150,8 @@
 ### 5.6 `ar-view`（Android，原生 Kotlin）
 
 - **做什么**：相机预览、抽帧、识别调用、单目标跟踪、视频贴图播放。
-- **接口（对 Flutter）**：MethodChannel `startScan()`/`stopScan()`；EventChannel 上报状态机变迁与命中结果。
-- **依赖**：ARCore、SceneView(Filament)、ExoPlayer
+- **接口**：~~对 Flutter 的 MethodChannel/EventChannel~~ → 外壳同进程直接启 `ui.ArScanActivity`（Phase 3 改，见 §5.8）。状态机变迁与命中结果由 `ScanController` → `ScanEffects` 在进程内直接分发。
+- **依赖**：ARCore、~~SceneView(Filament)~~ 手写 GLES 2.0（Phase 2 改，见 §17）、ExoPlayer(media3)
 
 ### 5.7 `EndpointResolver`（Android）
 
@@ -159,9 +159,11 @@
 - **接口**：`api() -> Endpoint`；`media() -> Endpoint`；`refresh()`
 - **见 §9**
 
-### 5.8 `app-shell`（Flutter）
+### 5.8 `app-shell`（~~Flutter~~ → Kotlin + Jetpack Compose，Phase 3 改）
 
-- **做什么**：照片列表、NAS 文件浏览与关联、扫描历史、缓存管理、endpoint 设置。
+- **做什么**：照片列表、照片详情、NAS 文件浏览与关联、入库、扫描历史、缓存管理、endpoint 设置。
+- **为什么不是 Flutter**：项目地基是 ARCore，只有 Android，Flutter 的跨平台价值为零；而代价是把 §7 契约实现两遍（Dart 侧重写请求与解析，或把每个 API 都包成 MethodChannel）；§5.7 已经把 `EndpointResolver` 放在原生侧，「当前走哪条通道」这个所有界面都要显示的状态本就在那边；缩略图要带 `Authorization` 头，`Image.network` 用不了，Flutter 的控件生态省事这一条也不成立。改 Compose 后外壳与 `:arview` 同进程直接调用，无桥、无第二份契约实现。
+- **代价**：`@Composable` 层无法在 JVM 单测里跑，所以所有「差一位就错」的格式化与校验抠进不 import `android.*` 的 `Fmt.kt`（26 个测试）。
 
 ## 6. 数据模型
 
@@ -571,7 +573,7 @@ AR 渲染与跟踪只能真机验证：不同角度、不同光照、覆膜反�
 | **Phase 0** | `recognizer` + `ingest` + 合成查询图回归测试。**纯离线，不含服务、不含 App** | 达到 §14.2 全部基线。**这是生死线** —— 见下方状态 |
 | Phase 1 | `photo-ar-server`（catalog + recognize + fs-browser + media-resolve + file-serve）+ 加一条 cloudflared ingress | 能用 curl 完成入库→识别→取流；路径穿越测试通过 |
 | Phase 2 | 纯原生 Android Activity：扫描 → 识别 → 单目标跟踪 → 播放 | 真机 AR 体验可接受 |
-| Phase 3 | Flutter 外壳 + `EndpointResolver` + NAS 文件浏览与关联 + 历史 | 可日常使用 |
+| Phase 3 | ~~Flutter~~ Compose 外壳 + `EndpointResolver` + NAS 文件浏览与关联 + 历史 | 可日常使用 —— 见下方状态 |
 | Phase 4 | 端侧缓存索引（最近 200 张离线秒识别）+ 视频本地 LRU 缓存 | 常扫照片离线可用 |
 
 **Phase 0 必须先单独完成。** 它成本很小（纯离线代码 + 自动化测试，不碰 NAS 部署、不写 App），却能提前证伪整个项目最大的风险：上万张高度自相似的家庭照片能否被可靠区分。若识别率不达标，后续所有工作都是沉没成本。
@@ -622,6 +624,30 @@ ARCore / GLES / 相机 / 播放各层只做搬运。所以「未验证」的具�
 `org.json` 的空值行为。**Phase 2 记作代码完成、出口条件挂起。** 详见
 `docs/superpowers/plans/2026-07-30-phase2-arview.md`。
 
+### Phase 3 的实际状态（2026-07-30）
+
+出口条件「可日常使用」：**未达成，且当前无法判定** —— 与 Phase 2 同一个理由，
+没有 Android 真机。**外壳改用 Kotlin + Jetpack Compose，不是 §5.8 原写的 Flutter**
+（理由见 §5.8 与 §17）。
+
+| 验证方式 | 结果 |
+|---|---|
+| `./gradlew testDebugUnitTest` | 239 个全绿（endpoint 43 / 状态机 43 / 目录解析 30 / 客户端 30 / API 解析 27 / 格式化 26 / 几何 15 / 探活 13 / 抽帧 12）。全仓库 637 |
+| `./gradlew assembleDebug` | BUILD SUCCESSFUL，`app-debug.apk` 11.7MB / 9 个 dex |
+| 真机 | **一次都没跑过**，§14.5 手测清单依然一条未执行 |
+
+六个界面（照片 / 详情 / 浏览 / 入库 / 历史 / 设置）+ §9 全套探活都写完了，但
+`@Composable` 一行都没在设备上渲染过。所以「未验证」的具体是：实际布局与手感、
+一次真实入库的闭环、缩略图网格的内存与流畅度、真网络上的四通道探活与切网重探、
+以及**照片方向 → 打印宽度是否真取对了边**（这一项错了不报错，只会让 AR 一直飘）。
+
+**刻意没做**：`POST /v1/upload` 的 SAF 选文件流程（§7 自标「可选路径」，且按 §9.4
+只在非隧道通道可用）、缓存管理入口（归 Phase 4）、删除照片（服务端整张路由表里
+没有 DELETE，不在 §7 范围内）。
+
+**Phase 3 记作代码完成、出口条件挂起**，与 Phase 2 同一状态 —— 两者的出口条件
+在同一次真机上手里一起判。详见 `docs/superpowers/plans/2026-07-30-phase3-shell.md`。
+
 ## 16. 风险与已知限制
 
 | 风险 | 影响 | 缓解 |
@@ -644,6 +670,9 @@ ARCore / GLES / 相机 / 播放各层只做搬运。所以「未验证」的具�
 |---|---|---|
 | ARCore Augmented Images | MindAR(Web)、ARKit、Vuforia | 单库 1000 张但**库数量不限**，配合"云识别 + 单目标下发"即无上限；有 `arcoreimg` 离线预生成；跟踪质量优于 Web AR。MindAR 多目标会崩移动浏览器（[issue #22](https://github.com/hiukim/mind-ar-js/issues/22)）；ARKit 需 $99/年账号 |
 | ~~[SceneView/sceneform-android](https://github.com/SceneView/sceneform-android)~~ → **裸 ARCore + 手写 GLES 2.0**（Phase 2 改） | SceneView、已归档的 Google Sceneform、裸 Filament | 原选 SceneView 是因为它原生支持 Augmented Images + `ExternalTexture`。Phase 2 实做时改掉了：§11.8 的羽化+淡入需要自定义 fragment shader，Filament 材质得用 `matc` 离线编译成 `.filamat`（等于再加一个 Google 闭源工具）；而整个场景只有两个四边形，用不上场景图/光照/PBR/glTF，为它背 ~10MB 不划算；`SurfaceTexture` → `GL_TEXTURE_EXTERNAL_OES` 也是 ExoPlayer 出图最直的路。代价是 EGL 生命周期、`setDisplayGeometry`、`getTransformMatrix` 全得自己管对，`gl/` 共 546 行 |
+| ~~Flutter 外壳~~ → **Kotlin + Jetpack Compose**（Phase 3 改） | Flutter + MethodChannel/EventChannel、React Native、原生 View/XML | 地基是 ARCore，只有 Android，Flutter 的跨平台价值为零；代价却是把 §7 契约实现两遍（Dart 重写请求与解析，或把每个 API 都包成 MethodChannel，六个界面的每次列目录/取缩略图都过桥）。`EndpointResolver` 按 §5.7 本就在原生侧，「当前走哪条通道」这个全局状态还得再推过去；缩略图要带 `Authorization` 头，`Image.network` 用不了，"控件生态省事"也不成立。改 Compose 后同进程直接调用，无桥、无第二份契约。代价是 `@Composable` 层跑不了 JVM 单测，故把易错的格式化与校验抠进纯函数 `Fmt.kt` |
+| **打印尺寸按纸张预设 + 手输毫米（10–2000）** | 只给手输、或从 EXIF/DPI 反推 | `print_width_m` 是参考图**水平方向**的物理宽度，横放取长边、竖放取短边（6寸 = 152 / 102），方向由缩略图像素比判定。填错**不会报错**，只会让 AR 里的视频一直飘 —— 所以既要预设降低出错率，也要范围校验挡住笔误。EXIF 里没有实物打印尺寸，反推不出来 |
+| **缩略图自己解码 + `LruCache`** | Coil、Glide | 每张图要带 `Authorization: Bearer`，且 api/media 是两条会各自变化的通道，缓存键得绕开 URL。配图片库的 header 注入 + 自定义客户端 + 自定义键，工作量不比 `BitmapFactory` + 8MB `LruCache` 少，还多一棵依赖树 |
 | [fbow](https://github.com/rmsalinas/fbow) / [DBoW3](https://github.com/rmsalinas/DBow3) | FAISS + CLIP、pHash | ORB 二进制描述子 + 层次词汇树，纯 CPU 万级库查询 10-50ms，ORB-SLAM 同款。pHash 抗不住透视与光照；CLIP 在 N5095 上偏慢且对裁切敏感 |
 | **识别跑在 NAS** | ECS 2C2G | N5095 是 4C@2.9GHz / 8G 可扩 16G，明显强于 ECS；数据本就在 NAS，无需同步；识别包仅 50KB，走隧道毫无压力。**这一条让 ECS 完全退出，并消除了 v1 的双库同步问题** |
 | **媒体存 NAS，不上云** | Cloudflare R2 + AES-CTR 加密 + 冷热分层 | 存储与带宽两个瓶颈都不存在（§10.1）。不出内网 → 不需要加密 → 不需要分层 → 不需要密钥体系。**v1 约 60% 的复杂度来自一个不存在的问题** |

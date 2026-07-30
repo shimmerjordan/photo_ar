@@ -7,11 +7,15 @@
         android:allowBackup="false"
         android:supportsRtl="true">
 
+        <!-- 主题用系统的深色 NoActionBar：外壳自己画 Material3 顶栏，而扫描界面是
+             全屏黑底相机 —— 起始窗口跟着深色才不会在两者之间闪一下白。
+             adjustResize：设置页和入库表单都有输入框，键盘弹起时要能滚上来。 -->
         <activity
-            android:name="app.photoar.standalone.SetupActivity"
+            android:name="app.photoar.standalone.MainActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
