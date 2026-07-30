@@ -22,7 +22,8 @@ cp /tmp/corpus/vocab.npz data/vocab.npz
 # 3) 配置
 cp deploy/config.example.json deploy/config.json
 $EDITOR deploy/config.json          # 改 roots 为容器内路径
-export PHOTOAR_TOKEN=$(openssl rand -hex 24)   # 别写进配置文件
+cp .env.example .env
+$EDITOR .env                        # 填 PHOTOAR_TOKEN（openssl rand -hex 24），别写进配置文件
 ```
 
 `vocab.npz` 换了就必须 `photoar-server reindex --rebuild-words`，否则库里存的
@@ -32,15 +33,15 @@ export PHOTOAR_TOKEN=$(openssl rand -hex 24)   # 别写进配置文件
 ## 2. 起服务
 
 ```bash
-docker compose build
-PHOTOAR_TOKEN=$PHOTOAR_TOKEN docker compose up -d
+docker compose pull            # 用 GHCR 上的镜像。自己改了代码就换成 docker compose build
+docker compose up -d
 docker compose logs -f photo-ar-server
 ```
 
-自检：
+自检（`T` 取 `.env` 里那串）：
 
 ```bash
-curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" http://<NAS 的 LAN IP>:8964/v1/ping
+curl -sS -H "Authorization: Bearer $T" http://<NAS 的 LAN IP>:8964/v1/ping
 # {"ok": true, "version": "phase1", "serverTime": 1753...}
 
 # 硬编到底有没有生效（软编回退是静默的，只能这样问）
@@ -89,7 +90,7 @@ docker restart cloudflared     # 或 Container Station 里重启
 验证（从任何外网环境）：
 
 ```bash
-curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" https://arphoto.<你的域名>/v1/ping
+curl -sS -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping
 ```
 
 ### 隧道上的三条硬限制（详见 [deploy-details](../docs/deploy-details.md#隧道的三条硬限制)）
@@ -105,7 +106,7 @@ curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" https://arphoto.<你的域名
 入口是 HTTP（Android 外壳的「关联新照片」页调的也是它）。单条：
 
 ```bash
-curl -sS -H "Authorization: Bearer $PHOTOAR_TOKEN" -H 'Content-Type: application/json' \
+curl -sS -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   -d '{"refPath":"/share/Photo/2019/IMG_0421.jpg",
        "videoPath":"/share/Video/2019/IMG_0421.mov",
        "printWidthMm":152,
@@ -164,7 +165,7 @@ docker compose exec photo-ar-server python -m photoar.server.httpd -c /config/co
 机上直接删 `data/` 会遇到 Permission denied，用容器自己删：
 
 ```bash
-docker run --rm --entrypoint sh -v "$PWD/data:/x" photo-ar-server:phase1 -c 'rm -rf /x/*'
+docker compose run --rm --entrypoint sh photo-ar-server -c 'rm -rf /data/*'
 ```
 
 `library/` 里三份记录（`slots.json` / `desc.bin` / `words.bin`）的条数必须相等。

@@ -21,3 +21,6 @@ captures/
 # superpowers 的 spec/plan 是过程产物，留在本地不进仓库
 docs/superpowers/
 .superpowers/
+
+# compose 读的环境变量文件，含 token
+.env

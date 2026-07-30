@@ -1,45 +1,51 @@
-# QNAP Container Station 用。`docker compose up -d` 或直接在 Container Station
-# 的「应用程序」里贴这份 YAML。
+# photo-ar-server。照着 docs/deploy.md 走一遍即可，这份文件只需要改三处：
 #
-# 三处必须按自己的 NAS 改：
-#   1. PHOTOAR_TOKEN —— 换成自己的随机串（openssl rand -hex 24）
-#   2. 照片与视频所在的共享文件夹挂载点（下面 volumes 里的两条 :ro）
-#   3. deploy/config.json 里的 roots 必须与这里挂进去的容器内路径一致
+#   1. `.env` 里的 PHOTOAR_TOKEN（`cp .env.example .env` 后填）
+#   2. 下面 volumes 里照片/视频所在的共享文件夹
+#   3. deploy/config.json 里的 roots 要和这里挂进去的【容器内】路径一致
+#
+# 两种起法，二选一：
+#   拉现成镜像（推荐）：docker compose pull && docker compose up -d
+#   本地构建：        docker compose build && docker compose up -d
 services:
   photo-ar-server:
+    # 默认拉 GHCR 上由 CI 构建的镜像。想用别的 tag 就在 .env 里设 PHOTOAR_IMAGE，
+    # 例如 ghcr.io/shimmerjordan/photo-ar-server:sha-1a2b3c4 回滚到某次提交。
+    image: ${PHOTOAR_IMAGE:-ghcr.io/shimmerjordan/photo-ar-server:latest}
+    # 保留 build 是为了改了代码能本地构建；只要执行过 pull 或 build，
+    # `up` 就直接用本地已有的镜像，不会再动它。
     build: .
-    image: photo-ar-server:phase1
     container_name: photo-ar-server
     restart: unless-stopped
     # 识别是 CPU 密集的（ORB + RANSAC）。N5095 只有 4 核，留一核给
     # cloudflared / CloudDrive2 / QTS 自己，不然扫描时整台 NAS 都发木。
     cpus: "3.0"
     mem_limit: 3g
-    # 核显透进容器，转码走 h264_vaapi 而不是 libx264。软编实测（本机 3 核配额，
-    # 一条 30 秒 1080p）：preset veryfast 18.2s、slow 89.2s；折算到 N5095
-    # 分别约 56 秒和 4.6 分钟一条。入库的 attach 是同步请求，而 Cloudflare 的
-    # Proxy Read Timeout 是 125 秒 —— 软编 + 慢 preset 走隧道入库必然 524。
-    # 没有这一段（或者节点不存在）不会报错，服务自己回退软编——所以想确认
-    # 硬编真的生效，把 config.json 的 video_encoder 显式写成 "h264_vaapi"，
-    # 探测不到会直接报错（见 transcode.resolve_encoder）。
+    # 核显透进容器，转码走 h264_vaapi 而不是软编。没挂或节点不存在都不会报错，
+    # 服务自己回退 libx264 —— 想确认硬编真生效见 docs/deploy.md 第 4 步。
     devices:
       - /dev/dri:/dev/dri
-    # QTS 上 /dev/dri/renderD128 通常属 root:root 且 0666，如果发现容器内
-    # 打不开设备，用 `stat -c '%g' /dev/dri/renderD128` 查到 GID 后填进来。
+    # QTS 上 /dev/dri/renderD128 通常属 root:root 且 0666。若容器内打不开设备，
+    # 用 `stat -c '%g' /dev/dri/renderD128` 查到 GID 填进来。
     # group_add:
     #   - "44"
     ports:
       # 只监听 LAN/Tailscale。外网走已有的 cloudflared，不在这里暴露。
       - "8964:8964"
     environment:
-      PHOTOAR_TOKEN: "改成你自己的随机串"
+      # 没设就直接报错退出，而不是拿空 token 起一个谁都能访问的服务
+      PHOTOAR_TOKEN: ${PHOTOAR_TOKEN:?先 cp .env.example .env 并填 PHOTOAR_TOKEN}
       # 词汇树用 UTF-8 路径，容器里 locale 默认是 POSIX，显式设一下省事
       LANG: C.UTF-8
     volumes:
-      # 索引、SQLite、转码产物、缩略图。必须是持久卷 —— 丢了要全库重新入库
-      # （每张约 1s，一万张三小时）。
+      # 索引、SQLite、转码产物、缩略图，以及你训好的 vocab.npz。必须是持久卷 ——
+      # 丢了要全库重新入库（每张约 5s，一万张十几小时）。
       - ./data:/data
       - ./deploy:/config:ro
+      # arcoreimg：ARCore SDK 里的闭源二进制，不可再分发，所以镜像里没有它，
+      # 由宿主机送进去（记得 chmod +x）。本地构建的镜像里已经有一份，这条挂载
+      # 只是覆盖成同一个文件，无害。
+      - ./tools/arcoreimg:/opt/photoar/tools/arcoreimg:ro
       # 照片与视频。只读挂载：这个服务永远不改用户的原始文件
       # （唯一的写入是 /v1/upload，落在下面单独一条可写挂载里）。
       - /share/Photo:/share/Photo:ro
