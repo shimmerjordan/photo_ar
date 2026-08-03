@@ -44,7 +44,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import app.photoar.arview.EndpointCenter
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.Alignment
 import app.photoar.arview.Resolution
+import app.photoar.standalone.pixel.PhotoArPixelTheme
+import app.photoar.standalone.pixel.PixelBitmap
+import app.photoar.standalone.pixel.PixelButton
+import app.photoar.standalone.pixel.PixelIcon
+import app.photoar.standalone.pixel.PixelIconSize
+import app.photoar.standalone.pixel.PixelIcons
 import app.photoar.arview.ar.ArCoreEmbeddedRuntime
 import app.photoar.arview.ui.ArScanActivity
 
@@ -91,25 +101,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Scheme = darkColorScheme(
-    primary = Color(0xFFFFC46B),
-    onPrimary = Color(0xFF3A2600),
-    primaryContainer = Color(0xFF54400F),
-    onPrimaryContainer = Color(0xFFFFE0B2),
-    secondary = Color(0xFFB8C7D9),
-    background = Color(0xFF121316),
-    onBackground = Color(0xFFE6E6E9),
-    surface = Color(0xFF121316),
-    onSurface = Color(0xFFE6E6E9),
-    surfaceVariant = Color(0xFF2A2C31),
-    onSurfaceVariant = Color(0xFFB9BCC4),
-)
-
-/** 深色固定：扫描界面是全屏相机（黑底），外壳跟着深色才不会在两者之间闪白。 */
+/**
+ * 外壳的主题。**实现搬到了 [app.photoar.standalone.pixel.PhotoArPixelTheme]**，
+ * 这里只留一个转发。
+ *
+ * 留这个名字而不是让 20 个调用点跟着改：它是 `setContent { PhotoArTheme { ... } }`
+ * 那一处的入口名，而"这个 App 长什么样"的决定全在 pixel 那个包里 —— 换风格时
+ * 只该动那一个包。
+ */
 @Composable
-fun PhotoArTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = Scheme, content = content)
-}
+fun PhotoArTheme(content: @Composable () -> Unit) = PhotoArPixelTheme(content)
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -118,15 +120,42 @@ fun AppRoot() {
     val shell = remember { Shell(context) }
     val resolution = rememberResolution(shell.center)
 
-    // §9.2 的第一个触发时机。没配过就直接落在设置页 —— 空列表加一个「连不上」
-    // 比「去填地址」难懂得多。
+    // 登录状态的版本号。凭证不是 Compose 的 State（存在 SharedPreferences 里），
+    // 所以登录/登出之后靠它触发重组。
+    var authRev by remember { mutableStateOf(0) }
+    val gated = remember(authRev) {
+        NavPolicy.needsGate(
+            hasUsableEndpoint = shell.center.config.candidates.any { it.usable },
+            phase = shell.center.authPhase(),
+        )
+    }
+    val isAdmin = remember(authRev) { shell.center.config.auth?.isAdmin == true }
+
+    // §9.2 的第一个触发时机。改造前这里在没配过的时候把人扔到设置页 —— 现在那件事
+    // 由登录蒙版做（它的第一步就是问地址），所以这里只剩「配过就探一次活」。
     LaunchedEffect(Unit) {
-        if (shell.center.configured) shell.center.refreshAsync() else shell.tab(Route.Settings)
+        if (shell.center.configured) shell.center.refreshAsync()
+    }
+
+    // 角色定了之后校正落地页。两种情况都要：刚登录进来（栈里还是那个占位值），
+    // 以及同一台手机换人登录（管理员登出、访客进来，而界面还停在「素材」页 ——
+    // 那一页上每个按钮都会 403）。
+    LaunchedEffect(gated, isAdmin) {
+        if (!gated) {
+            val want = NavPolicy.tabAfterRoleChange(tabOf(shell.currentRoot), isAdmin)
+            shell.tab(routeOf(want))
+        }
+    }
+
+    if (gated) {
+        LoginGate(shell) { authRev++ }
+        return
     }
 
     BackHandler(enabled = shell.current != shell.currentRoot) { shell.pop() }
 
     val route = shell.current
+    val tabs = NavPolicy.tabsFor(isAdmin)
     Scaffold(
         topBar = {
             TopAppBar(
@@ -134,15 +163,28 @@ fun AppRoot() {
                 navigationIcon = {
                     if (!route.root) {
                         IconButton(onClick = { shell.pop() }) {
-                            @Suppress("DEPRECATION")
-                            Icon(Icons.Filled.ArrowBack, contentDescription = "返回")
+                            PixelIcon(
+                                bitmap = PixelIcons.Back,
+                                size = PixelIconSize,
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.semantics { contentDescription = "返回" },
+                            )
                         }
                     }
                 },
                 actions = {
+                    // 「＋」现在切到「素材」页，而不是打开 NAS 浏览器：入库只有一条路
+                    // 了（手机里挑一张照片 + 一段视频，一次传完就是一组映射）。
                     if (route == Route.Photos) {
-                        IconButton(onClick = { shell.push(Route.Browse(Pick.IMAGE, null)) }) {
-                            Icon(Icons.Filled.Add, contentDescription = "关联新照片")
+                        IconButton(onClick = { shell.tab(Route.Media) }) {
+                            PixelIcon(
+                                bitmap = PixelIcons.Add,
+                                size = PixelIconSize,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.semantics {
+                                    contentDescription = "传一组新素材"
+                                },
+                            )
                         }
                     }
                     // 探活状态点只给调试模式看，常态是噪声。开关在设置页「关于」里。
@@ -152,62 +194,119 @@ fun AppRoot() {
                 },
             )
         },
-        floatingActionButton = { if (route.root) ScanButton() },
+        // 访客不给 FAB：他的首页整个就是那颗「扫一扫」（200dp，比 FAB 大得多），
+        // 再悬一颗在上面是同一个动作两个入口，而且正好压在那个大按钮上。
+        floatingActionButton = { if (route.root && isAdmin) ScanButton() },
         floatingActionButtonPosition = FabPosition.Center,
         bottomBar = {
             if (route.root) {
                 NavigationBar {
-                    NavigationBarItem(
-                        selected = route == Route.Photos,
-                        onClick = { shell.tab(Route.Photos) },
-                        icon = { Icon(Icons.Filled.Home, null) },
-                        label = { Text("照片") },
-                    )
-                    NavigationBarItem(
-                        selected = route == Route.History,
-                        onClick = { shell.tab(Route.History) },
-                        icon = {
-                            @Suppress("DEPRECATION")
-                            Icon(Icons.Filled.List, null)
-                        },
-                        label = { Text("历史") },
-                    )
-                    NavigationBarItem(
-                        selected = route == Route.Settings,
-                        onClick = { shell.tab(Route.Settings) },
-                        icon = { Icon(Icons.Filled.Settings, null) },
-                        label = { Text("设置") },
-                    )
+                    for (tab in tabs) {
+                        val target = routeOf(tab)
+                        NavigationBarItem(
+                            selected = route == target,
+                            onClick = { shell.tab(target) },
+                            icon = {
+                                // 选中时用主色、没选中用 Dim：Material 的
+                                // NavigationBarItem 自己会给 icon 上色，但那套色是
+                                // 按 secondaryContainer 那一档来的，而这里的图标是
+                                // Canvas 画的、不吃 LocalContentColor。所以显式给。
+                                PixelIcon(
+                                    bitmap = iconOf(tab),
+                                    size = PixelIconSize,
+                                    tint = if (route == target) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                )
+                            },
+                            label = { Text(labelOf(tab)) },
+                        )
+                    }
                 }
             }
         },
     ) { pad ->
         Box(Modifier.padding(pad)) {
             when (route) {
+                Route.ScanHome -> ScanHomeScreen(shell)
                 Route.Photos -> PhotosScreen(shell)
+                Route.Media -> MediaScreen(shell)
+                Route.Admin -> AdminScreen(shell)
                 Route.History -> HistoryScreen(shell)
-                Route.Settings -> SettingsScreen(shell, resolution)
+                Route.Settings -> SettingsScreen(shell, resolution) { authRev++ }
+                Route.AdminWeb -> AdminWebScreen(shell.center)
                 is Route.Detail -> PhotoDetailScreen(shell, route.photoId)
                 is Route.Play -> PlayScreen(shell, route.photoId)
-                is Route.Browse -> BrowseScreen(shell, route)
-                Route.Create -> CreateScreen(shell)
                 Route.Cache -> CacheScreen(shell)
             }
         }
     }
 }
 
+/** 页签 → 路由。两者是一一对应的，但 [Tab] 是纯逻辑（可测），[Route] 带 Compose。 */
+private fun routeOf(tab: Tab): Route = when (tab) {
+    Tab.SCAN -> Route.ScanHome
+    Tab.PHOTOS -> Route.Photos
+    Tab.MEDIA -> Route.Media
+    Tab.ADMIN -> Route.Admin
+    Tab.SETTINGS -> Route.Settings
+}
+
+/**
+ * 根路由 → 页签。
+ *
+ * 只在 `shell.currentRoot` 上调用，所以参数一定是个根。`else` 那一支给 PHOTOS 是
+ * 因为 Kotlin 要求 when 穷尽 —— 不是「非根路由也当照片页」，而是那些分支到不了。
+ */
+private fun tabOf(root: Route): Tab = when (root) {
+    Route.ScanHome -> Tab.SCAN
+    Route.Media -> Tab.MEDIA
+    Route.Admin -> Tab.ADMIN
+    Route.Settings -> Tab.SETTINGS
+    else -> Tab.PHOTOS
+}
+
+private fun labelOf(tab: Tab): String = when (tab) {
+    Tab.SCAN -> "扫一扫"
+    Tab.PHOTOS -> "照片"
+    Tab.MEDIA -> "素材"
+    Tab.ADMIN -> "管理"
+    Tab.SETTINGS -> "设置"
+}
+
+/**
+ * 页签图标。
+ *
+ * 只用 Material 自带的那几个基础图标，没有引 material-icons-extended —— 那个包
+ * 会给 APK 加几 MB，而这个 App 已经因为内嵌 ARCore 到 186 MB 了。
+ */
+@Suppress("DEPRECATION")
+/**
+ * 页签图标。全部是自己画的 16×16 像素图（[PixelIcons]），不是 Material 的矢量图。
+ *
+ * 改造前 SCAN 与 PHOTOS **用的是同一个** `Icons.Filled.Home` —— 底栏上两个页签
+ * 长得一样，靠文字区分。现在一个是房子、一个是相框叠。
+ */
+private fun iconOf(tab: Tab): PixelBitmap = when (tab) {
+    Tab.SCAN -> PixelIcons.Home
+    Tab.PHOTOS -> PixelIcons.Photos
+    Tab.MEDIA -> PixelIcons.Upload
+    Tab.ADMIN -> PixelIcons.Admin
+    Tab.SETTINGS -> PixelIcons.Settings
+}
+
 private fun titleOf(route: Route): String = when (route) {
+    Route.ScanHome -> "photoar"
     Route.Photos -> "照片库"
+    Route.Media -> "素材"
+    Route.Admin -> "管理"
     Route.History -> "识别历史"
     Route.Settings -> "设置"
+    Route.AdminWeb -> "管理台"
     is Route.Detail -> "照片详情"
     is Route.Play -> "试播"
-    is Route.Browse -> when (route.pick) {
-        Pick.IMAGE -> "挑一张照片 · " + Fmt.dirTitle(route.dir)
-        else -> "挑一段视频 · " + Fmt.dirTitle(route.dir)
-    }
-    Route.Create -> "关联新照片"
     Route.Cache -> "离线缓存"
 }
 
@@ -223,14 +322,25 @@ private fun titleOf(route: Route): String = when (route) {
 @Composable
 private fun ScanButton() {
     val context = LocalContext.current
-    FloatingActionButton(
+    // 不用 FloatingActionButton：那个是圆的，而圆是这套风格里唯一不能出现的形状
+    // （像素画没有抗锯齿的曲线）。方块 + 斜面同样是"悬在上面的主操作"，
+    // 而且它给的按下反馈是斜面翻转，比 ripple 更贴这套风格。
+    PixelButton(
         onClick = { ArScanActivity.start(context) },
         modifier = Modifier.size(76.dp),
-        containerColor = MaterialTheme.colorScheme.primary,
-        contentColor = MaterialTheme.colorScheme.onPrimary,
-        shape = CircleShape,
     ) {
-        Text("扫一扫", style = MaterialTheme.typography.titleMedium)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            PixelIcon(
+                bitmap = PixelIcons.Scan,
+                size = 32.dp,
+                tint = MaterialTheme.colorScheme.onPrimary,
+            )
+            Text(
+                "扫一扫",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
     }
 }
 
