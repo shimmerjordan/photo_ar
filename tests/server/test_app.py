@@ -117,16 +117,37 @@ def test_ingest_without_video(env):
     assert env.get(f"/v1/photo/{pid}")  # 详情仍可读
 
 
-def test_ingest_requires_print_width(env):
+def test_ingest_allows_omitting_print_width(env):
+    """不填 printWidthMm 能入库，库里记 0 = 未知。
+
+    原来这里必须返回 400 missing_print_width，理由是"跟踪精度依赖它"。改了是因为照片
+    实际尺寸经常不知道，而强制必填的结果是随手填一个数 —— 一个**猜的**宽度比不填更糟：
+    ARCore 会照它回显 getExtentX，端上按这个错数字画四边形，位姿却来自量纲真实的 SLAM，
+    两个尺度一错位视频就贴不上，而现象和"跟踪算不准"一模一样。
+    """
     ref = env.write_image("photos/c.jpg", seed=7)
     r = env.post_json("/v1/photo", {"refPath": str(ref)})
-    assert r.status == 400
-    assert env.body_json(r)["error"] == "missing_print_width"
+    assert r.status == 201, env.body_json(r)
+    assert env.body_json(r)["printWidthM"] == 0.0
+
+    listed = env.body_json(env.get("/v1/photos"))["photos"]
+    row = next(p for p in listed if p["photoId"] == env.body_json(r)["photoId"])
+    assert row["printWidthM"] == 0.0
 
 
 def test_ingest_rejects_bad_print_width(env):
     ref = env.write_image("photos/c2.jpg", seed=7)
     r = env.post_json("/v1/photo", {"refPath": str(ref), "printWidthMm": "big"})
+    assert r.status == 400 and env.body_json(r)["error"] == "bad_print_width"
+
+
+def test_ingest_rejects_negative_print_width(env):
+    """负宽度仍然拒 —— 它不是"未知"，是算错了或单位搞反了。
+
+    静默当未知处理会把一个真实的 bug 藏起来：调用方以为填了宽度，服务端悄悄丢掉。
+    """
+    ref = env.write_image("photos/c3.jpg", seed=7)
+    r = env.post_json("/v1/photo", {"refPath": str(ref), "printWidthMm": -152})
     assert r.status == 400 and env.body_json(r)["error"] == "bad_print_width"
 
 
@@ -661,3 +682,38 @@ def test_response_bodies_are_utf8_json(env):
     r = env.get("/v1/ping")
     assert r.headers["Content-Type"] == "application/json; charset=utf-8"
     json.loads(r.body.decode("utf-8"))
+
+
+def test_photo_ref_serves_the_original_not_the_thumb(env):
+    """`/v1/photo/<id>/ref` 给的是原图，不是缩略图。
+
+    「保存到相册」要存的是原图。客户端手上原来只有 refThumbUrl（缩略图），存下来
+    是一张糊的 —— 而这个错误不会报任何错，用户要打开相册才发现。
+    """
+    ref = env.write_image("photos/orig.jpg", seed=11)
+    r = env.post_json("/v1/photo", {"refPath": str(ref)})
+    assert r.status == 201, env.body_json(r)
+    pid = env.body_json(r)["photoId"]
+
+    got = env.get(f"/v1/photo/{pid}/ref")
+    assert got.status == 200
+    assert got.headers["Content-Type"] == "image/jpeg"
+    body = env.body_bytes(got)
+    assert body == ref.read_bytes(), "必须逐字节等于 NAS 上那张原图"
+
+    thumb = env.body_bytes(env.get(f"/v1/photo/{pid}/thumb"))
+    assert len(body) != len(thumb), "原图和缩略图不该是同一份"
+
+
+def test_photo_ref_404_when_original_is_gone(env):
+    """原图被挪走/删了 → 404，不是 500。
+
+    这不是服务端故障，客户端该做的事（告诉用户原图没了）和其它 404 一致。
+    """
+    ref = env.write_image("photos/vanish.jpg", seed=12)
+    r = env.post_json("/v1/photo", {"refPath": str(ref)})
+    pid = env.body_json(r)["photoId"]
+    ref.unlink()
+    got = env.get(f"/v1/photo/{pid}/ref")
+    assert got.status == 404
+    assert env.body_json(got)["error"] == "ref_missing"

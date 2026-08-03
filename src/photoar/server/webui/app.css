@@ -1,0 +1,764 @@
+/* photoar 管理台样式。
+ *
+ * 视觉方向是「运维控制台」：近黑底、单一强调色、其余全靠灰阶层次。理由不是审美
+ * 偏好 —— 这个页面的使用场景是晚上有人站在走廊里拿手机改一下谁能看哪些照片，
+ * 亮底满屏白在那种环境下刺眼；而管理台上的每一屏都是密集的名字、数字和状态，
+ * 多一种颜色就多一种「这个颜色是什么意思」的问题。
+ *
+ * ## 颜色为什么写成 16 进制而不是 oklch()
+ *
+ * 配色是在 OKLCH 里配的（每个变量后面都注了源值），但落到文件里写 16 进制。
+ * oklch() 要 Chrome 111 / Safari 15.4 以上，而这个页面要在「家里随便哪台手机」
+ * 上打开 —— 老 Android WebView 遇到不认识的颜色函数会把整条声明丢掉，后果是
+ * 白底上的白字，一个没人能自己救回来的状态。设计工具用 OKLCH，交付值用兼容格式。
+ *
+ * ## 对比度
+ *
+ * 正文/次要文字/强调色对各自底色都实测过 ≥4.5:1（最低的一档是 --ink-3 在
+ * --raise 上的 5.58:1），交互控件的描边用 --edge（对 --bg 3.48:1，满足
+ * WCAG 1.4.11 的 3:1）。--line 只用来画分隔线，不承载信息，所以允许它很淡。
+ */
+
+:root {
+  /* 底色三层：页面 / 面板 / 抬起（hover、输入框轨道） */
+  --bg: #0e100e;      /* oklch(0.170 0.006 150) 近黑，带一点点品牌绿的倾向，不是纯黑 */
+  --panel: #171a17;   /* oklch(0.212 0.007 150) */
+  --raise: #202421;   /* oklch(0.255 0.008 150) */
+
+  --line: #303431;    /* oklch(0.320 0.008 150) 分隔线 */
+  --edge: #656b66;    /* oklch(0.520 0.010 150) 交互控件描边，3:1 */
+
+  --ink: #f2f4f2;     /* oklch(0.965 0.004 150) 正文 */
+  --ink-2: #c0c4c0;   /* oklch(0.815 0.006 150) 次要 */
+  --ink-3: #979b97;   /* oklch(0.685 0.007 150) 弱化：标签、说明、占位符 */
+
+  /* 强调色只用在三处：主操作、当前选中、焦点圈。不做装饰。 */
+  --accent: #8ed28f;      /* oklch(0.800 0.115 145) 强调色文字/描边 */
+  --accent-fill: #79c77c; /* oklch(0.760 0.130 145) 主按钮底 */
+  --accent-dim: #76af77;  /* oklch(0.700 0.100 145) 主按钮 hover */
+  --on-accent: #0b140d;   /* oklch(0.180 0.020 150) 主按钮上的字 */
+
+  --danger: #ed756e;      /* oklch(0.700 0.150 25) 危险文字/描边 */
+  --danger-fill: #cf4040; /* oklch(0.580 0.180 25) 危险按钮底，配白字 4.69:1 */
+  --warn: #f0ba59;        /* oklch(0.820 0.130 80) 需要注意（已停用、要重启） */
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 等宽只给 id、数字、路径 —— 那些东西要能逐字符比对 */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans Mono", monospace;
+
+  --r: 5px;  /* 唯一的圆角值。多几档就会开始出现「这里 6 那里 8」的不一致 */
+
+  /* 语义化的层级，不写 999。dialog 走浏览器的 top layer，不参与这套排序。 */
+  --z-sticky: 20;
+  --z-toast: 60;
+
+  /* 退出型曲线（ease-out-quart），不要弹跳 */
+  --ease: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+* { box-sizing: border-box; }
+
+/* `[hidden]` 必须能压住作者样式里的 display。
+ *
+ * 浏览器给 `hidden` 的 `display:none` 来自 UA 样式表，优先级最低 —— 所以
+ * `.gate { display:flex }` 会把它盖掉，表现是「明明设了 `gate.hidden = true`，
+ * 登录框还挡在整个管理台上面」。JS 那边一切正常（属性确实在），只有肉眼看得出来。
+ * 这条 !important 是这个问题的标准解法，也是整份样式里唯一一条 !important。 */
+[hidden] { display: none !important; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 0.9375rem;   /* 15px：固定 rem 刻度，不用 clamp —— 管理台在固定 DPI 下看 */
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 焦点圈全局兜底。任何时候都不能把它去掉：键盘操作是这个页面唯一的无障碍出路。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 只给屏幕阅读器的文字（表格里那些「操作」列头之类） */
+.sr {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.muted { color: var(--ink-3); }
+.nowrap { white-space: nowrap; }
+
+/* ---------- 登录 ---------- */
+
+.gate {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+
+.gate form {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 22px;
+}
+
+.gate h1 {
+  margin: 0 0 2px;
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.gate .sub { margin: 0 0 20px; color: var(--ink-3); font-size: 0.8125rem; }
+
+/* ---------- 外壳 ---------- */
+
+.chrome {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.brand {
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.topbar .who {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.topbar .who .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 12ch;
+}
+
+/* 页签。横向可滚，窄屏上四个中文标签放不下时不会挤成两行。 */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 16px;
+  max-width: 1180px;
+  margin: 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+
+.tabs button {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 9px 12px;
+  min-height: 40px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 140ms var(--ease);
+}
+.tabs button:hover { color: var(--ink-2); }
+.tabs button[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 18px 16px 64px;
+}
+
+/* 面板切换是状态变化而不是入场动画：内容由 [hidden] 控制显隐，动画只是让
+ * 「换了一屏」有个交代。prefers-reduced-motion 下整段关掉。 */
+.panel { animation: panel-in 150ms var(--ease); }
+@keyframes panel-in {
+  from { opacity: 0.4; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 14px;
+}
+.head h2 {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.head .note { color: var(--ink-3); font-size: 0.8125rem; margin: 0; }
+.head .right { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- 按钮 ---------- */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink);
+  background: var(--raise);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  padding: 7px 12px;
+  min-height: 36px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms var(--ease), border-color 120ms var(--ease),
+    color 120ms var(--ease);
+}
+.btn:hover:not(:disabled) { background: #2a2f2b; }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn.primary {
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) { background: var(--accent-dim); border-color: var(--accent-dim); }
+
+.btn.danger { color: var(--danger); border-color: #6a3a37; }
+.btn.danger:hover:not(:disabled) { background: #2c1c1b; border-color: var(--danger); }
+
+.btn.danger-fill {
+  background: var(--danger-fill);
+  border-color: var(--danger-fill);
+  color: #fff;
+  font-weight: 600;
+}
+.btn.danger-fill:hover:not(:disabled) { background: #b93838; border-color: #b93838; }
+
+.btn.sm { font-size: 0.8125rem; padding: 4px 9px; min-height: 30px; }
+
+/* 触屏上把所有可点区域抬到 40px 以上。用 pointer: coarse 而不是宽度断点：
+ * 平板横屏也是手指点的，而窄窗口的桌面浏览器不是。 */
+@media (pointer: coarse) {
+  .btn { min-height: 44px; padding: 10px 14px; }
+  .btn.sm { min-height: 40px; padding: 8px 12px; }
+}
+
+/* ---------- 表单控件 ---------- */
+
+.field { display: grid; gap: 5px; margin-bottom: 14px; }
+.field > label { font-size: 0.875rem; font-weight: 550; }
+.field .help { font-size: 0.8125rem; color: var(--ink-3); }
+.field .help code { font-family: var(--mono); font-size: 0.9em; color: var(--ink-2); }
+.field .err { font-size: 0.8125rem; color: var(--danger); }
+.field .err:empty { display: none; }
+
+input[type="text"], input[type="password"], input[type="number"], input[type="search"], select {
+  font: inherit;
+  font-size: 0.9375rem;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  padding: 8px 10px;
+  min-height: 40px;
+  width: 100%;
+}
+input::placeholder { color: var(--ink-3); opacity: 1; }  /* 占位符也要 4.5:1 */
+input:focus, select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+input:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
+input[aria-invalid="true"] { border-color: var(--danger); }
+
+select {
+  /* 原生下拉，不自造。只把箭头位置留出来。 */
+  padding-right: 28px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-3) 50%),
+    linear-gradient(135deg, var(--ink-3) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 47%, calc(100% - 10px) 47%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  appearance: none;
+}
+
+/* 开关。底下是真的 <input type=checkbox>，键盘和读屏都按复选框处理。 */
+.sw {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  min-height: 40px;
+  position: relative;
+}
+.sw input {
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 42px; height: 24px;
+  margin: 0;
+  opacity: 0;       /* 不用 display:none —— 那样它就不可聚焦了 */
+  cursor: pointer;
+}
+.sw .track {
+  flex: 0 0 auto;
+  width: 42px; height: 24px;
+  border-radius: 12px;
+  background: var(--raise);
+  border: 1px solid var(--edge);
+  position: relative;
+  transition: background-color 160ms var(--ease), border-color 160ms var(--ease);
+}
+.sw .track::after {
+  content: "";
+  position: absolute;
+  left: 2px; top: 2px;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  transition: transform 160ms var(--ease), background-color 160ms var(--ease);
+}
+.sw input:checked + .track { background: var(--accent-fill); border-color: var(--accent-fill); }
+.sw input:checked + .track::after { transform: translateX(18px); background: var(--on-accent); }
+.sw input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sw input:disabled + .track { opacity: 0.45; }
+.sw .txt { font-size: 0.875rem; }
+
+input[type="checkbox"]:not(.sw input) { accent-color: var(--accent-fill); }
+
+/* ---------- 表格 ---------- */
+
+.tblwrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r); }
+
+.tbl { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+.tbl th {
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--ink-3);
+  padding: 9px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.tbl td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+.tbl tbody tr:last-child td { border-bottom: 0; }
+.tbl tbody tr:hover { background: var(--panel); }
+.tbl td .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.tbl .sub { display: block; font-size: 0.75rem; color: var(--ink-3); }
+
+@media (pointer: coarse) {
+  .tbl td { padding: 11px 12px; }
+}
+
+/* 窄屏把表格翻成卡片。列头靠 td 上的 data-label 补回来，所以渲染时每个单元格
+ * 都必须带 data-label —— 缺一个的表现是那一行少一个标签，而不是整块塌掉。
+ * 横向滚动是另一个选项，但用户表有 8 列，在手机上等于要横着推三屏。 */
+@media (max-width: 760px) {
+  .tblwrap { border: 0; border-radius: 0; overflow: visible; }
+  .tbl thead { display: none; }
+  .tbl, .tbl tbody, .tbl tr, .tbl td { display: block; width: auto; }
+  .tbl tr {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    margin-bottom: 10px;
+    padding: 4px 0;
+  }
+  .tbl tbody tr:hover { background: var(--panel); }
+  .tbl td {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    border-bottom: 0;
+    padding: 7px 12px;
+    min-height: 40px;
+    text-align: left;
+  }
+  .tbl td::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-size: 0.8125rem;
+    color: var(--ink-3);
+  }
+  .tbl td[data-label=""]::before { display: none; }
+  .tbl td.num { text-align: left; }
+  /* 卡片形态下操作按钮跟着标签列左对齐（那一栏没有 data-label，右对齐会显得
+     和上面每一行的「标签在左、值在右」错开）。 */
+  .tbl td .acts { justify-content: flex-start; }
+  .tbl td.wide { display: block; }
+  .tbl td.wide::before { display: block; margin-bottom: 4px; }
+}
+
+/* ---------- 标签 / 状态 ---------- */
+
+/* 状态一律「颜色 + 文字」双编码：只靠颜色的话色盲用户读不到，而这里区分的是
+ * 「已停用 / 启用中」这种不能猜的东西。 */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 2px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.tag.ok { color: var(--accent); border-color: #35513a; }
+.tag.warn { color: var(--warn); border-color: #56462a; }
+.tag.bad { color: var(--danger); border-color: #6a3a37; }
+.tag .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+
+/* ---------- 缩略图 ---------- */
+
+.th {
+  width: 56px; height: 42px;
+  flex: 0 0 auto;
+  object-fit: cover;
+  background: var(--raise);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  display: block;
+}
+.th.bad {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.6875rem;
+  color: var(--ink-3);
+}
+
+/* ---------- 授权勾选列表 ---------- */
+
+.picktools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 12px 0 10px;
+}
+.picktools .grow { flex: 1 1 200px; min-width: 0; max-width: 420px; }
+.picktools .count { font-size: 0.8125rem; color: var(--ink-3); margin-left: auto; }
+
+.pick {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.pick .row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  min-height: 52px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.pick .row:last-child { border-bottom: 0; }
+.pick .row:hover { background: var(--panel); }
+.pick .row.on { background: #1b241c; }
+.pick .row input { width: 20px; height: 20px; flex: 0 0 auto; margin: 0; cursor: pointer; }
+.pick .row .meta { min-width: 0; flex: 1 1 auto; }
+.pick .row .t {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.875rem;
+}
+.pick .row .s { display: block; font-size: 0.75rem; color: var(--ink-3); }
+
+/* grantAll 打开时勾选列表仍然可编辑（它会被保存下来），但要看得出「此刻不决定
+ * 他能看到什么」—— 所以是压暗，不是禁用。 */
+.pick.shadowed { opacity: 0.55; }
+
+.actionbar {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.actionbar .state { font-size: 0.8125rem; color: var(--ink-3); margin-right: auto; }
+.actionbar .state strong { color: var(--warn); font-weight: 600; }
+
+/* ---------- 配置 ---------- */
+
+.group { margin-bottom: 26px; }
+.group > h3 {
+  margin: 0 0 10px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--ink-3);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.group > h3 .k { font-family: var(--mono); font-weight: 400; }
+
+.cfg {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 260px);
+  gap: 10px 22px;
+  align-items: start;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.cfg:last-child { border-bottom: 0; }
+.cfg .lab { min-width: 0; }
+.cfg .lab .t { font-size: 0.9375rem; font-weight: 550; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cfg .lab .k { font-family: var(--mono); font-size: 0.75rem; color: var(--ink-3); }
+.cfg .lab .h { font-size: 0.8125rem; color: var(--ink-2); margin-top: 4px; max-width: 68ch; }
+.cfg .lab .meta { font-size: 0.75rem; color: var(--ink-3); margin-top: 4px; }
+.cfg .ctl { display: grid; gap: 5px; justify-items: start; }
+.cfg .ctl > input, .cfg .ctl > select { width: 100%; }
+.cfg .ctl .err { font-size: 0.8125rem; color: var(--danger); }
+.cfg .ctl .err:empty { display: none; }
+.cfg.dirty .lab .t::after {
+  content: "已改";
+  font-size: 0.6875rem;
+  color: var(--warn);
+  border: 1px solid #56462a;
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.cfg .reset {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  min-height: 28px;
+}
+
+@media (max-width: 760px) {
+  .cfg { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .cfg .ctl { justify-items: stretch; }
+  /* 控件铺满整行，但「恢复默认」这个链接不能跟着铺满 —— 铺满之后文字会居中，
+     看起来像个居中的按钮。 */
+  .cfg .ctl .reset { justify-self: start; }
+}
+
+.banner {
+  border: 1px solid #56462a;
+  background: #221d13;
+  border-radius: var(--r);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.banner .body { flex: 1 1 auto; min-width: 0; }
+.banner b { color: var(--warn); }
+.banner ul { margin: 6px 0 0; padding-left: 20px; font-size: 0.875rem; }
+.banner code { font-family: var(--mono); font-size: 0.8125rem; color: var(--ink-2); }
+.banner .x {
+  appearance: none; background: none; border: 0;
+  color: var(--ink-3); font-size: 1.125rem; line-height: 1;
+  cursor: pointer; padding: 4px 6px; min-height: 32px; min-width: 32px;
+}
+
+/* ---------- 空态 / 骨架 / 错误 ---------- */
+
+.empty {
+  border: 1px dashed var(--line);
+  border-radius: var(--r);
+  padding: 28px 20px;
+  text-align: center;
+  color: var(--ink-2);
+}
+.empty p { margin: 0 0 6px; }
+.empty .hint { font-size: 0.8125rem; color: var(--ink-3); margin: 0; }
+
+.skel {
+  height: 40px;
+  border-radius: var(--r);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  margin-bottom: 8px;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.failbox {
+  border: 1px solid #6a3a37;
+  background: #241716;
+  border-radius: var(--r);
+  padding: 12px 14px;
+  color: var(--ink);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.failbox .msg { flex: 1 1 240px; min-width: 0; }
+.failbox .code { font-family: var(--mono); font-size: 0.75rem; color: var(--ink-3); display: block; }
+
+/* 表单/对话框里的内联报错。后端的中文 message 原样显示在这里 —— 不换成
+ * 「操作失败」，那句话对着一条 409 name_taken 或 400 password_required 毫无用处。 */
+.formerr {
+  border: 1px solid #6a3a37;
+  background: #241716;
+  border-radius: var(--r);
+  padding: 9px 11px;
+  font-size: 0.875rem;
+  margin-bottom: 12px;
+}
+/* 错误码单独一行：跟在中文后面同一行时会连成「用户名已存在：'小明'name_taken」，
+   看起来像是消息本身出了乱码。 */
+.formerr .code { display: block; margin-top: 3px; font-family: var(--mono); font-size: 0.75rem; color: var(--ink-3); }
+.formerr[hidden] { display: none; }
+
+/* ---------- 提示条 ---------- */
+
+.toasts {
+  position: fixed;
+  right: 16px; bottom: 16px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 32px));
+}
+@media (max-width: 560px) {
+  .toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+}
+.toast {
+  background: var(--raise);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  font-size: 0.875rem;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  animation: toast-in 180ms var(--ease);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+.toast.ok { border-color: #35513a; }
+.toast.bad { border-color: #6a3a37; }
+.toast .body { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.toast .code { display: block; font-family: var(--mono); font-size: 0.75rem; color: var(--ink-3); }
+.toast .x {
+  appearance: none; background: none; border: 0;
+  color: var(--ink-3); font-size: 1.125rem; line-height: 1;
+  cursor: pointer; padding: 2px 4px; min-height: 28px; min-width: 28px;
+}
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ---------- 对话框 ---------- */
+
+dialog {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 0;
+  width: min(460px, calc(100vw - 24px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+dialog::backdrop { background: rgba(4, 6, 4, 0.7); }
+dialog h3 { margin: 0 0 4px; font-size: 1.0625rem; font-weight: 650; }
+dialog .lead { margin: 0 0 16px; font-size: 0.875rem; color: var(--ink-2); }
+dialog form, dialog .pad { padding: 18px; }
+dialog .foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+dialog ul { margin: 0 0 16px; padding-left: 20px; font-size: 0.875rem; }
+dialog li { margin-bottom: 6px; }
+dialog .selfnote {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 9px 11px;
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  margin-bottom: 14px;
+}
+
+/* 没有 showModal 的老浏览器走这条降级路径（JS 里 setAttribute('open')）：
+ * 手动把它钉在屏幕中间，否则它会以块级元素的身份出现在文档流里。 */
+dialog[open]:not(:modal) {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 100;
+}
+
+/* ---------- 动效降级 ---------- */
+
+/* 关掉动画不是可选项。这里的每一个动效都只是「状态变了」的附加交代，
+ * 去掉之后信息一条不少。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .btn:active:not(:disabled) { transform: none; }
+}

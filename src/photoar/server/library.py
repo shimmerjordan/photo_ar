@@ -45,27 +45,27 @@ Phase 0 的实测数字直接适用。`tests/server/test_library.py` 钉住了�
 
 import json
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from .. import descstore
+from .. import backend as backend_mod
+from ..backend import Backend, VocabLike
 from ..descstore import DescStore
 from ..features import N_FEATURES, Features
 from ..index import InvertedIndex, InvertedIndexBuilder
 from ..recognizer import TOP_K
 from ..verify import (
-    DEDUP_MIN_INLIERS,
     DET_MAX,
     DET_MIN,
     RATIO,
     Decision,
     PairResult,
     decide,
-    verify_pair,
 )
-from ..vocab import Vocab
 
 SLOTS_VERSION = 1
 
@@ -81,29 +81,59 @@ _WORDS_STRIDE = _WORDS_SLOTS * 4
 # 50 个候选的代价完全可以接受，所以这里不跟着 TOP_K。
 DEDUP_TOP_K = 50
 
+# 训词表时最多喂进去的描述子条数。理由（为什么必须有上限、以及怎么抽样）写在
+# `PhotoLibrary._sample_descriptors` 里。
+#
+# 200 万条这个数怎么来的：ORB 是 32 字节/条 = 64MB，XFeat 是 256 字节/条 = 512MB
+# —— 后者已经是 `mem_limit: 3g` 上能接受的上限附近，而球面 k-means 每轮还要一个
+# (N, branching) 的内积矩阵。真要在更小的机器上跑，调小这个数换来的是词表区分度
+# 下降，不是失败。
+MAX_TRAIN_DESCRIPTORS = 2_000_000
+
 
 class LibraryCorrupt(RuntimeError):
     """库目录里几个文件互相不一致。宁可拒绝启动，也不要按错位的 slot 识别。"""
 
 
-def _encode_words(words: np.ndarray) -> bytes:
-    count = min(int(words.size), N_FEATURES)
-    buf = np.zeros(_WORDS_SLOTS, np.uint32)
+class EmptyLibrary(RuntimeError):
+    """库里没有可训练的描述子。见 `PhotoLibrary.train_vocab`。"""
+
+
+@dataclass(frozen=True)
+class VocabTrained:
+    """一次 `train_vocab` 的结果。给 CLI 与管理接口如实报告用。"""
+
+    path: Path
+    n_photos: int
+    n_descriptors: int
+    n_words: int
+    elapsed_ms: int
+
+
+def _encode_words(words: np.ndarray, slots: int = _WORDS_SLOTS) -> bytes:
+    """定长编码一条词序列。
+
+    `slots` 随后端变（ORB 300 个特征 → 301 槽，XFeat 512 个 → 513 槽）。不参数化的话
+    XFeat 的词序列会被截到 300，粗排等于只用了 59% 的词 —— 而这不会报错。
+    """
+    count = min(int(words.size), slots - 1)
+    buf = np.zeros(slots, np.uint32)
     buf[0] = count
     if count:
         buf[1 : 1 + count] = np.asarray(words[:count], np.uint32)
     return buf.tobytes()
 
 
-def _read_words(path: Path) -> list[np.ndarray]:
+def _read_words(path: Path, slots: int = _WORDS_SLOTS) -> list[np.ndarray]:
     if not path.exists():
         return []
+    stride = slots * 4
     size = path.stat().st_size
-    if size % _WORDS_STRIDE:
+    if size % stride:
         raise LibraryCorrupt(
-            f"{path} 大小 {size} 不是词序列步长 {_WORDS_STRIDE} 的整数倍"
+            f"{path} 大小 {size} 不是词序列步长 {stride} 的整数倍"
         )
-    flat = np.fromfile(path, dtype=np.uint32).reshape(-1, _WORDS_SLOTS)
+    flat = np.fromfile(path, dtype=np.uint32).reshape(-1, slots)
     out = []
     for row in flat:
         count = int(row[0])
@@ -137,10 +167,31 @@ class Conflict:
 class PhotoLibrary:
     """目录布局：desc.bin / words.bin / index.npz / slots.json。vocab 在目录外。"""
 
-    def __init__(self, root: str | Path, vocab: Vocab) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        vocab: "VocabLike",
+        recog_backend: "Backend | None" = None,
+    ) -> None:
+        """`recog_backend` 决定提特征/配对/存储布局/阈值这一整套（见 photoar.backend）。
+
+        默认 ORB，与本文件此前的行为逐字节相同 —— 既有调用方与测试不必改一个字。
+        `vocab` 必须与后端配套（ORB 配 vocab.Vocab，XFeat 配 floatvocab.FloatVocab），
+        配错不会报错，只会让粗排召回崩塌，所以下面立刻校验一次。
+        """
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._vocab = vocab
+        self._backend = recog_backend or backend_mod.orb_backend()
+        expected = self._backend.vocab_cls
+        if not isinstance(vocab, expected):
+            names = " / ".join(c.__name__ for c in expected)
+            raise TypeError(
+                f"{self._backend.name} 后端要的词表是 {names}，"
+                f"收到 {type(vocab).__name__}。配错不会在别处报错，只会让粗排召回"
+                f"崩塌，所以在这里拒绝。"
+            )
+        self._words_slots = 1 + self._backend.layout.n_features
         self._write_lock = threading.RLock()
         self._snapshot: _Snapshot | None = None
         self._load()
@@ -150,6 +201,23 @@ class PhotoLibrary:
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def backend(self) -> "Backend":
+        """这个库绑的识别后端。
+
+        暴露出来是给**入库路径**用的（`ingest.ingest_photo`）：它必须用与库同一个
+        后端提特征。此前它 `from ..features import extract` 直接用 ORB —— 在 XFeat
+        库上，那些 32 字节的 uint8 描述子会被 `descstore.encode_slot` 塞进一个
+        512×64 float32 的 slot 里。那一步恰好会因为形状不匹配抛 ValueError（不是
+        静默写坏），但报出来的是一句 numpy 广播错误，与"入库用错了后端"毫无关系。
+        """
+        return self._backend
+
+    @property
+    def vocab(self) -> "VocabLike":
+        """当前生效的词表。给状态上报用（"跑的是空词表还是训好的词表"）。"""
+        return self._vocab
 
     @property
     def desc_path(self) -> Path:
@@ -194,12 +262,12 @@ class PhotoLibrary:
     def _counts(self) -> tuple[int, int]:
         """(desc.bin 条数, words.bin 条数)。按文件大小算，不解析内容。"""
         n_desc = (
-            self.desc_path.stat().st_size // descstore.SLOT_STRIDE
+            self.desc_path.stat().st_size // self._backend.layout.stride
             if self.desc_path.exists()
             else 0
         )
         n_words = (
-            self.words_path.stat().st_size // _WORDS_STRIDE
+            self.words_path.stat().st_size // (self._words_slots * 4)
             if self.words_path.exists()
             else 0
         )
@@ -228,7 +296,7 @@ class PhotoLibrary:
             return
 
         self._assert_aligned(photo_ids)
-        words = _read_words(self.words_path)
+        words = _read_words(self.words_path, self._words_slots)
 
         if self.index_path.exists():
             index = InvertedIndex.load(self.index_path)
@@ -246,10 +314,19 @@ class PhotoLibrary:
     def _make_snapshot(self, index: InvertedIndex, photo_ids: list[str]) -> _Snapshot:
         # unretrievable_docs() 是 O(全部 postings)，绝不能进查询热路径，
         # 所以在这里算一次存进快照。
-        extra = tuple(index.unretrievable_docs()) if index.n_docs > TOP_K else ()
+        #
+        # **无条件算**，不再跳过 `n_docs <= TOP_K` 的情形。原来那个跳过是对的：库比
+        # TOP_K 小时 `_candidate_slots` 本来就走全查分支，extra_slots 用不上。但
+        # `_candidate_slots` 拿到的 `top_k` 是**热配置**里的 `recog.top_k`，而这里
+        # 比的是代码常量 TOP_K(20)。把 `recog.top_k` 调到 10、库里有 15 张时，两个
+        # 分支就都不成立了：全查分支要 `n_docs <= 10`（不满足），extra_slots 又是空
+        # 的（因为 15 <= 20）。有真词表时粗排照样能返回候选，看不出问题；**空词表下
+        # `index.query` 恒返回空**（全部 idf 为 0，见 nullvocab.py），于是候选集为空
+        # —— 每一次识别都必然未命中，而日志里是一片正常的 200 "未命中"。
+        extra = tuple(index.unretrievable_docs())
         return _Snapshot(
             index=index,
-            store=DescStore(self.desc_path),
+            store=DescStore(self.desc_path, self._backend.layout),
             photo_ids=tuple(photo_ids),
             extra_slots=extra,
         )
@@ -304,18 +381,24 @@ class PhotoLibrary:
         与 `recognizer.TwoStageRecognizer.verify_candidates` 一样只提一次
         ORB：抽帧频率 400ms，重复提特征是这条路径上最贵的一步。
         """
-        from ..features import extract  # 局部 import：让 CLI 的 --help 不必加载 cv2
+        return self.verify_features(self._backend.extract_query(img), top_k)
 
+    def verify_features(
+        self, query: Features, top_k: int = TOP_K
+    ) -> list[PairResult]:
+        """特征**已经提好**的那一半（端上提特征的 `POST /v1/recognize/features` 走这条）。
+
+        拆出来而不是让新接口自己抄一遍循环：粗排候选、`extra_slots` 兜底、精排用哪个
+        `verify` 全在这几行里，抄一份的后果是两条识别路径的候选集不一样 —— 而两边都
+        返回 200、都能命中，只是命中率不同。那种差异要靠上规模跑才看得出来。
+        """
         snap = self._snapshot
-        if snap is None:
-            return []
-        query = extract(img)
-        if len(query) == 0:
+        if snap is None or len(query) == 0:
             return []
         out = []
         for slot in self._candidate_slots(snap, query, top_k):
             ref = snap.store.read(slot)
-            out.append(verify_pair(query, ref, snap.photo_ids[slot]))
+            out.append(self._backend.verify(query, ref, snap.photo_ids[slot]))
         return out
 
     def recognize(self, img: np.ndarray, top_k: int = TOP_K) -> Decision:
@@ -329,7 +412,7 @@ class PhotoLibrary:
         self_score: int,
         known_self_scores: dict[str, int],
         *,
-        min_inliers: int = DEDUP_MIN_INLIERS,
+        min_inliers: int | None = None,
         ratio: float = RATIO,
         top_k: int = DEDUP_TOP_K,
     ) -> list[Conflict]:
@@ -351,6 +434,10 @@ class PhotoLibrary:
         才能算出，入库时算一次存库）。缺了某张的分数就当它极低 —— 宁可多报一次
         冲突让用户确认，也不要因为查不到分数就放行。
         """
+        # 默认阈值跟后端走（ORB 25 / XFeat 38）：两个后端的内点数分布是两个不同的
+        # 量，沿用另一边的数会让去重闸门实际变松或变紧，而这不会报错。
+        if min_inliers is None:
+            min_inliers = self._backend.dedup_min_inliers
         snap = self._snapshot
         if snap is None or len(features) == 0:
             return []
@@ -360,7 +447,7 @@ class PhotoLibrary:
             ref = snap.store.read(slot)
             m = 0
             for a, b in ((features, ref), (ref, features)):
-                r = verify_pair(a, b, pid)
+                r = self._backend.verify(a, b, pid)
                 score = r.inliers if DET_MIN <= r.det <= DET_MAX else 0
                 m = max(m, score)
             if m < min_inliers:
@@ -393,10 +480,12 @@ class PhotoLibrary:
             if photo_id in set(photo_ids):
                 raise ValueError(f"photo_id 已在库中：{photo_id}")
             self._assert_aligned(photo_ids)
-            slot = descstore.append_slot(self.desc_path, features)
+            slot = descstore.append_slot(
+                self.desc_path, features, self._backend.layout
+            )
             words = self._vocab.words_of(features.desc)
             with open(self.words_path, "ab") as fh:
-                fh.write(_encode_words(words))
+                fh.write(_encode_words(words, self._words_slots))
             photo_ids.append(photo_id)
             self._write_slots(photo_ids)
             if defer_reindex:
@@ -415,21 +504,127 @@ class PhotoLibrary:
         with self._write_lock:
             photo_ids = self._read_slots()
             if rebuild_words:
-                store = DescStore(self.desc_path)
+                store = DescStore(self.desc_path, self._backend.layout)
                 try:
                     with open(self.words_path, "wb") as fh:
                         for slot in range(len(store)):
                             fh.write(
                                 _encode_words(
-                                    self._vocab.words_of(store.read(slot).desc)
+                                    self._vocab.words_of(store.read(slot).desc),
+                                    self._words_slots,
                                 )
                             )
                 finally:
                     store.close()
             self._reindex_locked(photo_ids)
 
+    # ---- 训词表 ----
+
+    def train_vocab(
+        self, out_path: str | Path, *, max_descriptors: int = MAX_TRAIN_DESCRIPTORS
+    ) -> "VocabTrained":
+        """从**库里已有的**描述子训一份词表，存盘，然后用它重建全库词序列与倒排索引。
+
+        为什么这件事必须在 `PhotoLibrary` 里、而不是在 CLI 或 HTTP 层拼起来：它是
+        "训 → 存盘 → 换掉 self._vocab → reindex(rebuild_words=True)"四步，中间任何
+        一步之后停下来，库都处于一个**不报错但静默错**的状态：
+        - 训完存盘、没换 `self._vocab` → 磁盘上是新词表，进程里还是旧的，下次重启
+          才生效，而重启后 `words.bin` 里的词 id 属于旧词表。
+        - 换了词表、没 `rebuild_words` → `words.bin` 是旧词 id，新词表的 idf 去解释
+          旧词 id，粗排召回**静默崩塌**（`reindex` 的 docstring 里也写着这条）。
+        所以四步必须在同一把 `_write_lock` 下走完，而那把锁是本类的私有状态。
+
+        库为空时**报错而不是训一个空词表**：`vocab.train` 拿 0 个描述子会抛，而就算
+        它不抛，训出来的也是一棵只有根的树，`words_of` 恒返回 0 —— 那正好等于
+        `NullVocab`，但它会**被存成一个文件**，从此"词表文件在不在"这个判据永久失效
+        （见 nullvocab.py 里 `save` 为什么拒绝写盘）。
+
+        返回值里带上描述子条数与耗时，是为了让 `POST /v1/admin/rebuild-vocab` 与
+        `photoar-server build-vocab` 能如实报告"这份词表是用多少数据训出来的" ——
+        库里只有 3 张照片时训出来的词表能用但没什么区分度，而那件事只有这个数字
+        能说明。
+        """
+        out_path = Path(out_path)
+        t0 = time.perf_counter()
+        with self._write_lock:
+            photo_ids = self._read_slots()
+            if not photo_ids:
+                raise EmptyLibrary(
+                    "库里一张照片都没有，训不出词表。先入库几十张（越多越好，"
+                    "几百张起就有意义），再训。在此之前服务用的是空词表 —— "
+                    "识别结果正确，只是每次都全量扫描。"
+                )
+            self._assert_aligned(photo_ids)
+            desc = self._sample_descriptors(len(photo_ids), max_descriptors)
+            new_vocab = self._backend.train_vocab(desc)
+            new_vocab.save(out_path)
+            # 先存盘再换内存里那份：反过来的话，`save` 失败（磁盘满、目录只读）会留下
+            # 一个"进程里用着一份磁盘上不存在的词表"的服务 —— 它能正常识别，直到重启
+            # 那一刻突然退回空词表，而没有任何一条日志把两件事联系起来。
+            self._vocab = new_vocab
+            # rebuild_words=True 是**必须**的，不是保险：`words.bin` 里现在存的是旧
+            # 词表（多半是空词表的全 0）的词 id。
+            store = DescStore(self.desc_path, self._backend.layout)
+            try:
+                with open(self.words_path, "wb") as fh:
+                    for slot in range(len(store)):
+                        fh.write(
+                            _encode_words(
+                                self._vocab.words_of(store.read(slot).desc),
+                                self._words_slots,
+                            )
+                        )
+            finally:
+                store.close()
+            self._reindex_locked(photo_ids)
+        return VocabTrained(
+            path=out_path,
+            n_photos=len(photo_ids),
+            n_descriptors=int(desc.shape[0]),
+            n_words=int(new_vocab.n_words),
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+    def _sample_descriptors(self, n_photos: int, max_descriptors: int) -> np.ndarray:
+        """从全库均匀取最多 `max_descriptors` 条描述子。
+
+        **必须有上限。** 直接把全库描述子 vstack 起来看着更简单，但 XFeat 一张照片是
+        512×64 float32 = 131KB，1 万张就是 1.3GB 常驻内存 —— 而这段代码跑在一台
+        `mem_limit: 3g` 的 NAS 上、服务同时还在对外提供识别。被 OOM killer 挑走的
+        大概率不是它自己而是正在转码的 ffmpeg。
+
+        按**每张照片配额**取，而不是"取前 N 张照片的全部描述子"：后者会让词表只认识
+        库里那一部分照片的内容分布（比如按入库时间排序的话，就是最早那几十张）。
+
+        配额内**随机**取行，不取前 quota 条：ORB 的 `extract` 返回的特征是按响应值
+        排序的，取前面几条等于系统性地只用最强的那批特征训词表。查询帧里恰恰有大量
+        弱特征，它们会被量化到没有中心靠近的叶子上 —— 粗排召回下降，而这不会报错。
+        seed 固定，同一个库训两次得到同一份词表（排查时能对照）。
+        """
+        quota = max(1, max_descriptors // max(1, n_photos))
+        rng = np.random.default_rng(0)
+        chunks: list[np.ndarray] = []
+        store = DescStore(self.desc_path, self._backend.layout)
+        try:
+            for slot in range(len(store)):
+                d = store.read(slot).desc
+                if d.shape[0] == 0:
+                    continue
+                if d.shape[0] > quota:
+                    rows = rng.choice(d.shape[0], size=quota, replace=False)
+                    d = d[np.sort(rows)]
+                chunks.append(np.ascontiguousarray(d))
+        finally:
+            store.close()
+        if not chunks:
+            raise EmptyLibrary(
+                "库里的照片一条描述子都没有（desc.bin 里全是空 slot）。"
+                "这说明入库时提特征失败过，用 photoar-server check 对一下账。"
+            )
+        return np.vstack(chunks)
+
     def _reindex_locked(self, photo_ids: list[str]) -> None:
-        index = self._build_index(_read_words(self.words_path))
+        index = self._build_index(_read_words(self.words_path, self._words_slots))
         index.save(self.index_path)
         # 整体替换快照。旧快照被读侧的局部变量持有着，它的 mmap 不会在读到
         # 一半时失效——这是这里不显式 close() 旧 store 的原因。

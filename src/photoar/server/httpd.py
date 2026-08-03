@@ -21,11 +21,10 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from ..vocab import Vocab
-from . import app, integrity
-from .config import ServerConfig
+from . import app, integrity, library
+from .config import ConfigError, ServerConfig
 from .db import Catalog
-from .library import PhotoLibrary
+from .library import EmptyLibrary
 
 # 同时在跑的识别请求数上限。N5095 4 核，留一核给 IO 与转码。
 _RECOGNIZE_SLOTS = 3
@@ -179,6 +178,7 @@ class _Handler(BaseHTTPRequestHandler):
     do_HEAD = _serve
     do_POST = _serve
     do_PUT = _serve
+    do_PATCH = _serve  # /v1/admin/users/<id> 与 /v1/admin/config 用它
     do_DELETE = _serve
 
 
@@ -198,8 +198,29 @@ def make_server(cfg: ServerConfig, srv: app.Server) -> ThreadedHTTPServer:
 # ---- 命令行 ----
 
 
-def _load(cfg_path: str) -> ServerConfig:
-    return ServerConfig.load(cfg_path)
+def _load(cfg_path: str | None) -> ServerConfig:
+    """配置文件优先，没有就走纯环境变量。
+
+    "文件不存在就用环境变量"而不是报错，是一键部署的关键一环：镜像的 ENTRYPOINT 想在
+    「用户挂了 /config/config.json」和「用户只在 compose 里填了环境变量」两种情况下
+    都能起来，而它在启动那一刻分不清是哪一种。让**同一条命令**两种都吃得下，比让
+    entrypoint 去探测文件再拼不同的参数要可靠 —— 后者那段探测逻辑只有在部署现场才
+    第一次运行。
+
+    ⚠️ 用户**显式**给了 `-c` 指向一个不存在的文件时，只打一行提示就静默走环境变量是
+    危险的（打错一个字母 = 全部配置被忽略、跑在一套默认值上）。所以那种情况下这行
+    提示写得很直白，而"根本没给 -c"是完全正常的路径、不提示。
+    """
+    if cfg_path:
+        path = Path(cfg_path)
+        if path.is_file():
+            return ServerConfig.load(path)
+        print(
+            f"[photoar] 配置文件 {path} 不存在，改用环境变量（PHOTOAR_ROOTS / "
+            f"PHOTOAR_DATA / …）。如果你本来是想读那个文件，检查一下路径和挂载。",
+            flush=True,
+        )
+    return ServerConfig.from_env()
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -219,7 +240,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     httpd = make_server(cfg, srv)
     print(
         f"[photoar] 监听 {cfg.bind}:{cfg.port}｜照片 {len(srv.library)} 张｜"
-        f"白名单根 {len(srv.roots.roots)} 个｜media 策略 {list(cfg.media_strategies)}",
+        f"后端 {srv.library.backend.name}"
+        + (f"（配置要的是 {srv.backend_requested}，已降级）" if srv.backend_error else "")
+        + f"｜白名单根 {len(srv.roots.roots)} 个｜"
+        f"media 策略 {list(cfg.media_strategies)}",
         flush=True,
     )
     try:
@@ -235,13 +259,46 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_reindex(args: argparse.Namespace) -> int:
     """重建倒排索引。换了词汇树、或 words.bin 疑似损坏时用。"""
     cfg = _load(args.config)
-    lib = PhotoLibrary(cfg.library_dir, Vocab.load(cfg.vocab_path))
+    lib = app.open_library_cli(cfg)
     t0 = time.perf_counter()
     lib.reindex(rebuild_words=args.rebuild_words)
     print(
-        f"[photoar] 重建完成：{len(lib)} 张，"
+        f"[photoar] 重建完成：{len(lib)} 张（{lib.backend.name} 库 {lib.root}），"
         f"{(time.perf_counter() - t0):.1f}s"
         + ("（含重新量化词序列）" if args.rebuild_words else ""),
+        flush=True,
+    )
+    return 0
+
+
+def cmd_build_vocab(args: argparse.Namespace) -> int:
+    """用库里已有的描述子训一份词表，存到 `<models>/<后端的词表文件名>`，然后重建索引。
+
+    为什么这条命令必须存在（而不是"在开发机上 `photoar build` 训好再拷进去"）：那条路
+    要求用户在部署**之前**就有一批照片、一台装了 Python 的机器、和一次 scp。一键部署
+    的前提是这些都不需要 —— 服务先用空词表跑起来（全量扫描，结果正确），入库几十张
+    之后在同一台机器上一条命令训出词表。而且用库里的描述子训出来的词表**天然匹配这批
+    照片的内容分布**，比拿别人的照片训的更合身。
+
+    ⚠️ 这条命令要与服务**分开**跑（`docker compose exec`），而不是在服务运行时。两个
+    进程各有一份 `PhotoLibrary`，写锁是进程内的 `threading.RLock`，管不住另一个进程
+    —— 服务那边正在入库时跑这条命令，`words.bin` 会被两边同时重写。要在服务跑着的时候
+    训就用 `POST /v1/admin/rebuild-vocab`（同一个进程，同一把锁）。
+    """
+    cfg = _load(args.config)
+    lib = app.open_library_cli(cfg)
+    out = cfg.vocab_path_for(lib.backend.name, lib.backend.vocab_file)
+    try:
+        r = lib.train_vocab(out, max_descriptors=args.max_descriptors)
+    except EmptyLibrary as exc:
+        print(f"[photoar] 训不了：{exc}", file=sys.stderr)
+        return 2
+    print(
+        f"[photoar] 词表训好了：{r.path}\n"
+        f"[photoar]   后端 {lib.backend.name}｜{r.n_photos} 张照片｜"
+        f"{r.n_descriptors} 条描述子｜{r.n_words} 个词｜{r.elapsed_ms / 1000:.1f}s\n"
+        f"[photoar]   已顺带重算全库词序列并重建倒排索引。"
+        f"**要重启服务**才会用上它（词表是启动时加载的）。",
         flush=True,
     )
     return 0
@@ -297,8 +354,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="photoar-server", description="照片 AR 服务端（spec §5）"
     )
+    # default=None 而不是 "config.json"：`_load` 拿 None 才能区分"用户没给"
+    # （正常走环境变量，不该有任何提示）与"用户给了一个不存在的路径"（要提示，
+    # 那多半是路径打错或卷没挂上）。
     parser.add_argument(
-        "-c", "--config", default="config.json", help="配置文件路径"
+        "-c",
+        "--config",
+        default=None,
+        help="配置文件路径。不给、或文件不存在时，全部从环境变量读（PHOTOAR_ROOTS 等）",
     )
     sub = parser.add_subparsers(dest="cmd")
 
@@ -312,6 +375,18 @@ def main(argv: list[str] | None = None) -> int:
         help="连词序列一起重算（换了词汇树时必须加）",
     )
     p.set_defaults(func=cmd_reindex)
+
+    p = sub.add_parser("build-vocab", help="用库里已有的描述子训词表并重建索引")
+    p.add_argument(
+        "--max-descriptors",
+        type=int,
+        default=library.MAX_TRAIN_DESCRIPTORS,
+        help=(
+            f"最多喂进去多少条描述子（默认 {library.MAX_TRAIN_DESCRIPTORS}）。"
+            f"调小省内存，代价是词表区分度下降"
+        ),
+    )
+    p.set_defaults(func=cmd_build_vocab)
 
     p = sub.add_parser("verify", help="校验素材完整性")
     p.set_defaults(func=cmd_verify)
@@ -327,6 +402,11 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except FileNotFoundError as exc:
         print(f"[photoar] 启动失败：{exc}", file=sys.stderr)
+        return 2
+    except ConfigError as exc:
+        # 单独接住而不是让它冒成一个 traceback：配置错是**用户**能修的，而一个
+        # 二十行的栈会把那句中文说明埋在最下面，容器日志里第一屏还看不到。
+        print(f"[photoar] 配置不对，起不来：{exc}", file=sys.stderr)
         return 2
 
 

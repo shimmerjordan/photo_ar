@@ -21,6 +21,16 @@
 第 3 步与第 5、6 步的顺序是刻意的：质量分是一次 `arcoreimg` 调用（快），自匹配分
 要 20 次 ORB 提取 + RANSAC（约 1 秒），近重复闸门还要对 50 个候选各做两次
 RANSAC。先用便宜的检查把明显不合格的照片挡掉。
+
+第 3 步与第 6 步各自有一个能在管理台上关掉的开关（`appconfig` 的
+`ingest.quality_gate` / `ingest.dedup_gate`），由 HTTP 层从热配置读出来传进
+`ingest_photo`。**它们默认必须是开的**，关掉的后果分别写在下面那两个参数的注释
+里 —— 尤其 dedup 那个，关掉不是"宽松一点"，是让两张照片双双永久扫不出来。
+
+阈值一律作为参数传进来、不在这里读 `appconfig`：本模块也被 CLI 的批量入库路径
+调（那条路径没有 AppConfig 实例），而且"谁决定阈值"只该有一处 —— 让入库自己去
+读配置的话，同一次入库的质量分下限和 HTTP 层刚校验过的那个值可能来自两次不同
+的缓存快照。
 """
 
 import time
@@ -30,7 +40,6 @@ from pathlib import Path
 import cv2
 
 from .. import dedup, quality, synth, transcode
-from ..features import extract
 from . import fsbrowser
 from .config import ServerConfig
 from .db import Catalog, new_id
@@ -112,6 +121,21 @@ def ingest_photo(
     video_path: Path | None,
     print_width_m: float,
     title: str | None,
+    # ⚠️ 关掉它照片能入库，但 ARCore 跟踪会明显抖动 —— 而这个后果要等到有人举着
+    # 手机扫的时候才看得到，那时早已忘了关过这个开关。关掉只关**判定**，仍然会跑
+    # 一次 `arcoreimg eval-img` 把分数记进库（见下面那段），也仍然生成 .imgdb。
+    quality_gate: bool = True,
+    min_quality_score: int = quality.MIN_QUALITY_SCORE,
+    # ⚠️ 关掉它的后果是 Phase 0 的第一条硬结论，不是"宽松一点"：两张近重复照片都
+    # 入库之后，识别时它们会互相触发 ratio 检验判 ambiguous，**两张都永久扫不
+    # 出来**，而用户看到的现象是"识别器坏了"，无从追查（见模块 docstring 第 6 步
+    # 与 `library.conflicts`）。只在"我确定这两张不是同一张"或"临时排查闸门本身
+    # 是不是误拦"时关，关完记得开回来。
+    dedup_gate: bool = True,
+    # 视频怎么贴进照片区域。None = 这一列留 NULL，读取侧回退到全局默认
+    # （见 `db._PHOTO_V2_COLUMNS`）。HTTP 层会把当时的全局默认显式传进来，理由
+    # 写在 `app.Server._create_photo` 里。
+    fit_mode: str | None = None,
 ) -> IngestResult:
     t0 = time.perf_counter()
 
@@ -121,9 +145,14 @@ def ingest_photo(
         raise IngestRejected(
             415, "ref_not_image", f"参考图不是支持的图片格式：{ref_path.suffix}"
         )
-    if not print_width_m > 0:
+    # 0 = 物理宽度未知，合法（交给 ARCore 自己量，理由见 `app._create_photo`）。
+    # 负数仍然拒：它不是"未知"，是算错了或单位搞反了，静默当未知处理会把一个真实
+    # 的 bug 藏起来。
+    if print_width_m < 0:
         raise IngestRejected(
-            400, "bad_print_width", f"打印宽度必须为正数（米），收到 {print_width_m!r}"
+            400,
+            "bad_print_width",
+            f"打印宽度不能是负数（米），收到 {print_width_m!r}。未知就给 0。",
         )
 
     existing = catalog.get_asset_by_path(str(ref_path))
@@ -143,66 +172,108 @@ def ingest_photo(
         raise IngestRejected(415, "ref_undecodable", str(exc)) from exc
 
     # --- 质量分（便宜，先做）---
+    #
+    # `quality_gate=False` 只关掉**判定**，eval-img 照样要跑。两个理由：
+    # `photo.quality_score` 是 NOT NULL 的，得有个真数字；而且管理台上"这张多少分"
+    # 正是用户判断"要不要换一张打印"的唯一依据 —— 闸门关着时更需要看得到分数。
+    # 想省掉这次调用的话就得往那一列写个 0 或 -1，那是往库里写假事实。
     try:
         score = quality.eval_img(ref_path, arcoreimg=cfg.arcoreimg)
     except quality.ArcoreimgMissing as exc:
+        # 与闸门无关：工具本身不在，后面 build-db 一样跑不了。
         raise IngestRejected(503, "arcoreimg_missing", str(exc)) from exc
     except quality.NotEnoughKeypoints as exc:
         # 连关键点都提不够 —— 就是 quality_too_low 最下面那一档，**不是**服务端故障。
         # 用同一个 code 而不是新开一个：对调用方和用户，该做的事一模一样（换图），
         # 多一个分支只会多一处要各自处理的地方。score=0 表达「连分都没算出来」。
         # 实测这类照片占 `clean` 数据集的 2.1%，放量入库时不是个别现象。
-        raise IngestRejected(
-            422,
-            "quality_too_low",
-            f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
-            score=0,
-            minScore=quality.MIN_QUALITY_SCORE,
-            suggestion=_LOW_QUALITY_SUGGESTION,
-        ) from exc
-    if score < quality.MIN_QUALITY_SCORE:
+        if quality_gate:
+            raise IngestRejected(
+                422,
+                "quality_too_low",
+                f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
+                score=0,
+                minScore=min_quality_score,
+                suggestion=_LOW_QUALITY_SUGGESTION,
+            ) from exc
+        # 闸门关着：记 0 分继续走，不在这里替用户判"这张不行"。这张图大概率会在
+        # `build-db` 上失败，那时报的是 build-db 自己的错 —— 比在这里把它归到
+        # "质量不达标"更接近事实，而闸门关着的人要的正是"别拿质量拦我"。
+        score = 0
+    if quality_gate and score < min_quality_score:
         raise IngestRejected(
             422,
             "quality_too_low",
             f"这张照片的 AR 跟踪质量分只有 {score}，低于 "
-            f"{quality.MIN_QUALITY_SCORE}，跟踪会明显抖动",
+            f"{min_quality_score}，跟踪会明显抖动",
             score=score,
-            minScore=quality.MIN_QUALITY_SCORE,
+            minScore=min_quality_score,
             suggestion=_LOW_QUALITY_SUGGESTION,
         )
 
-    features = extract(img)
+    # 提特征、配对、算自匹配分都必须走**库自己那个后端**，不能用模块级的
+    # `features.extract`（那是 ORB）。用错的后果不是"稍微不准"：XFeat 的库 slot 是
+    # 512×64 float32，把 300×32 的 uint8 描述子塞进去会在
+    # `descstore.encode_slot` 的最后一步抛一句 numpy 广播错误 —— 而那句错误里没有
+    # 任何字提到"后端"，排查时会先怀疑照片、再怀疑 opencv。
+    backend = library.backend
+    features = backend.extract(img)
     if len(features) == 0:
         raise IngestRejected(
-            422, "no_features", "这张照片提不出任何 ORB 特征，无法识别"
+            422,
+            "no_features",
+            f"这张照片提不出任何 {backend.name} 特征，无法识别",
         )
 
     # --- 自匹配分 + 近重复闸门（贵，放在质量分之后）---
+    #
+    # 自匹配分**无论闸门开关都要算**，虽然它是这条流水线上最贵的一步（20 次 ORB
+    # 提取 + RANSAC，约 1 秒）：它是**别人**入库时的分母（`library.conflicts` 的
+    # `known_self_scores` 从 catalog 取这一列）。跟着闸门一起跳过的话，这一行会
+    # 写进一个 0 分，而 conflicts 的判据是 `min(s_new, s_exist) < ratio * m` ——
+    # 0 恒小于任何值，于是以后每一张与它沾点关系的新照片都会被判成冲突。
+    # 也就是说"关掉去重闸门"会变成"以后入库全被拦住"，而拦人的是一个已经关掉的开关。
     samples = synth.generate(img, cfg.self_score_samples, seed=0)
-    self_score = dedup.self_score(features, [extract(q) for q, _ in samples])
+    self_score = dedup.self_score(
+        features,
+        # 这里的合成样本是"查询"语义，但**故意不用 `backend.extract_query`**
+        # （查询侧提 4000 个特征，入库侧 300）。自匹配分是去重判据
+        # `min(s_new, s_exist) < ratio * m` 的分子，而 `s_exist` 是老照片入库时
+        # 按 300 特征算出来的、存在 catalog 里的历史值。这一边换成 4000 会让新照片
+        # 的分数系统性地高出一截，两个量纲一比 —— 闸门整体失准，且不报错、不留日志。
+        # 要改的话得连着把全库的 self_score 重算一遍，那是一次数据迁移，不是改一行。
+        [backend.extract(q) for q, _ in samples],
+        # 配对函数也得跟着后端换：ORB 是 Hamming + crossCheck，XFeat 是余弦互近邻。
+        # 拿 `verify_pair` 去比 float32 描述子，cv2 的 BFMatcher(NORM_HAMMING) 会
+        # 直接抛（dtype 不对），但那是运气好 —— 真正要防的是自匹配分被算成一个
+        # **另一个量纲**的数字，因为它是去重判据 `min(s_new,s_exist) < ratio*m`
+        # 的分子，量纲错了闸门就整体失准，而不会报错。
+        verify_fn=backend.verify,
+    )
 
-    known = {
-        str(p["id"]): int(p["self_score"])
-        for p in catalog.list_photos()
-    }
-    conflicts: list[Conflict] = library.conflicts(features, self_score, known)
-    if conflicts:
-        raise IngestRejected(
-            409,
-            "near_duplicate",
-            "库里已经有和这张几乎相同的照片。两张都入库会让它们互相判"
-            "ambiguous，结果是**两张都永久识别不出来**。",
-            selfScore=self_score,
-            conflicts=[
-                {
-                    "photoId": c.photo_id,
-                    "inliers": c.inliers,
-                    "selfScore": c.self_score,
-                    "title": (catalog.get_photo(c.photo_id) or {}).get("title"),
-                }
-                for c in conflicts
-            ],
-        )
+    if dedup_gate:
+        known = {
+            str(p["id"]): int(p["self_score"])
+            for p in catalog.list_photos()
+        }
+        conflicts: list[Conflict] = library.conflicts(features, self_score, known)
+        if conflicts:
+            raise IngestRejected(
+                409,
+                "near_duplicate",
+                "库里已经有和这张几乎相同的照片。两张都入库会让它们互相判"
+                "ambiguous，结果是**两张都永久识别不出来**。",
+                selfScore=self_score,
+                conflicts=[
+                    {
+                        "photoId": c.photo_id,
+                        "inliers": c.inliers,
+                        "selfScore": c.self_score,
+                        "title": (catalog.get_photo(c.photo_id) or {}).get("title"),
+                    }
+                    for c in conflicts
+                ],
+            )
 
     photo_id = new_id()
 
@@ -284,6 +355,7 @@ def ingest_photo(
         imgdb_bytes=imgdb_bytes,
         thumb_path=str(thumb_path),
         self_score=self_score,
+        fit_mode=fit_mode,
     )
     # catalog 先写、library 后写是刻意的：反过来一旦 catalog 写失败，识别库里
     # 就有一个查得到却在 catalog 里不存在的 photo_id，识别命中后所有取流接口

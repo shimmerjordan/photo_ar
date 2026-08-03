@@ -8,6 +8,18 @@ spec §14.4 要求"完整入库→识别→解析→取流闭环，不依赖真�
 
 HTTP 层不起端口：`app.Server.handle(Request) -> Response` 是纯函数式的，测试
 直接构造 Request。真实 socket 路径由 `test_httpd.py` 单独用一个真端口验证。
+
+## 凭证
+
+默认凭证仍然是**运维 token**（`AUTH`），也就是 `PHOTOAR_TOKEN` 那条路 —— 它换来
+一个 `role=admin` 的 Principal，所以既有的测试一行不改就仍然测的是 admin 视角。
+这不是为了少改测试：那条路是 `tools/batch_ingest.py` 与 docker 健康检查在用的，
+让绝大多数接口测试都跑在它上面，正好把"运维凭证仍然全权有效"这件事持续钉住。
+
+要按具体用户测（会话 token、cookie、viewer 的授权范围）用 `Env.login()` /
+`Env.admin()` / `Env.viewer()`，它们返回一个 `Creds`，传给 `request(as_=...)`。
+每个测试各自 `post_json("/v1/auth/login", ...)` 一遍的话，那串 `{"name":...}` 与
+"响应里 token 字段叫什么"会散在几十处，改一次得改几十次。
 """
 
 import io
@@ -28,6 +40,42 @@ from photoar.server.config import ServerConfig
 
 TOKEN = "test-token-0123456789"
 AUTH = {"authorization": f"Bearer {TOKEN}"}
+
+# 引导管理员。名字与口令都固定，测试才能真的登录进去（口令不给的话
+# `Server._bootstrap_admin` 会生成一个随机的并只打印在日志里，测试拿不到）。
+ADMIN_NAME = "管理员"
+ADMIN_PASSWORD = "bootstrap-pw-0123"
+
+# `make_env(vocab_path=...)` 的哨兵。
+#
+# 不能用 None 当"没传"的默认值：None 在这里是一个**有意义的取值**（"不要词表"，
+# 用来测全新部署）。用 None 当默认的话，那两种情况就分不开了 —— 而它们的行为
+# 完全相反（一个训词表落盘，一个刻意不落）。
+_KEEP = object()
+
+
+@dataclass(frozen=True)
+class Creds:
+    """一次登录的产物。
+
+    同时给出 Bearer 与 cookie 两种带法，因为服务端必须两条路都认（App 用头、
+    网页里的 `<img>`/`<video>` 只能用 cookie），而"两条都认"这件事只有在测试能
+    分别构造出这两种请求时才钉得住。
+    """
+
+    token: str
+    user_id: str | None
+    role: str
+    name: str
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """默认带法：Bearer 头。"""
+        return {"authorization": f"Bearer {self.token}"}
+
+    @property
+    def cookie_headers(self) -> dict[str, str]:
+        return {"cookie": f"{app.SESSION_COOKIE}={self.token}"}
 
 
 # ---- 假二进制 ----
@@ -151,8 +199,20 @@ class Env:
         body: bytes = b"",
         headers: dict[str, str] | None = None,
         auth: bool = True,
+        as_: Creds | None = None,
+        cookie: bool = False,
     ) -> app.Response:
-        h = dict(AUTH) if auth else {}
+        """`as_` 给了就用那个人的会话凭证；否则 `auth=True` 用运维 token。
+
+        `cookie=True` 把 `as_` 的凭证改成 cookie 带法。单独一个开关而不是让调用方
+        自己拼 header，是为了让"这条测试测的是 cookie 那条路"在测试名之外还能从
+        参数上看出来。
+        """
+        if as_ is not None:
+            h = dict(as_.cookie_headers if cookie else as_.headers)
+        else:
+            assert not cookie, "cookie=True 需要配 as_（cookie 里放的是会话 token）"
+            h = dict(AUTH) if auth else {}
         h.update({k.lower(): v for k, v in (headers or {}).items()})
         return self.srv.handle(
             app.Request(
@@ -176,6 +236,86 @@ class Env:
             headers={"content-type": "application/json"},
             **kw,
         )
+
+    def patch_json(self, path: str, obj: dict, **kw) -> app.Response:
+        return self.request(
+            "PATCH",
+            path,
+            body=json.dumps(obj).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            **kw,
+        )
+
+    def put_json(self, path: str, obj: dict, **kw) -> app.Response:
+        return self.request(
+            "PUT",
+            path,
+            body=json.dumps(obj).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            **kw,
+        )
+
+    # -- 凭证 --
+
+    def login(self, name: str, password: str | None = None, **kw) -> Creds:
+        """真的走一遍 `POST /v1/auth/login`，不是在库里伪造一行 session。
+
+        伪造 session 能省掉一次 scrypt（约 50ms），但那样"登录"这条路径就只被专门
+        测登录的那几条覆盖，其余用会话凭证的测试全都跑在一个测试自己造出来的状态
+        上 —— 而登录响应的形状（token 字段名、cookie 属性）正是最容易在改动中悄悄
+        变掉的东西。
+        """
+        doc: dict = {"name": name}
+        if password is not None:
+            doc["password"] = password
+        resp = self.post_json("/v1/auth/login", doc, auth=False, **kw)
+        assert resp.status == 200, self.body_json(resp)
+        body = self.body_json(resp)
+        return Creds(
+            token=body["token"],
+            user_id=body["userId"],
+            role=body["role"],
+            name=body["name"],
+        )
+
+    def admin(self) -> Creds:
+        """引导管理员的一份**真实会话**凭证（区别于默认的运维 token）。"""
+        return self.login(ADMIN_NAME, ADMIN_PASSWORD)
+
+    def admin_cookie(self) -> str:
+        """引导管理员登录一次，返回原始的 `Set-Cookie` 头（测 cookie 属性用）。"""
+        resp = self.post_json(
+            "/v1/auth/login",
+            {"name": ADMIN_NAME, "password": ADMIN_PASSWORD},
+            auth=False,
+        )
+        assert resp.status == 200, self.body_json(resp)
+        return resp.headers["Set-Cookie"]
+
+    def viewer(
+        self,
+        name: str = "小明",
+        *,
+        grant_all: bool = False,
+        photo_ids: tuple[str, ...] | list[str] = (),
+    ) -> Creds:
+        """建一个 viewer、发好授权、登录，一步到位。
+
+        建号走的是管理接口（用运维 token 调），不是直接 `catalog.create_user` ——
+        那样会绕过 `_check_password_for_role` 之类的策略，测出来的 viewer 可能是
+        管理接口根本建不出来的形状。
+        """
+        resp = self.post_json(
+            "/v1/admin/users", {"name": name, "role": "viewer", "grantAll": grant_all}
+        )
+        assert resp.status == 201, self.body_json(resp)
+        uid = self.body_json(resp)["id"]
+        if photo_ids:
+            r = self.put_json(
+                f"/v1/admin/users/{uid}/grants", {"photoIds": list(photo_ids)}
+            )
+            assert r.status == 200, self.body_json(r)
+        return self.login(name)
 
     def post_frame(
         self, path: str, jpeg: bytes, *, headers: dict[str, str] | None = None, **kw
@@ -236,6 +376,17 @@ def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg
         media: dict | None = None,
         upload_dir_root: str | None = None,
         vocab_seeds: range = range(8),
+        cookie_secure: bool = False,
+        admin_password: str = ADMIN_PASSWORD,
+        # 下面两个是"一键部署"那条路要测的状态，默认值保持既有行为不变。
+        #
+        # `vocab_path`：给 None = **完全不写这个字段、也不落盘词表**，模拟全新部署
+        # （词表是用用户自己的照片训的，库空着的时候它不可能存在）。给一个字符串就是
+        # 显式指定路径。默认（省略）走原来那条"训一份 ORB 词表存盘"的路。
+        vocab_path: str | None | object = _KEEP,
+        # `token`：给 "" = 没配运维凭证。放宽"token 必填"之后这是一个合法状态，
+        # 而它必须**不能**变成一把万能钥匙。
+        token: str = TOKEN,
     ) -> Env:
         nas = tmp_path / "nas"
         (nas / "photos").mkdir(parents=True)
@@ -247,19 +398,23 @@ def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg
         # 词汇树：与 tests/test_recognizer.py 同一套参数（branching=6, depth=3），
         # 必须用真实 ORB 描述子训练——均匀随机描述子的成对距离过于集中，量化
         # 结果不稳定（见 test_vocab.py 的对照测试）。
-        descs = [
-            F.extract(textured_image(seed=1000 + s, w=900, h=650)).desc
-            for s in vocab_seeds
-        ]
-        voc = V.train(np.vstack(descs), branching=6, depth=3, seed=0)
-        vocab_path = tmp_path / "vocab.npz"
-        voc.save(vocab_path)
+        if vocab_path is _KEEP:
+            descs = [
+                F.extract(textured_image(seed=1000 + s, w=900, h=650)).desc
+                for s in vocab_seeds
+            ]
+            voc = V.train(np.vstack(descs), branching=6, depth=3, seed=0)
+            resolved_vocab: str | None = str(tmp_path / "vocab.npz")
+            voc.save(resolved_vocab)
+        else:
+            # None（或显式给的路径）时**一份词表都不训**：训了再不用它，测出来的
+            # "没有词表也能跑"就只是"没有引用那个变量"，而磁盘上其实躺着一份。
+            resolved_vocab = vocab_path  # type: ignore[assignment]
 
         doc = {
-            "token": TOKEN,
+            "token": token,
             "roots": {"nas": str(nas)},
             "data_dir": str(tmp_path / "data"),
-            "vocab_path": str(vocab_path),
             "arcoreimg": fake_arcoreimg(score=quality_score),
             "ffprobe": fake_ffprobe(),
             "ffmpeg": fake_ffmpeg(),
@@ -274,7 +429,14 @@ def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg
             # 硬编那条路由 tests/test_transcode.py 显式 monkeypatch 后单独测。
             "vaapi_device": str(tmp_path / "no-such-render-node"),
             "self_score_samples": self_score_samples,
+            # 固定引导管理员，测试才登得进去。留空的话 `_bootstrap_admin` 会生成一个
+            # 随机口令、只打印在日志里 —— 那正是生产环境该有的行为，但测试拿不到它。
+            "admin_name": ADMIN_NAME,
+            "admin_password": admin_password,
+            "cookie_secure": cookie_secure,
         }
+        if resolved_vocab is not None:
+            doc["vocab_path"] = resolved_vocab
         if media is not None:
             doc["media"] = media
         if upload_dir_root is not None:

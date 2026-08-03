@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<!--
+  photoar 管理台。
+
+  这个目录由 `app.Server._route_webui` 提供，路由是 `GET /admin` 与
+  `GET /admin/<file>`，**免鉴权**（页面本身就是输口令的那个界面，要求先鉴权才能
+  拿到它等于要求先登录才能看到登录框）。页面里所有 `/v1/admin/*` 调用都要鉴权。
+
+  能加进这个目录的文件名限于 `[A-Za-z0-9_-][A-Za-z0-9._-]*`（不能以点开头），
+  且只有一层 —— 不支持子目录。理由见 `_route_webui` 的 docstring。
+  所以这里是三个平级文件：index.html / app.css / app.js。
+
+  **零依赖**：没有 CDN、没有构建、没有框架。原生 DOM + fetch。理由不是洁癖 ——
+  这个服务的部署形态是家里 NAS 上的一个容器，可能跑在只有内网的环境里，任何
+  外部 CDN 引用都会变成「管理台在断网时打不开」。
+
+  结构上刻意只有一个 HTML 文件加一份 JS：页面上的每一块内容都要靠 fetch 才有
+  东西可显示，所以这里放的是骨架和对话框，列表与表单由 app.js 建 DOM。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 移动端等宽：NAS 管理经常是站在走廊里拿手机做的 -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>photoar 管理台</title>
+<!-- 绝对路径，不能写成 href="app.css"：这个页面在 `/admin` 和 `/admin/` 两个 URL 上
+     都能打开（后端两个都给首页），而在**没有**尾随斜杠的那个上，相对路径的基准是
+     `/`，于是 "app.css" 会被解析成 `/app.css` → 404 → 整页无样式无脚本。
+     那是一个只在浏览器里看得见、curl 单独取文件时完全看不出来的失败。 -->
+<link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+
+<!-- ---------- 登录 ---------- -->
+<!-- 初始就显示登录界面：进来时还不知道有没有会话（cookie 是 HttpOnly，脚本读不
+     到），app.js 会先探一次 /v1/auth/me 再决定显示哪一屏。先显示登录框而不是
+     空白，是因为「没登录」是绝大多数情况。 -->
+<div class="gate" id="gate">
+  <form id="login-form" autocomplete="on">
+    <h1>photoar 管理台</h1>
+    <p class="sub">照片授权、账号与识别参数。只有管理员能用。</p>
+
+    <div class="formerr" id="login-err" role="alert" hidden></div>
+
+    <div class="field">
+      <label for="login-name">名字</label>
+      <input id="login-name" name="username" type="text" autocomplete="username"
+             autocapitalize="none" spellcheck="false" required>
+    </div>
+
+    <div class="field">
+      <label for="login-pw">口令</label>
+      <input id="login-pw" name="password" type="password" autocomplete="current-password">
+      <span class="help">访客留空，管理员必填。</span>
+    </div>
+
+    <button class="btn primary" id="login-go" type="submit" style="width:100%">登录</button>
+  </form>
+</div>
+
+<!-- ---------- 非管理员 ---------- -->
+<!-- 访客也能通过 /v1/auth/login 登录成功（那个接口不分角色），但管理台的每一个
+     接口都是 admin only。与其让他登进来然后面对四个页签全是 403，不如在这里
+     说清楚。 -->
+<div class="gate" id="denied" hidden>
+  <div>
+    <h1 style="margin:0 0 6px;font-size:1.25rem">这个账号不能用管理台</h1>
+    <p class="muted" style="margin:0 0 18px;max-width:44ch">
+      管理台只有管理员能用。访客账号请在手机 App 里扫照片看视频 —— 能看哪些照片由
+      管理员授权。
+    </p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <span class="tag" id="denied-who"></span>
+      <button class="btn" id="denied-out" type="button">换个账号登录</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------- 主界面 ---------- -->
+<div id="app" hidden>
+  <div class="chrome">
+    <div class="topbar">
+      <h1 class="brand">photoar 管理台</h1>
+      <div class="who">
+        <span class="tag ok" id="me-role"></span>
+        <span class="name" id="me-name"></span>
+        <button class="btn sm" id="logout" type="button">登出</button>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="管理台分区">
+      <button role="tab" type="button" data-tab="users" id="tab-users"
+              aria-controls="p-users" aria-selected="true">用户</button>
+      <button role="tab" type="button" data-tab="grants" id="tab-grants"
+              aria-controls="p-grants" aria-selected="false">授权</button>
+      <button role="tab" type="button" data-tab="config" id="tab-config"
+              aria-controls="p-config" aria-selected="false">配置</button>
+      <button role="tab" type="button" data-tab="photos" id="tab-photos"
+              aria-controls="p-photos" aria-selected="false">照片</button>
+    </nav>
+  </div>
+
+  <main>
+    <!-- 用户 -->
+    <section class="panel" id="p-users" role="tabpanel" aria-labelledby="tab-users" tabindex="-1">
+      <div class="head">
+        <div>
+          <h2>用户</h2>
+          <p class="note">账号只能在这里建 —— 服务端不会自动建号。</p>
+        </div>
+        <div class="right">
+          <button class="btn sm" type="button" data-reload="users">刷新</button>
+          <button class="btn sm primary" type="button" id="new-user">新建用户</button>
+        </div>
+      </div>
+      <div id="users-body"></div>
+    </section>
+
+    <!-- 授权 -->
+    <section class="panel" id="p-grants" role="tabpanel" aria-labelledby="tab-grants" tabindex="-1" hidden>
+      <div class="head">
+        <div>
+          <h2>授权</h2>
+          <p class="note">选一个人，勾出他能看到的照片。整体替换，不是追加。</p>
+        </div>
+        <div class="right">
+          <button class="btn sm" type="button" data-reload="grants">刷新</button>
+        </div>
+      </div>
+      <div id="grants-body"></div>
+    </section>
+
+    <!-- 配置 -->
+    <section class="panel" id="p-config" role="tabpanel" aria-labelledby="tab-config" tabindex="-1" hidden>
+      <div class="head">
+        <div>
+          <h2>配置</h2>
+          <p class="note">识别阈值、入库闸门、会话时长。字段表由服务端给出。</p>
+        </div>
+        <div class="right">
+          <button class="btn sm" type="button" data-reload="config">刷新</button>
+        </div>
+      </div>
+      <div id="config-body"></div>
+    </section>
+
+    <!-- 照片 -->
+    <section class="panel" id="p-photos" role="tabpanel" aria-labelledby="tab-photos" tabindex="-1" hidden>
+      <div class="head">
+        <div>
+          <h2>照片</h2>
+          <p class="note">只读。入库走 App 与批量脚本，管理台不做上传。</p>
+        </div>
+        <div class="right">
+          <button class="btn sm" type="button" data-reload="photos">刷新</button>
+        </div>
+      </div>
+      <div id="photos-body"></div>
+    </section>
+  </main>
+</div>
+
+<!-- 提示条。成功的会自己消失，失败的留着等人读完 —— 后端返回的中文 message
+     就在里面，自动消失等于把它吞掉。 -->
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<!-- ---------- 用户对话框（新建 / 编辑共用一个） ---------- -->
+<dialog id="dlg-user" aria-labelledby="dlg-user-title">
+  <form id="dlg-user-form">
+    <h3 id="dlg-user-title">新建用户</h3>
+    <p class="lead" id="dlg-user-lead"></p>
+
+    <div class="formerr" id="dlg-user-err" role="alert" hidden></div>
+    <div class="selfnote" id="dlg-user-self" hidden></div>
+
+    <div class="field">
+      <label for="u-name">名字</label>
+      <input id="u-name" type="text" autocapitalize="none" spellcheck="false" required>
+      <span class="help">登录时输的就是这个名字，大小写和空格会被规范化。</span>
+      <span class="err" id="u-name-err"></span>
+    </div>
+
+    <div class="field">
+      <label for="u-role">角色</label>
+      <select id="u-role"></select>
+      <span class="help" id="u-role-help"></span>
+    </div>
+
+    <div class="field">
+      <label for="u-pw">口令</label>
+      <input id="u-pw" type="password" autocomplete="new-password">
+      <span class="help" id="u-pw-help"></span>
+      <span class="err" id="u-pw-err"></span>
+    </div>
+
+    <div class="field" id="u-disabled-field">
+      <label class="sw">
+        <input id="u-disabled" type="checkbox">
+        <span class="track"></span>
+        <span class="txt">停用这个账号</span>
+      </label>
+      <span class="help">停用会立刻踢掉他所有设备上的登录。想彻底移除才用删除。</span>
+    </div>
+
+    <div class="foot">
+      <button class="btn" type="button" data-close>取消</button>
+      <button class="btn primary" type="submit" id="u-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ---------- 危险操作二次确认 ---------- -->
+<dialog id="dlg-confirm" aria-labelledby="dlg-confirm-title">
+  <div class="pad">
+    <h3 id="dlg-confirm-title">确认</h3>
+    <p class="lead" id="dlg-confirm-lead"></p>
+    <ul id="dlg-confirm-list"></ul>
+    <div class="foot">
+      <button class="btn" type="button" id="dlg-confirm-no">取消</button>
+      <button class="btn danger-fill" type="button" id="dlg-confirm-yes">确认</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- 同上：绝对路径。相对路径在 `/admin`（无尾随斜杠）上会去取 `/app.js`。 -->
+<script src="/admin/app.js" defer></script>
+</body>
+</html>

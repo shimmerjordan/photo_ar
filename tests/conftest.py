@@ -28,7 +28,24 @@ def fake_arcoreimg(tmp_path):
         exit_code: int = 0,
         expected_width_m: float | None = None,
         stderr: str = "boom",
+        expected_targets: int | None = None,
+        expect_no_width: bool = False,
     ):
+        # expect_no_width：清单里**每一行都不许有第三列**。
+        #
+        # 需要它的理由和上面 expected_width_m 那段（I6）一样：宽度未知时的正确行为是
+        # 省略宽度列，而这个 fake 对 2 列和 3 列一律放行，所以"以为省略了、其实写了个
+        # 0.000000"的实现能让测试通过。而那个 bug 的后果很重：ARCore 会把 0 当真，
+        # 按 0 米宽算位姿，端上视频彻底贴不上，而服务端一切正常。
+        assert not (expect_no_width and expected_width_m is not None), (
+            "expect_no_width 与 expected_width_m 互斥：同时给等于要求"
+            "同一列既不存在又等于某个值"
+        )
+        # expected_targets：清单里必须正好有这么多行。多目标建库
+        # （quality.build_multi_target_db，整库预建那条路）唯一能被端到端验证的
+        # 就是"一行一个目标真的写进去了"—— 少了这项检查，把一串目标误写成一行
+        # （比如忘了换行、或者只写了最后一个）的实现也能让测试通过，而那个 .imgdb
+        # 里只有一个目标，表现是"大部分照片在端上扫不出来"。
         # stderr 可指定：真 arcoreimg 用退出码 1 同时表示「这张图不行」和
         # 「工具自己坏了」，只能靠文案分（见 quality.NotEnoughKeypoints），
         # 所以测试必须能造出那句话。
@@ -46,6 +63,8 @@ def fake_arcoreimg(tmp_path):
                 sys.stderr.write({stderr!r} + "\\n"); sys.exit({exit_code})
 
             EXPECTED_WIDTH_M = {expected_width_m!r}
+            EXPECTED_TARGETS = {expected_targets!r}
+            EXPECT_NO_WIDTH = {expect_no_width!r}
 
             def opt(prefix):
                 for i, a in enumerate(argv):
@@ -65,14 +84,20 @@ def fake_arcoreimg(tmp_path):
                 if not listing or not out:
                     sys.stderr.write("missing required option\\n"); sys.exit(2)
                 # 真实工具会因清单格式错误而失败；这里也校验，否则测试测不到格式
+                seen = 0
                 for line in pathlib.Path(listing).read_text(encoding="utf-8").splitlines():
                     if not line.strip():
                         continue
+                    seen += 1
                     parts = line.split("|")
                     if len(parts) not in (2, 3):
                         sys.stderr.write(f"bad list line: {{line}}\\n"); sys.exit(2)
                     if not pathlib.Path(parts[1]).is_absolute():
                         sys.stderr.write(f"path not absolute: {{parts[1]}}\\n"); sys.exit(2)
+                    if EXPECT_NO_WIDTH and len(parts) != 2:
+                        sys.stderr.write(
+                            f"width column should be absent: {{line}}\\n"
+                        ); sys.exit(2)
                     if EXPECTED_WIDTH_M is not None:
                         if len(parts) != 3:
                             sys.stderr.write("missing width field\\n"); sys.exit(2)
@@ -84,7 +109,18 @@ def fake_arcoreimg(tmp_path):
                             sys.stderr.write(
                                 f"width mismatch: expected {{EXPECTED_WIDTH_M}}, got {{w}}\\n"
                             ); sys.exit(2)
-                pathlib.Path(out).write_bytes(b"X" * {db_bytes})
+                if EXPECTED_TARGETS is not None and seen != EXPECTED_TARGETS:
+                    sys.stderr.write(
+                        f"target count mismatch: expected {{EXPECTED_TARGETS}}, got {{seen}}\\n"
+                    ); sys.exit(2)
+                # 真 arcoreimg（1.2 实测）在 --output_db_path 不以 .imgdb 结尾时**自己补
+                # 后缀**，写到 `<给的路径>.imgdb`，退出码仍然是 0。这个 fake 原来老老实实
+                # 写到给的路径上，于是和真件在这一点上分叉 —— 而正是这个分叉让
+                # `server.targets` 那条「整库临时文件名不以 .imgdb 结尾」的 bug 活了下来：
+                # 每次整库构建都失败，离线识别整条路一直是坏的，全套测试却是绿的。
+                real_out = out if out.endswith(".imgdb") else out + ".imgdb"
+                pathlib.Path(real_out).write_bytes(b"X" * {db_bytes})
+                print(f"Image database generated at: {{real_out}}")
                 sys.exit(0)
 
             sys.exit(2)

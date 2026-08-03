@@ -20,6 +20,7 @@ import pytest
 
 from photoar.server import httpd
 
+from . import conftest
 from .conftest import TOKEN
 
 
@@ -347,3 +348,72 @@ def test_304_has_no_body(live):
     r2 = _open(_req(f"{base}/v1/photo/{pid}/imgdb", headers={"If-None-Match": etag}))
     assert r2.status == 304
     assert r2.read() == b""
+
+
+def test_patch_and_delete_reach_the_dispatcher(live):
+    """PATCH 与 DELETE 只有 `_Handler` 上有对应的 `do_*` 才到得了 `Server.handle`。
+
+    这一条必须走真 socket：`test_app_auth.py` 直接调 `Server.handle`，路由表里有
+    PATCH 就够了 —— 漏掉 `do_PATCH` 的表现是 stdlib 回一个 501 Unsupported
+    method，那时全部管理接口的测试仍然是绿的，只有管理台是坏的。
+    """
+    env, base = live
+    r = _open(
+        _req(
+            f"{base}/v1/admin/config",
+            method="PATCH",
+            data=json.dumps({"recog.top_k": 25}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    )
+    assert r.status == 200, r.read()
+    assert json.loads(r.read())["needsRestart"] == []
+
+    created = _open(
+        _req(
+            f"{base}/v1/admin/users",
+            method="POST",
+            data=json.dumps({"name": "真 socket 上建的人", "role": "viewer"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    )
+    assert created.status == 201
+    uid = json.loads(created.read())["id"]
+    assert _open(_req(f"{base}/v1/admin/users/{uid}", method="DELETE")).status == 204
+
+
+def test_session_cookie_authenticates_over_a_real_socket(live):
+    """网页里的 `<img src>` 只能靠 cookie。这条走真 socket 是因为 Set-Cookie 与
+    Cookie 头都要真的过一遍 stdlib 的头解析。"""
+    env, base = live
+    pid = env.ingest_ok(env.write_image("photos/f.jpg", seed=10))
+    login = _open(
+        _req(
+            f"{base}/v1/auth/login",
+            method="POST",
+            data=json.dumps(
+                {"name": conftest.ADMIN_NAME, "password": conftest.ADMIN_PASSWORD}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            token=None,
+        )
+    )
+    assert login.status == 200
+    token = json.loads(login.read())["token"]
+    assert login.headers["Set-Cookie"].startswith("photoar_session=")
+
+    r = _open(
+        _req(
+            f"{base}/v1/photo/{pid}/thumb",
+            headers={"Cookie": f"photoar_session={token}"},
+            token=None,  # 只带 cookie，不带 Authorization
+        )
+    )
+    assert r.status == 200 and r.read()[:2] == b"\xff\xd8"
+
+
+def test_admin_page_is_served_over_a_real_socket(live):
+    _, base = live
+    r = _open(_req(base + "/admin", token=None))
+    assert r.status == 200
+    assert "photoar 管理台" in r.read().decode("utf-8")
