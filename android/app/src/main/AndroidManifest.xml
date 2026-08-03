@@ -5,16 +5,19 @@
         android:label="@string/app_name"
         android:icon="@android:drawable/ic_menu_camera"
         android:allowBackup="false"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PhotoAr">
 
-        <!-- 主题用系统的深色 NoActionBar：外壳自己画 Material3 顶栏，而扫描界面是
-             全屏黑底相机 —— 起始窗口跟着深色才不会在两者之间闪一下白。
+        <!-- 主题见 res/values/themes.xml：深色 NoActionBar + 透明系统栏。外壳自己画
+             Material3 顶栏，而扫描界面是全屏黑底相机 —— 起始窗口跟着深色才不会在
+             两者之间闪一下白。application 上也挂一份，是给 Activity 主题生效之前的
+             那个起始窗口用的。
              adjustResize：设置页和入库表单都有输入框，键盘弹起时要能滚上来。 -->
         <activity
             android:name="app.photoar.standalone.MainActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:theme="@style/Theme.PhotoAr"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

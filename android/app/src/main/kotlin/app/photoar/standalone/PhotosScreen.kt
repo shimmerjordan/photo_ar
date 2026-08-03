@@ -13,18 +13,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.photoar.arview.PhotoSummary
-import app.photoar.arview.ui.ArScanActivity
 
 /**
  * 照片库。
@@ -34,7 +31,6 @@ import app.photoar.arview.ui.ArScanActivity
  */
 @Composable
 fun PhotosScreen(shell: Shell) {
-    val context = LocalContext.current
     val fetch = rememberFetch(shell.libraryRev) { shell.client.photos() }
 
     Box(Modifier.fillMaxSize()) {
@@ -64,7 +60,8 @@ fun PhotosScreen(shell: Shell) {
                         start = 8.dp,
                         end = 8.dp,
                         top = 8.dp,
-                        // 给底部的「扫一扫」留位置，否则最后一行会被压住点不到
+                        // 给悬在底栏上方的「扫一扫」留位置（[MainActivity] 的
+                        // ScanButton，76dp 的圆），否则最后一行会被压住点不到
                         bottom = 88.dp,
                     ),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -76,15 +73,6 @@ fun PhotosScreen(shell: Shell) {
                 }
             }
         }
-
-        ExtendedFloatingActionButton(
-            onClick = { ArScanActivity.start(context) },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp),
-            text = { Text("扫一扫") },
-            icon = {},
-        )
     }
 }
 

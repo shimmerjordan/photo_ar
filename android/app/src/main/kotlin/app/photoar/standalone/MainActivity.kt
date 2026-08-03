@@ -2,12 +2,16 @@ package app.photoar.standalone
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -16,6 +20,8 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FabPosition
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +45,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import app.photoar.arview.EndpointCenter
 import app.photoar.arview.Resolution
+import app.photoar.arview.ar.ArCoreEmbeddedRuntime
+import app.photoar.arview.ui.ArScanActivity
 
 /**
  * 外壳的唯一 Activity。
@@ -54,8 +62,31 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 铺到系统栏底下去。这不是为了好看：不铺的话底部那条手势区的颜色归 framework
+        // 的 navigationBarColor 管，而 MIUI 把它给成了**白色** —— 深色界面下面吊一条
+        // 16dp 的纯白（实测 #FFFFFF）。铺过去之后那块由 NavigationBar 自己画（M3 的
+        // NavigationBar 默认就带 navigationBars inset 的内边距），白条就没了。
+        //
+        // 显式 dark 而不用默认的 `auto`：auto 按**系统**深浅色模式决定图标颜色，而这个
+        // App 是固定深色的（见 PhotoArTheme），系统在浅色模式时 auto 会给深色图标，
+        // 于是状态栏图标在我们的深底上看不见。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
+
+        DebugMode.init(this)
+
         // §9.2 的第二个触发时机。注册一次跟着进程活着。
         EndpointCenter.get(this).watchNetwork()
+
+        // 内嵌的 ARCore 运行时首启要把 5.7 MiB 的 dex 从 assets 拷到 codeCacheDir。
+        // 放在进程一起来就开，是因为「无感」的字面意思就是这步不该被用户等到 ——
+        // 登录、翻照片的那几秒后台线程早解完了，真进扫描页时一问就是现成的。
+        // 幂等且非阻塞，所以 ArCheck.state() 里那次调用照旧留着：哪条路径先到都算。
+        ArCoreEmbeddedRuntime.start(this)
+
         setContent { PhotoArTheme { AppRoot() } }
     }
 }
@@ -114,10 +145,15 @@ fun AppRoot() {
                             Icon(Icons.Filled.Add, contentDescription = "关联新照片")
                         }
                     }
-                    ViaChip(resolution) { shell.center.refreshAsync(force = true) }
+                    // 探活状态点只给调试模式看，常态是噪声。开关在设置页「关于」里。
+                    if (DebugMode.enabled) {
+                        ViaChip(resolution) { shell.center.refreshAsync(force = true) }
+                    }
                 },
             )
         },
+        floatingActionButton = { if (route.root) ScanButton() },
+        floatingActionButtonPosition = FabPosition.Center,
         bottomBar = {
             if (route.root) {
                 NavigationBar {
@@ -152,6 +188,7 @@ fun AppRoot() {
                 Route.History -> HistoryScreen(shell)
                 Route.Settings -> SettingsScreen(shell, resolution)
                 is Route.Detail -> PhotoDetailScreen(shell, route.photoId)
+                is Route.Play -> PlayScreen(shell, route.photoId)
                 is Route.Browse -> BrowseScreen(shell, route)
                 Route.Create -> CreateScreen(shell)
                 Route.Cache -> CacheScreen(shell)
@@ -165,6 +202,7 @@ private fun titleOf(route: Route): String = when (route) {
     Route.History -> "识别历史"
     Route.Settings -> "设置"
     is Route.Detail -> "照片详情"
+    is Route.Play -> "试播"
     is Route.Browse -> when (route.pick) {
         Pick.IMAGE -> "挑一张照片 · " + Fmt.dirTitle(route.dir)
         else -> "挑一段视频 · " + Fmt.dirTitle(route.dir)
@@ -174,10 +212,33 @@ private fun titleOf(route: Route): String = when (route) {
 }
 
 /**
+ * 「扫一扫」。这个 App 只有一个主动作，它就是那个。
+ *
+ * 位置在底栏正上方居中（[FabPosition.Center]），而不是原来的右下角：右下角是「次要
+ * 动作」的位置，而这里没有比它更主要的动作 —— 用户不是来管理照片库的，是来扫照片的。
+ *
+ * 尺寸自己写 76dp 而不用 `LargeFloatingActionButton`（96dp）：96 的圆盖在三格底栏
+ * 上会把中间那个「历史」压掉一半。76 刚好落在底栏上沿之上。
+ */
+@Composable
+private fun ScanButton() {
+    val context = LocalContext.current
+    FloatingActionButton(
+        onClick = { ArScanActivity.start(context) },
+        modifier = Modifier.size(76.dp),
+        containerColor = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+        shape = CircleShape,
+    ) {
+        Text("扫一扫", style = MaterialTheme.typography.titleMedium)
+    }
+}
+
+/**
  * 顶栏右上角那颗状态点：当前 api 走的哪条通道、多少毫秒。点一下强制重探。
  *
- * 这不是装饰。在外面扫不出来时，第一个要回答的问题就是「现在走的是哪条」——
- * 没有它就只能去设置页翻探活结果。
+ * 只在 [DebugMode] 下出现。它对宾客没有意义，但在外面扫不出来时，第一个要回答的问题
+ * 就是「现在走的是哪条」—— 所以留着，只是收到调试模式后面。
  */
 @Composable
 private fun ViaChip(resolution: Resolution?, onClick: () -> Unit) {

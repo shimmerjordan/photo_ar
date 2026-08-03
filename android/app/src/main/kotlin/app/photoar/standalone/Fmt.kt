@@ -1,7 +1,9 @@
 package app.photoar.standalone
 
 import app.photoar.arview.ApiParseException
+import app.photoar.arview.AuthPolicy
 import app.photoar.arview.NetErrorKind
+import app.photoar.arview.cache.CacheSync
 import app.photoar.arview.net.HttpFailure
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -113,13 +115,67 @@ object Fmt {
      */
     fun errText(e: Throwable): String = when {
         e is HttpFailure && e.kind == NetErrorKind.UNAUTHORIZED ->
-            "令牌不对，去「设置」里改（${e.status}）"
+            "登录已失效，回「设置」里重新登录（${e.status}）"
         e is HttpFailure && e.kind == NetErrorKind.TIMEOUT -> "服务器没回话（超时）"
         e is HttpFailure && e.kind == NetErrorKind.TRANSPORT -> "连不上服务器：${e.message}"
         e is HttpFailure && e.kind == NetErrorKind.SERVER_ERROR -> "服务端出错：${e.message}"
         e is HttpFailure -> e.message ?: "请求失败"
         e is ApiParseException -> "响应看不懂：${e.message}"
         else -> e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    }
+
+    /**
+     * 登录失败 → 一句人话。
+     *
+     * 与 [errText] 分开：登录接口上 401 与 403 的下一步动作正好相反（重输 / 别再试），
+     * 而 [errText] 把两者都指向「回设置里重新登录」—— 在登录界面上那句话是个循环。
+     * 分岔判据交给 [AuthPolicy.loginMessage]（在 `:arview` 里，有单测）。
+     */
+    fun loginErr(e: Throwable): String = when (e) {
+        is HttpFailure -> AuthPolicy.loginMessage(e.kind, e.code, e.message)
+        is ApiParseException -> AuthPolicy.loginMessage(
+            NetErrorKind.BAD_RESPONSE,
+            null,
+            e.message,
+        )
+        else -> AuthPolicy.loginMessage(NetErrorKind.TRANSPORT, null, e.message)
+    }
+
+    /** 有效期那一行。与 [time] 同一个格式，单独一个名字只为读起来清楚。 */
+    fun dateTime(ms: Long): String = time(ms)
+
+    /**
+     * 服务端预建离线识别库那一步的结果，说成人话。
+     *
+     * 五种正常结局都要有各自的一句话：把 [CacheSync.TargetsStatus.BUILDING] 和
+     * [CacheSync.TargetsStatus.FAILED] 归成同一句「没同步上」，用户就没法知道自己
+     * 该「过一会儿再来」还是「去找管理员」—— 而前者按一下就好了。
+     */
+    fun prebuiltStatus(r: CacheSync.TargetsResult): String = when (r.status) {
+        CacheSync.TargetsStatus.SKIPPED -> "离线识别库：这次没查"
+        CacheSync.TargetsStatus.UP_TO_DATE -> "离线识别库已是最新（覆盖 ${r.count} 张）"
+        CacheSync.TargetsStatus.DOWNLOADED ->
+            "离线识别库已更新（覆盖 ${r.count} 张，${bytes(r.bytes)}）"
+        CacheSync.TargetsStatus.BUILDING ->
+            "服务端还在建离线识别库，过一会儿再同步一次就好"
+        CacheSync.TargetsStatus.EMPTY -> "你还没有被授权任何照片，离线识别库是空的"
+        CacheSync.TargetsStatus.FAILED ->
+            "离线识别库这次没拿到（${r.detail ?: "原因未知"}），" +
+                "扫描不受影响：认不出来时会自动问服务端"
+    }
+
+    /**
+     * 有照片没进预建库时的那句提醒。没有就返回 null。
+     *
+     * 必须说出来：ARCore 单个库最多 1000 张，超出的那些**永远**得联网才认得出，而这件
+     * 事在界面上没有任何别的痕迹 —— 用户只会觉得「有几张照片时好时坏」。同时要说清它
+     * 不是坏了（联网照样认），否则这句话只会制造焦虑。
+     */
+    fun overflowNote(overflow: Int, maxTargets: Int): String? {
+        if (overflow <= 0) return null
+        val cap = if (maxTargets > 0) "$maxTargets" else "上限"
+        return "有 $overflow 张照片没进离线识别库（ARCore 单个库最多 $cap 张，" +
+            "服务端留的是最近入库的那些）。它们联网时照样能扫出来，只是要多等一次往返。"
     }
 
     /** 入库耗时。几十秒起步是正常的（要跑 eval-img + ORB + ffmpeg）。 */

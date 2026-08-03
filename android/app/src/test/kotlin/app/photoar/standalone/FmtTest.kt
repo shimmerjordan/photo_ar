@@ -2,6 +2,7 @@ package app.photoar.standalone
 
 import app.photoar.arview.ApiParseException
 import app.photoar.arview.NetErrorKind
+import app.photoar.arview.cache.CacheSync
 import app.photoar.arview.net.HttpFailure
 import java.util.TimeZone
 import org.junit.Assert.assertEquals
@@ -177,10 +178,15 @@ class FmtTest {
     // ---- 错误文案：401 必须单独说 ----
 
     @Test
-    fun `令牌错了指到设置里去`() {
-        // 归成一句「连接失败」会让人去查路由和防火墙，而问题在设置页那一行。
+    fun `凭证失效指到设置里去重新登录`() {
+        // 归成一句「连接失败」会让人去查路由和防火墙，而问题在设置页那一块。
+        //
+        // Phase 5 改了措辞而不是改了要求：服务端从「一个预共享 token」换成了用户体系，
+        // 401 的最常见原因是**登录过期**（管理员 12 小时、访客 30 天），而不是「令牌
+        // 填错了」。三条断言的强度不变 —— 要说清是登录问题、要指出去哪里解决、
+        // 要带上状态码。
         val text = Fmt.errText(HttpFailure(NetErrorKind.UNAUTHORIZED, 401, "/v1/photos → 未授权"))
-        assertTrue(text.contains("令牌"))
+        assertTrue(text.contains("登录"))
         assertTrue(text.contains("设置"))
         assertTrue(text.contains("401"))
     }
@@ -211,5 +217,111 @@ class FmtTest {
         // 不能返回空串：那会让出错页变成一片空白，看着像加载中卡住了。
         assertEquals("IllegalStateException", Fmt.errText(IllegalStateException()))
         assertEquals("IllegalStateException", Fmt.errText(IllegalStateException("  ")))
+    }
+
+    // ---- 登录失败（Phase 5）----
+
+    @Test
+    fun `登录失败不能用 errText 那句「回设置里重新登录」`() {
+        // 那句话在登录界面上是个循环：用户已经在设置里，正对着登录框。
+        val e = HttpFailure(
+            NetErrorKind.BAD_CREDENTIALS,
+            401,
+            "/v1/auth/login → 口令不对",
+            "bad_credentials",
+        )
+        val text = Fmt.loginErr(e)
+        assertTrue(text.contains("口令"))
+        assertTrue("不该再指回设置", !text.contains("回「设置」"))
+    }
+
+    @Test
+    fun `名字不在册与口令错给不同文案`() {
+        val unknown = Fmt.loginErr(
+            HttpFailure(NetErrorKind.FORBIDDEN, 403, "没有这个用户", "unknown_user"),
+        )
+        val bad = Fmt.loginErr(
+            HttpFailure(NetErrorKind.BAD_CREDENTIALS, 401, "口令不对", "bad_credentials"),
+        )
+        assertTrue(unknown != bad)
+        assertTrue("要说清重试没用", unknown.contains("再试一次也不会成"))
+    }
+
+    @Test
+    fun `不是 HttpFailure 的异常也有话说`() {
+        assertTrue(Fmt.loginErr(java.io.IOException("socket closed")).isNotBlank())
+        assertTrue(Fmt.loginErr(ApiParseException("不是 JSON")).isNotBlank())
+        assertTrue(Fmt.loginErr(IllegalStateException()).isNotBlank())
+    }
+
+    // ---- 离线识别库（Phase 6）----
+
+    @Test
+    fun `预建库的每一种结局都有各自的一句话`() {
+        // 归成同一句「没同步上」的话，用户没法知道该「过一会儿再来」还是「去找管理员」——
+        // 而前者按一下就好了。
+        val texts = CacheSync.TargetsStatus.entries.map { s ->
+            Fmt.prebuiltStatus(CacheSync.TargetsResult(status = s, count = 3, bytes = 4096))
+        }
+        assertEquals("有两种说的是同一句话", texts.size, texts.toSet().size)
+        texts.forEach { assertTrue(it.isNotBlank()) }
+    }
+
+    @Test
+    fun `正在建要说清过一会儿再来`() {
+        val text = Fmt.prebuiltStatus(
+            CacheSync.TargetsResult(status = CacheSync.TargetsStatus.BUILDING),
+        )
+        assertTrue(text.contains("再同步"))
+    }
+
+    @Test
+    fun `预建库没拿到时要说清扫描不受影响`() {
+        // 它失败时其余部分是全好的，而且认不出来会自动落回服务端识别。不说的话，
+        // 一句「离线识别库没拿到」看起来像整个功能坏了。
+        val text = Fmt.prebuiltStatus(
+            CacheSync.TargetsResult(
+                status = CacheSync.TargetsStatus.FAILED,
+                detail = "连不上服务端",
+            ),
+        )
+        assertTrue(text.contains("连不上服务端"))
+        assertTrue(text.contains("扫描不受影响"))
+    }
+
+    @Test
+    fun `更新成功时报出张数与体积`() {
+        val text = Fmt.prebuiltStatus(
+            CacheSync.TargetsResult(
+                status = CacheSync.TargetsStatus.DOWNLOADED,
+                count = 137,
+                bytes = 6L * 1024 * 1024,
+            ),
+        )
+        assertTrue(text.contains("137"))
+        assertTrue(text.contains("6.0 MB"))
+    }
+
+    @Test
+    fun `没有照片被挤掉时不说话`() {
+        // 「有 0 张没进库」是纯噪声。
+        assertNull(Fmt.overflowNote(0, 1000))
+        assertNull(Fmt.overflowNote(-1, 1000))
+    }
+
+    @Test
+    fun `有照片被挤掉时说清张数与它不是坏了`() {
+        val note = Fmt.overflowNote(37, 1000)!!
+        assertTrue(note.contains("37"))
+        assertTrue("上限是这件事唯一的原因", note.contains("1000"))
+        assertTrue("必须说清联网照样能扫", note.contains("联网"))
+    }
+
+    @Test
+    fun `不知道上限时也能说`() {
+        // maxTargets 是服务端给的，老服务端可能不给。这句话的重点是「有 N 张没进去」。
+        val note = Fmt.overflowNote(2, 0)!!
+        assertTrue(note.contains("2"))
+        assertTrue(note.contains("上限"))
     }
 }

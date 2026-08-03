@@ -51,7 +51,11 @@ fun HistoryScreen(shell: Shell) {
                 )
             }
         } else {
-            LazyColumn(contentPadding = PaddingValues(vertical = 8.dp)) {
+            // bottom 88：给悬在底栏上方的「扫一扫」（76dp 的圆）留位置，
+            // 否则最后一条记录被压住点不到。
+            LazyColumn(
+                contentPadding = PaddingValues(top = 8.dp, bottom = 88.dp),
+            ) {
                 // 不给 key：一条记录没有唯一 id，ts 会撞（同一帧的连续识别）。
                 items(entries) { e -> HistoryRow(shell, e) }
             }

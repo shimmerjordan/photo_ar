@@ -77,6 +77,10 @@ fun PhotoDetailScreen(shell: Shell, photoId: String) {
             KeyValue("入库", Fmt.time(d.createdAt))
             KeyValue("更新", Fmt.time(d.updatedAt))
 
+            // 主动作是「试播」而不是「换视频」：刚配完视频最想确认的是配对配没配错，
+            // 而那件事不需要相机、也不需要手里有打印件（见 [Route.Play]）。视频不在
+            // 就按不下去 —— 那种情况下点进去只会看到一个 ExoPlayer 的错误码。
+            val playable = d.hasVideo && d.videoMissing == false
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -84,17 +88,26 @@ fun PhotoDetailScreen(shell: Shell, photoId: String) {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Button(
-                    onClick = {
-                        shell.push(Route.Browse(Pick.VIDEO_FOR_PHOTO, null, d.photoId))
-                    },
+                    onClick = { shell.push(Route.Play(d.photoId)) },
+                    enabled = playable,
                 ) {
-                    Text(if (d.hasVideo) "换视频" else "配视频")
+                    Text("试播")
                 }
                 OutlinedButton(onClick = { ArScanActivity.start(context) }) { Text("去扫这张") }
             }
 
+            OutlinedButton(
+                onClick = {
+                    shell.push(Route.Browse(Pick.VIDEO_FOR_PHOTO, null, d.photoId))
+                },
+                modifier = Modifier.padding(top = 12.dp),
+            ) {
+                Text(if (d.hasVideo) "换视频" else "配视频")
+            }
+
             Text(
-                text = "换视频会重新转码，几十秒到几分钟都正常。",
+                text = "试播是全屏放一遍，不开相机；「去扫这张」才走 AR。" +
+                    "换视频会重新转码，几十秒到几分钟都正常。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),

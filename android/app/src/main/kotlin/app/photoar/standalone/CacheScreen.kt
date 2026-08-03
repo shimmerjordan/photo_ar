@@ -32,6 +32,7 @@ import app.photoar.arview.ar.LocalTargetDb
 import app.photoar.arview.cache.CacheStats
 import app.photoar.arview.cache.CacheSync
 import app.photoar.arview.cache.OfflineCache
+import app.photoar.arview.cache.ServerTargetsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -60,9 +61,13 @@ fun CacheScreen(shell: Shell) {
     val prefs = remember { CachePrefs(context) }
     val scope = rememberCoroutineScope()
 
+    val serverTargets = remember { ServerTargetsStore(cache) }
+
     var photos by remember { mutableStateOf(prefs.photos) }
     var videoMb by remember { mutableStateOf(prefs.videoMb) }
     var stats by remember { mutableStateOf(cache.stats()) }
+    /** 本地那份服务端预建库的元数据。同步之后要重读 —— 张数和 overflow 都在里面。 */
+    var prebuilt by remember { mutableStateOf(serverTargets.snapshot()) }
     // 「能离线认出多少张」按 usableAsTarget 逐条数，不用 withThumb - rejected 去减：
     // 那个减法在「被拒的那条恰好没缩略图」时会算多，而这一页最不该错的就是这个数。
     var usable by remember { mutableStateOf(cache.entries().count { it.usableAsTarget }) }
@@ -75,6 +80,7 @@ fun CacheScreen(shell: Shell) {
     fun refreshStats() {
         stats = cache.stats()
         usable = cache.entries().count { it.usableAsTarget }
+        prebuilt = serverTargets.snapshot()
     }
 
     /**
@@ -110,7 +116,25 @@ fun CacheScreen(shell: Shell) {
             .padding(bottom = 32.dp),
     ) {
         Section("离线可用")
-        KeyValue("可离线识别", "$usable 张")
+        // 两个数分开列，因为它们的口径不同：预建库是服务端拿**原图**建的，能覆盖到
+        // ARCore 的 1000 张上限；端上现建那份的输入是缓存里的缩略图，最多就是缓存条数。
+        // 合成一个数会让「为什么我设了 200 张却能离线认出 800 张」变成没法解释的事。
+        val server = prebuilt?.takeIf { it.installable && stats.serverTargetBytes > 0 }
+        if (server != null) {
+            KeyValue("可离线识别", "${server.count} 张（服务端预建库）")
+        } else {
+            KeyValue("可离线识别", "$usable 张（端上现建）")
+            if (prebuilt?.rejected == true) {
+                Banner(
+                    "服务端预建的识别库这台手机装不上（版本不匹配，多半是服务端的 " +
+                        "arcoreimg 比手机上的 ARCore 新）。已改用端上现建的那份 —— " +
+                        "还能离线认，但贴合会差一点。服务端下次入库会换一版自动再试；" +
+                        "更新过手机上的「ARCore」之后想立刻重试，按「全清」再同步一次。",
+                    tone = Tone.WARN,
+                )
+            }
+        }
+        Fmt.overflowNote(prebuilt?.overflow ?: 0, prebuilt?.maxTargets ?: 0)?.let { Banner(it) }
         KeyValue("缓存条目", "${stats.photos} 张")
         if (stats.rejected > 0) {
             Banner(
@@ -123,7 +147,9 @@ fun CacheScreen(shell: Shell) {
         Section("占用")
         KeyValue("缩略图", Fmt.bytes(stats.thumbBytes))
         KeyValue("视频", Fmt.bytes(stats.videoBytes))
-        KeyValue("识别库", Fmt.bytes(stats.targetBytes))
+        // 两份库分开列：稳态下只有一份非零，两个都非零说明退回过端上现建。
+        KeyValue("预建识别库", Fmt.bytes(stats.serverTargetBytes))
+        KeyValue("端上识别库", Fmt.bytes(stats.targetBytes))
         KeyValue("合计", Fmt.bytes(stats.totalBytes))
 
         Section("上限")
@@ -187,7 +213,10 @@ fun CacheScreen(shell: Shell) {
                             spec = CacheSettings.spec(photos, videoMb),
                             // 建 ARCore 库要一个 ARCore Session，而这一页连相机都没开。
                             // 所以这里只把库标成过期，真正重建在下一次扫描启动时。
-                            rebuildTargetDb = LocalTargetDb(cache).deferredRebuild(),
+                            rebuildTargetDb = LocalTargetDb(cache, serverTargets).deferredRebuild(),
+                            // 服务端预建库在这一步下（几 MB）。放在这里而不是扫描启动时：
+                            // 那条路上用户正举着手机等画面，不能替他决定现在用流量。
+                            targets = serverTargets,
                         )
                         var result: CacheSync.Result? = null
                         var failure: String? = null
@@ -311,7 +340,14 @@ private fun describe(r: CacheSync.Result): String {
     val size = if (r.bytesDownloaded > 0) "，共 ${Fmt.bytes(r.bytesDownloaded)}" else ""
     val failed = if (r.failed.isEmpty()) "" else "；${r.failed.size} 条没下成，下次再试"
     val stopped = r.stoppedBy?.let { "；停在半路：$it" } ?: ""
-    return body + size + failed + stopped
+    // 预建库那一步单独一句：它是离线识别的主力，成没成必须直说 —— 而它失败时其余部分
+    // 是全好的，混进上面那串「下了几张」里会看不见。
+    val prebuilt = if (r.prebuilt.status == CacheSync.TargetsStatus.SKIPPED) {
+        ""
+    } else {
+        "。" + Fmt.prebuiltStatus(r.prebuilt)
+    }
+    return body + size + failed + stopped + prebuilt
 }
 
 /**

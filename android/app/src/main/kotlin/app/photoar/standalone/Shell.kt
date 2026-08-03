@@ -29,6 +29,16 @@ sealed interface Route {
     data class Detail(val photoId: String) : Route
 
     /**
+     * 试播：全屏放这张照片配的那段视频，不开相机。
+     *
+     * 不是「AR 的简化版」，两件事的用途不同：AR 要回答「贴得准不准」，试播回答的是
+     * 「这张照片配的是不是那段视频」—— 后者在入库之后立刻就想确认，而那时人还在
+     * 电脑前，手里没有打印件可扫。顺带也是 §5.8 那条没有 ARCore 时的全屏兜底路径
+     * （[VideoPlayer.attach] 的 SurfaceView 重载）唯一能被日常走到的地方。
+     */
+    data class Play(val photoId: String) : Route
+
+    /**
      * 离线缓存管理（§5.8）。
      *
      * 不给它一个底栏 tab：这一页是「出门前准备一次」的页面，日常不需要，
