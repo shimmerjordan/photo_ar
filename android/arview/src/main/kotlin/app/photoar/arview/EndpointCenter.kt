@@ -84,12 +84,40 @@ class EndpointCenter private constructor(context: Context) {
     /** 配置有没有填到能用的程度。没填地址时界面要引导去设置，而不是让它静默失败。 */
     val configured: Boolean get() = config.candidates.any { it.usable } && config.token.isNotBlank()
 
+    /** 当前凭证的阶段。见 [AuthPolicy.phaseOf]。 */
+    fun authPhase(nowMs: Long = System.currentTimeMillis()): AuthPhase =
+        AuthPolicy.phaseOf(config, nowMs)
+
+    /**
+     * 手上这个 token 现在还能不能用。
+     *
+     * 过期的判定用**本机时钟**，所以它可能是错的（手机时间跑偏）。这不构成安全问题
+     * （真正的判定在服务端），它只是让「已经知道要过期了」的情况不必先白发一次请求
+     * 换回 401。时钟偏到把有效凭证判成过期时，用户重新登录一次即可，代价可接受。
+     */
+    val loggedIn: Boolean get() = authPhase().usable
+
     /** 保存并立刻重新探活（配置变了，上次的结果一定过期）。 */
     fun save(newConfig: EndpointConfig, onDone: ((Resolution) -> Unit)? = null) {
         store.save(newConfig)
         tokenSnapshot = newConfig.token
         resolver.update(newConfig)
         refreshAsync(force = true, onDone = onDone)
+    }
+
+    /**
+     * 只换凭证，**不重新探活**。
+     *
+     * 与 [save] 分开：探活要 1.5 秒，而登录/登出没有改任何地址 —— 上一次的探活结果
+     * 仍然有效。走 [save] 的话，每次登录都要多等一次探活，而那一秒半正好落在用户刚
+     * 输完口令、最期待反馈的时刻。
+     *
+     * `resolver.update` 会清掉探活结果（它假设配置变了），所以这里不能用它。
+     */
+    fun saveCredentials(newConfig: EndpointConfig) {
+        store.save(newConfig)
+        tokenSnapshot = newConfig.token
+        resolver.replaceConfigKeepingProbes(newConfig)
     }
 
     /**

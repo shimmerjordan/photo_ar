@@ -168,7 +168,13 @@ fun localMedia(fileUrl: String, bytes: Long, durationMs: Long?): MediaInfo = Med
     reason = null,
 )
 
-/** 缓存的占用统计，给「缓存管理」那一页显示。 */
+/**
+ * 缓存的占用统计，给「缓存管理」那一页显示。
+ *
+ * @param targetBytes 端上现建那份库（`local.imgdb`）。
+ * @param serverTargetBytes 服务端预建那份库（`targets.imgdb`）。两份分开列而不是加起来：
+ *   稳态下只有一份在，两个数同时非零说明退回过端上现建，而那件事用户该看得见。
+ */
 data class CacheStats(
     val photos: Int,
     val withThumb: Int,
@@ -176,18 +182,24 @@ data class CacheStats(
     val thumbBytes: Long,
     val videoBytes: Long,
     val targetBytes: Long,
+    val serverTargetBytes: Long,
     val rejected: Int,
 ) {
-    val totalBytes: Long get() = thumbBytes + videoBytes + targetBytes
+    val totalBytes: Long get() = thumbBytes + videoBytes + targetBytes + serverTargetBytes
 
     companion object {
-        fun of(entries: Collection<CachedPhoto>, targetBytes: Long): CacheStats = CacheStats(
+        fun of(
+            entries: Collection<CachedPhoto>,
+            targetBytes: Long,
+            serverTargetBytes: Long = 0L,
+        ): CacheStats = CacheStats(
             photos = entries.size,
             withThumb = entries.count { it.thumbBytes > 0 },
             withVideo = entries.count { it.videoCached },
             thumbBytes = entries.sumOf { it.thumbBytes },
             videoBytes = entries.sumOf { it.videoBytes },
             targetBytes = targetBytes,
+            serverTargetBytes = serverTargetBytes,
             rejected = entries.count { it.targetRejected },
         )
     }
@@ -246,10 +258,14 @@ object CacheIndexCodec {
         for (i in 0 until arr.length()) {
             val e = arr.optJSONObject(i) ?: continue
             val id = str(e, "photoId") ?: continue // 没 id 的条目对不上任何文件，跳过
+            // printWidthM 不可用 → 记 0 = 未知，条目**保留**。
+            //
+            // 原来是丢掉这条，理由是「它会被原样传给 addImage，宽度错了只会让视频一直
+            // 飘」。宽度未知现在是受支持的状态：不传给 addImage，让 ARCore 自己量
+            // （见 `ar.LocalTargetDb` 与 `Geometry.quadSize`）。而丢掉这条的代价是这张
+            // 照片进不了端侧库，离线命中对它永久失效。
             val width = e.optDouble("printWidthM", 0.0).toFloat()
-            // printWidthM 不可用就不要这条：它会被原样传给 addImage，宽度错了
-            // 不报错，只会让 AR 里的视频一直飘。
-            if (!width.isFinite() || width <= 0f) continue
+                .takeIf { it.isFinite() && it > 0f } ?: 0f
             out.add(
                 CachedPhoto(
                     photoId = id,

@@ -82,13 +82,27 @@ data class EndpointCandidate(
     }
 }
 
-/** 候选列表 + token。§9.1「App 内可编辑，带默认值」的那份东西。 */
+/**
+ * 候选列表 + token。§9.1「App 内可编辑，带默认值」的那份东西。
+ *
+ * @param token 全 App 唯一的 bearer 来源（探活的 [net.HttpProber] 也用它）。
+ * @param auth 那个 token 的元数据（谁、什么角色、什么时候过期），见 [AuthState]。
+ *   为 null 表示「有令牌但不知道来路」—— Phase 3 手填令牌的老装机就是这个状态，
+ *   它是合法的，不是「没登录」。
+ * @param onDeviceFeatures 识别走端上提特征那条路（`POST /v1/recognize/features`）。
+ *   **默认 false**：端上推理在开发机上没法真机验证，默认打开等于把一条没验过的路径
+ *   设成所有人的默认行为。
+ */
 data class EndpointConfig(
     val candidates: List<EndpointCandidate>,
     val token: String,
+    val auth: AuthState? = null,
+    val onDeviceFeatures: Boolean = false,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("token", token)
+        auth?.let { put("auth", it.toJson()) }
+        put("onDeviceFeatures", onDeviceFeatures)
         put("endpoints", JSONArray().also { arr -> candidates.forEach { arr.put(it.toJson()) } })
     }.toString()
 
@@ -144,7 +158,9 @@ data class EndpointConfig(
                 return DEFAULT
             }
             val arr = o.optJSONArray("endpoints") ?: return DEFAULT.copy(
-                token = if (o.isNull("token")) "" else o.optString("token", ""),
+                token = tokenOf(o),
+                auth = authOf(o),
+                onDeviceFeatures = o.optBoolean("onDeviceFeatures", false),
             )
             val list = ArrayList<EndpointCandidate>(arr.length())
             for (i in 0 until arr.length()) {
@@ -152,9 +168,25 @@ data class EndpointConfig(
             }
             return EndpointConfig(
                 candidates = if (list.isEmpty()) DEFAULT.candidates else list,
-                token = if (o.isNull("token")) "" else o.optString("token", ""),
+                token = tokenOf(o),
+                auth = authOf(o),
+                // 缺这个键（升级前存的那份配置）时是 false —— 也就是保持现状那条路。
+                onDeviceFeatures = o.optBoolean("onDeviceFeatures", false),
             )
         }
+
+        private fun tokenOf(o: JSONObject): String =
+            if (o.isNull("token")) "" else o.optString("token", "")
+
+        /**
+         * 读 auth 那一块。
+         *
+         * 缺了就是 null，也就是 [AuthPhase.UNKNOWN_TOKEN]。不要在这里造一个占位的
+         * [AuthState]：那会让「不知道这个 token 归谁」变成「知道，是一个叫空字符串的
+         * 访客」，而界面按后者会显示一个看起来正常的登录状态。
+         */
+        private fun authOf(o: JSONObject): AuthState? =
+            o.optJSONObject("auth")?.let { AuthState.fromJson(it) }
     }
 }
 
@@ -238,6 +270,21 @@ class EndpointResolver(
         config = newConfig
         resolution = null
         lastRefreshAt = Long.MIN_VALUE
+    }
+
+    /**
+     * 换配置但**保留**探活结果。登录 / 登出 / 改开关走这条。
+     *
+     * 只有在候选列表没变时才成立，所以这里断言一次 —— 拿它去换一份地址不同的配置会让
+     * [resolution] 里的 candidate 与 [config] 里的对不上，而设置界面正是按
+     * name+base 把两者对回去的（见 `probedFor`），对不上只表现为「状态那一栏空了」。
+     */
+    fun replaceConfigKeepingProbes(newConfig: EndpointConfig) {
+        if (newConfig.candidates != config.candidates) {
+            update(newConfig)
+            return
+        }
+        config = newConfig
     }
 
     /**

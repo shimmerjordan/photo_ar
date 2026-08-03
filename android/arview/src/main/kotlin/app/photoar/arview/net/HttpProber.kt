@@ -49,7 +49,10 @@ class HttpProber(
     }
 
     private fun describe(reply: HttpReply): String = when {
-        reply.status == 401 || reply.status == 403 -> "令牌不对（${reply.status}）"
+        // 服务端换成用户体系之后，这里最常见的原因是**没登录或登录过期**，而不是
+        // 「令牌填错了」—— 探活带的就是那个会话 token。文案要把人指到账号那一块去。
+        reply.status == 401 || reply.status == 403 ->
+            "没登录或登录已过期（${reply.status}）"
         reply.status >= 500 -> "服务端出错（${reply.status}）"
         // 404 通常意味着这个地址后面根本不是 photo-ar-server（打错端口、
         // 反代规则没配到），说「不通」会让人查错方向。

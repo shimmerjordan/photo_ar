@@ -63,6 +63,10 @@ class FakeEffects : ScanEffects {
         calls += "requestEndpointRefresh"
     }
 
+    override fun requestLogin() {
+        calls += "requestLogin"
+    }
+
     override fun emit(event: ScanEvent) {
         events += event
     }

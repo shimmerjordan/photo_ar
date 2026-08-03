@@ -50,6 +50,30 @@ class CacheSyncTest {
         var mediaMissing = false
         var mediaAbsolute = false
 
+        // ---- 整库目标（Phase 6）。默认没人问，因为 CacheSync 的 targets 默认是 null ----
+
+        /** 服务端那套的版本号。 */
+        var targetsVersion = "v1"
+        var targetsOverflow = 0
+        var targetsMaxTargets = 1000
+
+        /** manifest 里那条的标题。用来验「304 时元数据照样更新」。 */
+        var targetsTitle = "外婆生日"
+
+        /** 库接口还要回几次 503（模拟服务端正在建）。 */
+        var buildingRounds = 0
+
+        /** 非 null 时 db 接口的 ETag 用这个值 —— 用来造「manifest 与库配不上」。 */
+        var dbEtag: String? = null
+
+        var targetsDbBytes = 4_096
+
+        /** 非 null 时 db 接口直接回这个状态码与体。 */
+        var dbFailure: Pair<Int, String>? = null
+
+        /** db 接口每次收到的 If-None-Match。 */
+        val dbConditions = ArrayList<String?>()
+
         override fun get(url: String, headers: Map<String, String>, timeoutMs: Int): HttpReply {
             gets.add(url)
             failOn.firstOrNull { url.contains(it.first) }?.let { throw it.second }
@@ -57,12 +81,53 @@ class CacheSyncTest {
             // 按包含关系匹配会把视频请求当成元数据请求，返回一段 JSON 当视频。
             return when {
                 url.endsWith("/v1/photos") -> json(photosJson())
+                url.endsWith("/v1/targets/manifest") -> json(manifestJson())
+                url.endsWith("/v1/targets/db") -> targetsDb(headers)
                 url.endsWith("/stream") || url.endsWith(".mp4") ->
                     HttpReply(200, ByteArray(videoBytes) { 2 })
                 url.endsWith("/media") -> json(mediaJson())
                 url.endsWith("/thumb") -> HttpReply(200, ByteArray(thumbBytes) { 1 })
                 else -> HttpReply(404, """{"error":"not found"}""".toByteArray())
             }
+        }
+
+        private fun manifestJson(): String {
+            val items = photos.keys.joinToString(",") { id ->
+                """
+                {"photoId":"$id","printWidthM":$printWidthM,"refAspect":1.5,
+                 "fitMode":"contain","title":"$targetsTitle",
+                 "hasVideo":${photos[id]},
+                 "mediaUrl":"/v1/photo/$id/media","imgdbUrl":"/v1/photo/$id/imgdb"}
+                """.trimIndent()
+            }
+            return """
+                {"version":"$targetsVersion","count":${photos.size},
+                 "overflow":$targetsOverflow,"maxTargets":$targetsMaxTargets,
+                 "building":${buildingRounds > 0},"targets":[$items]}
+            """.trimIndent()
+        }
+
+        private fun targetsDb(headers: Map<String, String>): HttpReply {
+            dbConditions.add(headers["If-None-Match"])
+            dbFailure?.let { (status, body) -> return HttpReply(status, body.toByteArray()) }
+            if (buildingRounds > 0) {
+                buildingRounds--
+                return HttpReply(
+                    503,
+                    """{"error":"targets_building","version":"$targetsVersion",
+                        "retryAfterS":5}""".toByteArray(),
+                    mapOf("retry-after" to "5"),
+                )
+            }
+            val etag = dbEtag ?: targetsVersion
+            if (headers["If-None-Match"] == "\"$etag\"") {
+                return HttpReply(304, ByteArray(0), mapOf("etag" to "\"$etag\""))
+            }
+            return HttpReply(
+                200,
+                ByteArray(targetsDbBytes) { 9 },
+                mapOf("etag" to "\"$etag\""),
+            )
         }
 
         private fun json(s: String) = HttpReply(200, s.toByteArray())
@@ -139,7 +204,21 @@ class CacheSyncTest {
         rebuild: (List<CachedPhoto>) -> CacheSync.RebuildResult = {
             CacheSync.RebuildResult(accepted = it.size)
         },
-    ): CacheSync.Result = CacheSync(client, cache, clock, spec, rebuild).sync()
+        /** 非 null 时才跑「拉服务端预建整库目标」那一步（默认关，见 [CacheSync]）。 */
+        targets: ServerTargetsStore? = null,
+    ): CacheSync.Result = CacheSync(
+        client,
+        cache,
+        clock,
+        spec,
+        targets = targets,
+        // 单测里不真睡：503 那条路要重试好几轮，真睡就是把一条用例拖成半分钟。
+        sleep = { slept.add(it) },
+        rebuildTargetDb = rebuild,
+    ).sync()
+
+    /** 每次「等一会儿再问」的毫秒数。503 那条路的退避靠它验。 */
+    private val slept = ArrayList<Long>()
 
     // ---- 首轮 ----
 
@@ -489,5 +568,214 @@ class CacheSyncTest {
             CacheSync.RebuildResult(accepted = it.size)
         }.sync()
         assertTrue(r.elapsedMs > 0)
+    }
+
+    // ---- 服务端预建的整库目标（Phase 6）----
+
+    private fun store() = ServerTargetsStore(cache)
+
+    @Test
+    fun `没接 store 时这一步整个不跑`() {
+        // 既有那批用例全走这条路，所以它们的请求序列一个字都不该变。
+        transport.photos["a"] = false
+        val r = sync()
+        assertEquals(CacheSync.TargetsStatus.SKIPPED, r.prebuilt.status)
+        assertFalse(transport.gets.any { it.contains("/v1/targets") })
+    }
+
+    @Test
+    fun `首轮把预建库下下来并落盘`() {
+        transport.photos["a"] = false
+        transport.photos["b"] = true
+        val s = store()
+        val r = sync(targets = s)
+
+        assertEquals(CacheSync.TargetsStatus.DOWNLOADED, r.prebuilt.status)
+        assertEquals("v1", r.prebuilt.version)
+        assertEquals(2, r.prebuilt.count)
+        assertEquals(4_096L, r.prebuilt.bytes)
+        assertEquals(4_096L, s.bytes)
+        assertNotNull("必须能装 —— 库字节和元数据都在", s.installable())
+        // manifest 也整份存下来了：那些「预建库有、端侧没缓存」的照片靠它查元数据
+        assertEquals(listOf("a", "b"), s.snapshot()!!.entries.map { it.photoId })
+    }
+
+    @Test
+    fun `manifest 排在库字节之前取`() {
+        // manifest 那个请求在服务端会顺手把构建踢起来（它自己不等）。反过来的话第一次
+        // 一定是 503，而那时候构建才刚开始 —— 白等一个 Retry-After 周期。
+        transport.photos["a"] = false
+        sync(targets = store())
+        val manifestAt = transport.gets.indexOfFirst { it.endsWith("/v1/targets/manifest") }
+        val dbAt = transport.gets.indexOfFirst { it.endsWith("/v1/targets/db") }
+        assertTrue("manifest 没排在前面", manifestAt in 0 until dbAt)
+    }
+
+    @Test
+    fun `预建库排在缩略图之前下`() {
+        // 它是离线识别真正的地基（服务端拿原图建的），缩略图只是它装不上时的退路。
+        transport.photos["a"] = false
+        sync(targets = store())
+        val dbAt = transport.gets.indexOfFirst { it.endsWith("/v1/targets/db") }
+        val thumbAt = transport.gets.indexOfFirst { it.endsWith("/thumb") }
+        assertTrue("预建库该排在缩略图前面", dbAt in 0 until thumbAt)
+    }
+
+    @Test
+    fun `第二轮带上版本号换回 304，不重下字节`() {
+        transport.photos["a"] = false
+        val s = store()
+        sync(targets = s)
+        transport.gets.clear()
+        transport.dbConditions.clear()
+
+        val r = sync(targets = s)
+        assertEquals(CacheSync.TargetsStatus.UP_TO_DATE, r.prebuilt.status)
+        assertEquals(listOf("\"v1\""), transport.dbConditions)
+        assertEquals(4_096L, s.bytes)
+    }
+
+    @Test
+    fun `304 时元数据照样更新`() {
+        // manifest 是 no-store 的、每次现取，而标题 / hasVideo / overflow 刻意不在版本号
+        // 里（改个标题不该让全体客户端重下几 MB）。不更新的话，一张照片补了视频这件事
+        // 在离线那条路上永远看不到。
+        transport.photos["a"] = false
+        val s = store()
+        sync(targets = s)
+
+        transport.targetsTitle = "改过的名字"
+        transport.photos["a"] = true
+        sync(targets = s)
+
+        val entry = s.snapshot()!!.entry("a")!!
+        assertEquals("改过的名字", entry.title)
+        assertTrue(entry.hasVideo)
+        assertEquals("v1", s.snapshot()!!.version)
+    }
+
+    @Test
+    fun `版本变了就换一份新的库`() {
+        transport.photos["a"] = false
+        val s = store()
+        sync(targets = s)
+
+        transport.targetsVersion = "v2"
+        transport.targetsDbBytes = 8_192
+        val r = sync(targets = s)
+
+        assertEquals(CacheSync.TargetsStatus.DOWNLOADED, r.prebuilt.status)
+        assertEquals("v2", s.snapshot()!!.version)
+        assertEquals(8_192L, s.bytes)
+    }
+
+    @Test
+    fun `服务端正在建时按 Retry-After 等一会儿再问`() {
+        transport.photos["a"] = false
+        transport.buildingRounds = 2
+        val r = sync(targets = store())
+
+        assertEquals(CacheSync.TargetsStatus.DOWNLOADED, r.prebuilt.status)
+        assertEquals("两次 503 就该等两次", listOf(5_000L, 5_000L), slept)
+    }
+
+    @Test
+    fun `一直在建也不阻断这一轮同步`() {
+        // 「正在建」是服务端那边的正常状态。等到上限就报一句「过一会儿再来」，而缩略图
+        // 和视频照样下完 —— 离线识别退回端上现建那一档，功能不丢。
+        transport.photos["a"] = true
+        transport.buildingRounds = 99
+        val r = sync(targets = store())
+
+        assertEquals(CacheSync.TargetsStatus.BUILDING, r.prebuilt.status)
+        assertNull("这不是失败，不该停在半路", r.stoppedBy)
+        assertEquals(1, r.thumbsDownloaded)
+        assertEquals(1, r.videosDownloaded)
+        assertTrue("退避要有上限，同步不能变成不会结束的按钮", slept.size in 1..10)
+    }
+
+    @Test
+    fun `一张都没授权时把本地那份删掉`() {
+        // 留着就是「已经没权限看的照片，这台手机还能离线认出来」。
+        transport.photos["a"] = false
+        val s = store()
+        sync(targets = s)
+        assertTrue(s.bytes > 0)
+
+        transport.dbFailure = 404 to """{"error":"no_targets","message":"还没有被授权"}"""
+        val r = sync(targets = s)
+
+        assertEquals(CacheSync.TargetsStatus.EMPTY, r.prebuilt.status)
+        assertEquals(0L, s.bytes)
+        assertNull(s.snapshot())
+    }
+
+    @Test
+    fun `库的 ETag 与 manifest 版本对不上时不配到一起`() {
+        // 两个请求之间管理员可能入了十张照片。配错的后果是端上认出一张照片却查到错的
+        // 尺寸 —— 服务端那边费很大劲堵死的就是这个方向。
+        transport.photos["a"] = false
+        transport.dbEtag = "另一个版本"
+        val s = store()
+        val r = sync(targets = s)
+
+        assertEquals(CacheSync.TargetsStatus.FAILED, r.prebuilt.status)
+        assertNull("宁可这一份不落盘", s.snapshot())
+        // 按服务端注释说的「重取一遍 manifest」，所以 manifest 被问了两次
+        assertEquals(2, transport.gets.count { it.endsWith("/v1/targets/manifest") })
+        // 其余部分照样完成
+        assertEquals(1, r.thumbsDownloaded)
+    }
+
+    @Test
+    fun `预建库拿不到不影响缩略图和视频`() {
+        transport.photos["a"] = true
+        transport.dbFailure = 500 to """{"error":"targets_build_failed","message":"arcoreimg 没了"}"""
+        val r = sync(targets = store())
+
+        assertEquals(CacheSync.TargetsStatus.FAILED, r.prebuilt.status)
+        assertNull(r.stoppedBy)
+        assertEquals(1, r.thumbsDownloaded)
+        assertEquals(1, r.videosDownloaded)
+    }
+
+    @Test
+    fun `预建库那一步拿到 401 就立刻停整轮`() {
+        // 剩下两百条会用同一个坏 token 各失败一次，白等半分钟还刷一屏错误。
+        transport.photos["a"] = true
+        transport.failOn.add(
+            "/v1/targets" to HttpFailure(NetErrorKind.UNAUTHORIZED, 401, "token 无效"),
+        )
+        val r = sync(targets = store())
+
+        assertNotNull(r.stoppedBy)
+        assertEquals(CacheSync.TargetsStatus.FAILED, r.prebuilt.status)
+        assertEquals(0, transport.gets.count { it.endsWith("/thumb") })
+    }
+
+    @Test
+    fun `断网时也是立刻停，且不删已经缓存好的东西`() {
+        transport.photos["a"] = true
+        val s = store()
+        sync(targets = s)
+        val bytesBefore = s.bytes
+        transport.failOn.add(
+            "/v1/targets" to HttpFailure(NetErrorKind.TRANSPORT, null, "连不上"),
+        )
+        val r = sync(targets = s)
+
+        assertEquals("连不上服务端", r.stoppedBy)
+        assertEquals("本地那份还在，离线识别照样能用", bytesBefore, s.bytes)
+    }
+
+    @Test
+    fun `overflow 被如实带出来`() {
+        // ARCore 单个库最多 1000 张，超出的那些永远得联网才认得出。这个数是界面上
+        // 唯一能解释「有几张照片时好时坏」的东西。
+        transport.photos["a"] = false
+        transport.targetsOverflow = 37
+        val r = sync(targets = store())
+        assertEquals(37, r.prebuilt.overflow)
+        assertEquals(1000, r.prebuilt.maxTargets)
     }
 }

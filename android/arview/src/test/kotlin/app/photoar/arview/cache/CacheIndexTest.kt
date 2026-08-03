@@ -116,9 +116,11 @@ class CacheIndexTest {
     }
 
     @Test
-    fun `打印宽度不可用的条目跳过`() {
-        // printWidthM 会被原样传给 ARCore 的 addImage，为 0 或负数不报错，
-        // 只会让 AR 里的视频一直飘 —— 宁可这张离线不可用。
+    fun `打印宽度不可用的条目保留，宽度归成 0`() {
+        // 原来是跳过，理由是「printWidthM 会被原样传给 addImage，为 0 不报错，只会让
+        // 视频一直飘」。现在 0 是**受支持的状态**：`LocalTargetDb` 见到 0 会改用不带
+        // 宽度的 addImage 重载，由 ARCore 自己量物理尺寸。跳过的真实代价是这张照片
+        // 永远进不了端侧库，离线命中对它失效。
         val json = """
             {"version":$CACHE_INDEX_VERSION,"photos":[
               {"photoId":"zero","printWidthM":0},
@@ -127,7 +129,10 @@ class CacheIndexTest {
               {"photoId":"ok","printWidthM":0.152}
             ]}
         """.trimIndent()
-        assertEquals(listOf("ok"), CacheIndexCodec.parse(json).map { it.photoId })
+        val parsed = CacheIndexCodec.parse(json)
+        assertEquals(listOf("zero", "neg", "missing", "ok"), parsed.map { it.photoId })
+        // 负数也要归成 0，不能原样留着 —— 负宽度传到哪一层都是错的
+        assertEquals(listOf(0f, 0f, 0f, 0.152f), parsed.map { it.printWidthM })
     }
 
     @Test

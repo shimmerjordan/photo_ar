@@ -118,26 +118,30 @@ class HttpProberTest {
     }
 
     @Test
-    fun `401 抛出「令牌不对」而不是当成不通`() {
-        // 令牌填错时四条通道会全部探不通；只说「不通」会让人去查路由和防火墙，
-        // 而问题在设置里那一行。
+    fun `401 抛出「没登录」而不是当成不通`() {
+        // 凭证不对时四条通道会全部探不通；只说「不通」会让人去查路由和防火墙，
+        // 而问题在设置里的账号那一块。
+        //
+        // Phase 5 只改了措辞：服务端从预共享 token 换成了用户体系，所以最常见的原因
+        // 是没登录或登录过期，而不是「令牌填错了」。断言强度不变 —— 要说清是凭证
+        // 问题、并带上状态码。
         val t = PingTransport(status = 401, body = """{"error":"unauthorized"}""")
         try {
             HttpProber(t, { "wrong" }, StepClock()).ping("http://a", 1_500)
             fail("应该抛 ProbeFailed")
         } catch (e: ProbeFailed) {
-            assertTrue(e.message!!.contains("令牌不对"))
+            assertTrue(e.message!!.contains("登录"))
             assertTrue(e.message!!.contains("401"))
         }
     }
 
     @Test
-    fun `403 也归到令牌不对`() {
+    fun `403 也归到没登录`() {
         try {
             HttpProber(PingTransport(status = 403), { "x" }, StepClock()).ping("http://a", 1_500)
             fail("应该抛 ProbeFailed")
         } catch (e: ProbeFailed) {
-            assertTrue(e.message!!.contains("令牌不对"))
+            assertTrue(e.message!!.contains("登录"))
         }
     }
 

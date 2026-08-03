@@ -14,9 +14,11 @@ import java.io.File
  * ```
  * <root>/offline/
  *   index.json          索引（[CacheIndexCodec]）
- *   thumbs/<id>.jpg     参考缩略图 —— 离线识别的地基
+ *   thumbs/<id>.jpg     参考缩略图 —— 端上现建那份库的地基
  *   videos/<id>.mp4     视频，LRU 淘汰的就是这些
- *   local.imgdb         ARCore 多图库（LocalTargetDb 写）
+ *   local.imgdb         端上现建的 ARCore 多图库（LocalTargetDb 写）
+ *   targets.imgdb       服务端预建的整库多目标（CacheSync 下，优先装它）
+ *   targets.json        targets.imgdb 的 version + manifest（[ServerTargetsCodec]）
  * ```
  *
  * 视频一律叫 `.mp4`：服务端转码后的产物就是 H.264/AAC 的 mp4（§8.1），扩展名对
@@ -39,6 +41,31 @@ class PhotoCache(root: File) {
 
     /** ARCore 多图库。文件名不带 hash：它总是「当前这 200 张」的函数。 */
     val targetDbFile: File = File(dir, "local.imgdb")
+
+    /**
+     * 服务端预建的**整库**多目标 `.imgdb`（`GET /v1/targets/db` 下来的字节）。
+     *
+     * 和 [targetDbFile] **并存**而不是共用一个名字：两份库的失效条件根本不是一回事 ——
+     * 端上那份是「当前这些缩略图」的函数（拿文件时间就能判过期，见 [newestThumbMs]），
+     * 服务端那份是「服务端那套照片」的函数，本地无从判断新旧，只能靠 version 去问。
+     * 共用一个文件的话，服务端那份装不上的时候就没有任何东西可以退回去了，而那正是
+     * 必须留着退路的一种情况（服务端的 arcoreimg 比端上的 ARCore 新时 deserialize 会抛）。
+     *
+     * 文件名同样不带 version：磁盘上永远只留「当前那一份」，历史版本对客户端没用 ——
+     * 服务端已经在自己那边留最近 3 个了。和 [targetsMetaFile] 共用词干 `targets`，
+     * 因为那两个文件必须一起读写（先库、后元数据），同名让这件事在目录里一眼看得出。
+     */
+    val serverTargetDbFile: File = File(dir, "targets.imgdb")
+
+    /**
+     * [serverTargetDbFile] 的随身元数据：它的 version 与 manifest（见 [ServerTargetsCodec]）。
+     *
+     * 和库字节分成两个文件、且**先写库再写元数据**：只有元数据落成功了才算这一份可用。
+     * 反过来（先写元数据）的话，一次写库失败会留下一个指向旧库（或者根本不存在的库）
+     * 的新 version —— 于是下一次 ETag 协商拿到 304，而本地那份是错的。这条约定与
+     * [ModelCache.store] 一致，理由也一样。
+     */
+    val targetsMetaFile: File = File(dir, "targets.json")
 
     /**
      * 内存里的一份索引，按 photoId 索引。
@@ -108,6 +135,7 @@ class PhotoCache(root: File) {
     fun stats(): CacheStats = CacheStats.of(
         index.values,
         targetBytes = if (targetDbFile.isFile) targetDbFile.length() else 0L,
+        serverTargetBytes = if (serverTargetDbFile.isFile) serverTargetDbFile.length() else 0L,
     )
 
     /**

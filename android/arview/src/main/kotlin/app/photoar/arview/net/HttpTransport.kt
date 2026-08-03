@@ -8,16 +8,36 @@ import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
 
-/** HTTP 回复。[body] 对识别响应是 JSON，对 imgdb/thumb 是二进制。 */
-class HttpReply(val status: Int, val body: ByteArray) {
+/**
+ * HTTP 回复。[body] 对识别响应是 JSON，对 imgdb/thumb 是二进制。
+ *
+ * [headers] 带默认值是为了不动既有的三个假 transport（它们都只构造 status + body）。
+ * 目前唯一用到它的是模型下载的 ETag 协商 —— 那条路必须能读到响应头，否则「服务端换
+ * 了一份模型」在手机上永远看不出来。键一律小写，取值走 [header]。
+ */
+class HttpReply(
+    val status: Int,
+    val body: ByteArray,
+    val headers: Map<String, String> = emptyMap(),
+) {
     fun text(): String = String(body, Charsets.UTF_8)
     val ok: Boolean get() = status in 200..299
+
+    /** 大小写不敏感取头。HTTP 头名不区分大小写，而 ETag 的写法各家服务器都不同。 */
+    fun header(name: String): String? = headers[name.lowercase()]
 }
 
 class HttpFailure(
     val kind: NetErrorKind,
     val status: Int?,
     message: String,
+    /**
+     * 服务端错误体里的 `error` 字段（机器可读的 code）。
+     *
+     * 单独带出来而不是让调用方从 message 里 substring：message 是给人看的中文，
+     * 改一个字就会把按它分岔的逻辑静默改掉。
+     */
+    val code: String? = null,
 ) : IOException(message)
 
 /**
@@ -123,7 +143,7 @@ class UrlTransport : HttpTransport {
             val stream: InputStream? =
                 if (status in 200..299) conn.inputStream else conn.errorStream
             val data = stream?.use { readAll(it) } ?: ByteArray(0)
-            return HttpReply(status, data)
+            return HttpReply(status, data, responseHeaders(conn))
         } catch (e: SocketTimeoutException) {
             throw HttpFailure(NetErrorKind.TIMEOUT, null, "超时：$url")
         } catch (e: HttpFailure) {
@@ -133,6 +153,22 @@ class UrlTransport : HttpTransport {
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * 响应头，键统一小写。
+     *
+     * `headerFields` 里会有一个 **key 为 null** 的条目（那是状态行 "HTTP/1.1 200 OK"），
+     * 直接 `associate` 会 NPE 掉整个请求 —— 而它只在真机上才出现，本地假 transport
+     * 永远不会有。所以这里显式跳过 null 键。
+     */
+    private fun responseHeaders(conn: HttpURLConnection): Map<String, String> {
+        val out = HashMap<String, String>(8)
+        for ((key, values) in conn.headerFields) {
+            if (key == null) continue
+            values?.lastOrNull()?.let { out[key.lowercase()] = it }
+        }
+        return out
     }
 
     private fun readAll(input: InputStream): ByteArray {
