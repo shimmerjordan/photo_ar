@@ -54,6 +54,36 @@ ADMIN_PASSWORD = "bootstrap-pw-0123"
 _KEEP = object()
 
 
+def _assert_headers_sendable(resp, method: str, path: str) -> None:
+    """响应头必须能真的发出去。
+
+    这道检查存在的原因是一个真实事故：导出接口把中文文件名放进了
+    `Content-Disposition: filename="photoar-模板.xlsx"`，**整套测试全绿**，但真实
+    请求一打过来服务端线程就 `UnicodeEncodeError` 崩掉。
+
+    根因是这个测试装置与真货的差异：`Env.request` 直接调 `Server.handle()`，拿到的是
+    一个 `Response` 对象；而真实路径上 `httpd._write` 会把每个头交给
+    `http.server.send_header`，那个函数是拿 **latin-1** 硬编码的
+    （`("%s: %s\\r\\n" % (k, v)).encode('latin-1', 'strict')`）。也就是说"能构造出来"
+    和"能发出去"是两件事，而测试只验了前一件。
+
+    放在这里而不是只在导出那几条用例里，是因为这一类 bug 与接口无关：任何一个把
+    库里的中文（文件名、用户名、照片标题）拼进响应头的地方都会踩到。放在
+    `Env.request` 上，全套服务端测试都在替这件事把关，包括以后新加的接口。
+    """
+    for key, value in resp.headers.items():
+        for label, raw in (("头名", key), ("头值", value)):
+            try:
+                str(raw).encode("latin-1")
+            except UnicodeEncodeError as exc:
+                raise AssertionError(
+                    f"{method} {path} 的响应{label} {raw!r} 编不进 latin-1，"
+                    f"真实请求会在 http.server.send_header 里崩掉（{exc}）。"
+                    "中文要走 RFC 5987 的 `filename*=UTF-8''…` 百分号编码，"
+                    "或者百分号编码/转成 ASCII。"
+                ) from exc
+
+
 @dataclass(frozen=True)
 class Creds:
     """一次登录的产物。
@@ -214,7 +244,7 @@ class Env:
             assert not cookie, "cookie=True 需要配 as_（cookie 里放的是会话 token）"
             h = dict(AUTH) if auth else {}
         h.update({k.lower(): v for k, v in (headers or {}).items()})
-        return self.srv.handle(
+        resp = self.srv.handle(
             app.Request(
                 method=method,
                 raw_path=path,
@@ -224,6 +254,8 @@ class Env:
                 client="127.0.0.1",
             )
         )
+        _assert_headers_sendable(resp, method, path)
+        return resp
 
     def get(self, path: str, **kw) -> app.Response:
         return self.request("GET", path, **kw)
@@ -335,6 +367,16 @@ class Env:
     @staticmethod
     def body_json(resp: app.Response) -> dict:
         return json.loads(resp.body.decode("utf-8"))
+
+    @property
+    def arcoreimg_calls_path(self) -> Path:
+        """假 arcoreimg 记下的 build-db 清单日志。
+
+        用途见 `tests/server/test_app_replace_ref.py` 里那条 imgdb 的用例：这个 fake
+        产出的 .imgdb 内容与输入图无关，所以「imgdb 有没有按新图重建」只能靠「build-db
+        这次拿到的清单里写的是哪张图」来验。
+        """
+        return self.tmp / "arcoreimg-calls.log"
 
     @staticmethod
     def body_bytes(resp: app.Response) -> bytes:

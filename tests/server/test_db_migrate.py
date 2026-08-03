@@ -128,12 +128,21 @@ def _user_version(path):
 
 
 def test_v1_database_upgrades_in_place(v1_db):
-    """打开一个 v1 的库：补齐 v2 的四张表和 photo 的两列，老数据原样在。"""
+    """打开一个 v1 的库：一路补齐到**当前**版本，老数据原样在。
+
+    这里刻意不写死版本号（原来是 `== 2`）。写死的话每次加一版 schema 都要来改一个字面量，
+    而那个动作本身不验证任何东西 —— 真正要钉的是「打开一个老库之后，当前版本该有的表和
+    列都在，而且 user_version 被推到了当前值」。所以下面按 `db.SCHEMA_VERSION` 断言，
+    并逐版列出该出现的东西。
+    """
     cat = db.Catalog(v1_db)
     try:
+        # v2 的四张表 + photo 的两列
         assert _tables(v1_db) >= {"user", "session", "photo_grant", "app_config"}
         assert set(_columns(v1_db, "photo")) >= {"fit_mode", "backend"}
-        assert _user_version(v1_db) == db.SCHEMA_VERSION == 2
+        # v3 的素材挂载点表
+        assert "mount" in _tables(v1_db)
+        assert _user_version(v1_db) == db.SCHEMA_VERSION
 
         photo = cat.get_photo(V1_PHOTO_ID)
         assert photo is not None

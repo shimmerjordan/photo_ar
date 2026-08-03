@@ -27,16 +27,20 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import backend as backend_mod
+from .. import sheet as sheet_mod
 from .. import verify, xfeat
 from ..nullvocab import NullVocab
+from ..sheet import SheetError
 from . import (
+    batch,
     featurebody,
     framedump,
     fsbrowser,
@@ -57,6 +61,7 @@ from .auth import (
     Principal,
     UnknownUser,
     check_name,
+    normalize_name,
     photo_filter,
 )
 from .config import (
@@ -66,7 +71,17 @@ from .config import (
     MAX_UPLOAD_BYTES,
     ServerConfig,
 )
-from .db import Catalog, NameTaken, effective_fit_mode, ref_aspect
+from .db import (
+    MOUNT_KINDS,
+    MOUNT_LOCAL,
+    MOUNT_WEBDAV,
+    Catalog,
+    NameTaken,
+    effective_fit_mode,
+    ref_aspect,
+)
+from .integrity import sha256_file
+from .webdav import WebDavClient, WebDavError
 from .library import EmptyLibrary, PhotoLibrary
 from .multipart import MultipartError, boundary_of, parse_multipart
 from .ranges import ByteRange, RangeNotSatisfiable, parse_range
@@ -88,6 +103,13 @@ SESSION_COOKIE = "photoar_session"
 # 作废哪个 token，me 的全部内容就是"你是谁"。
 PUBLIC_PATHS = frozenset({"/v1/auth/login"})
 
+#: 每条识别记录里存前几名候选。
+#:
+#: 5 而不是 `recog.top_k`（20）：`ambiguous` 只由前两名决定，第三名之后是给
+#: 「到底有几张长得像」用的旁证。存 20 会让这张表在一次几百帧的扫描后膨胀十几倍，
+#: 而多出来的那 15 条一次都没被看过。
+DEDUP_LOG_TOP_K = 5
+
 # 管理台静态页面的目录。放在包内（而不是 data_dir）是因为它属于代码而不是数据：
 # 换一个版本的页面靠换镜像，不该靠往数据卷里拷文件。
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
@@ -97,6 +119,64 @@ WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 # 首字符不许是点：这样 `.`、`..`、`.env`、`.git` 之类一次全挡掉。只写
 # `[A-Za-z0-9._-]+` 是不够的 —— `..` 完全符合那个模式。
 _WEBUI_NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+
+# 管理台的分区。`/admin/<这里的名字>` 都返回首页，由前端按 `location.pathname`
+# 决定打开哪一个（见 `_route_webui`）。
+#
+# ⚠️ 这张清单必须与 `webui/app.js` 里的 `TABS` **一致**。多了一项：那个 URI 打得开
+# 但前端不认，会回落到默认分区（能用，只是地址栏和内容对不上）。少了一项：那个 URI
+# 刷新时 404 —— 而「刷新」正是独立 URI 最主要的用途。
+_WEBUI_TABS = frozenset({"users", "grants", "config", "photos", "batch"})
+
+
+def _rel_to(base: Path, target: Path) -> str:
+    """`target` 相对 `base` 的路径。相同就是空串（= 挂载点根）。
+
+    给管理台用：那边只该知道「在这个挂载点的哪一层」，不需要也不该拿到服务端的绝对
+    路径（那是部署细节，而且在界面上很长很难读）。
+    """
+    if target == base:
+        return ""
+    try:
+        return str(target.relative_to(base))
+    except ValueError:
+        # 到不了：调用方给的路径已经过 `roots.resolve` 且是从 base 拼出来的。
+        # 真出现说明 base 本身不在白名单里（挂载点被删了但没重建 roots），
+        # 那时给绝对路径比给一个错的相对路径好。
+        return str(target)
+
+
+def _safe_upload_name(raw: str) -> str:
+    """把一个**远端给的**文件名清成能落地的纯文件名。
+
+    注意这和 `_upload` 里那段是**刻意不同的两种策略**，不是重复实现：
+
+    - `_upload` 收到不合规的名字直接 **400 拒掉**。那条路上名字由客户端指定，让它改比
+      替它改好 —— 静默重命名会让文件落在一个客户端不知道的名字上，而客户端接下来要拿
+      这条路径去入库。
+    - 这里是**清洗**。名字来自 WebDAV 服务端，我们控制不了它（可能带路径、可能以点
+      开头、可能是 Windows 风格的反斜杠路径）。拒掉的话用户唯一的出路是去改远端的
+      文件名，而那常常不是他能改的。
+
+    把它们统一成一种是错的：要么接口开始悄悄改名，要么 WebDAV 在一个我们无权修改的
+    文件名上永久失败。
+    """
+    base = Path(raw).name.strip().lstrip(".")
+    # 路径分隔符在 Path().name 之后就没了，但 Windows 风格的反斜杠在 posix 上不算
+    # 分隔符，所以再切一次。
+    base = base.rsplit("\\", 1)[-1]
+    return base or "download.bin"
+
+
+def _suggest_name(name: str) -> str:
+    """同名不同内容时，给一个不会撞的建议名：`a.jpg` → `a-2.jpg`。
+
+    只加一个 `-2` 而不是拼时间戳或随机串：这个名字是要给人看、让人认出「哦这是
+    第二张」的，而 `a-20260803T142233.jpg` 只会让相册里多一个读不出来的文件名。
+    真的撞到第二次时用户会再改一次 —— 那比一个必然唯一但不可读的名字好。
+    """
+    p = Path(name)
+    return f"{p.stem}-2{p.suffix}"
 
 _WEBUI_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -307,6 +387,39 @@ class Server:
         # 把包内目录混进去会让 `/v1/fs/list` 把源码目录也列出来。
         self._webui_roots = Roots({"webui": str(webui_dir)})
         self._started = time.time()
+        # 环境变量给的那份白名单。挂载点是**叠加**在它上面的，所以要留一份原始的
+        # —— 否则删掉一个挂载点之后重建，会把 PHOTOAR_ROOTS 里的也一起丢掉。
+        self._env_roots: dict[str, str] = dict(cfg.roots)
+        self._rebuild_roots()
+
+    def _rebuild_roots(self) -> None:
+        """按 `PHOTOAR_ROOTS` + 启用中的 local 挂载点，重建白名单。
+
+        每次挂载点变动（增、改、删、启停）之后调一次。整体替换 `self.roots` 而不是往
+        里加 —— `Roots` 构造时会按路径长度排序（嵌套根时 name 才是确定的那个），
+        原地追加会让那个排序失效。
+
+        webdav 挂载点**不进白名单**：它不在本地文件系统上，浏览走 PROPFIND，入库前
+        先拉到暂存目录（那个目录本来就在 upload_dir_root 下，已经在白名单里了）。
+
+        名字冲突时环境变量赢：`PHOTOAR_ROOTS` 是部署时定下的、compose 里写着的东西，
+        而挂载点是运行期加的。让后者覆盖前者会让「改一下 compose 重启」这个动作
+        变得不可预测。冲突的挂载点会被跳过并在日志里说一句。
+        """
+        merged: dict[str, str] = dict(self._env_roots)
+        for m in self.catalog.list_mounts(enabled_only=True):
+            if str(m["kind"]) != MOUNT_LOCAL:
+                continue
+            name = str(m["name"])
+            path = str(m["location"])
+            if name in merged and merged[name] != path:
+                print(
+                    f"[photoar] ⚠️ 挂载点 {name!r} 与 PHOTOAR_ROOTS 里的同名"
+                    f"（{merged[name]}），按环境变量那份走，忽略挂载点 {path}"
+                )
+                continue
+            merged[name] = path
+        self.roots = Roots(merged)
 
     @classmethod
     def create(cls, cfg: ServerConfig) -> "Server":
@@ -674,12 +787,16 @@ class Server:
             ("GET", ("photo", "*", "imgdb"), self._photo_imgdb),
             ("GET", ("photo", "*", "thumb"), self._photo_thumb),
             ("GET", ("photo", "*", "ref"), self._photo_ref),
+            ("POST", ("photo", "*", "ref"), self._photo_replace_ref),
             ("GET", ("photo", "*", "media"), self._photo_media),
             ("POST", ("photo", "*", "video"), self._photo_attach_video),
+            ("DELETE", ("photo", "*", "video"), self._photo_detach_video),
+            ("DELETE", ("photo", "*"), self._photo_delete),
             ("GET", ("asset", "*", "stream"), self._asset_stream),
             ("GET", ("fs", "list"), self._fs_list),
             ("GET", ("fs", "thumb"), self._fs_thumb),
             ("POST", ("upload",), self._upload),
+            ("POST", ("upload", "check"), self._upload_check),
             ("GET", ("history",), self._history),
             ("GET", ("admin", "users"), self._admin_list_users),
             ("POST", ("admin", "users"), self._admin_create_user),
@@ -690,6 +807,18 @@ class Server:
             ("GET", ("admin", "config"), self._admin_get_config),
             ("PATCH", ("admin", "config"), self._admin_patch_config),
             ("POST", ("admin", "rebuild-vocab"), self._admin_rebuild_vocab),
+            ("GET", ("admin", "lookup"), self._admin_lookup),
+            ("GET", ("admin", "inbox"), self._admin_inbox),
+            ("GET", ("admin", "mounts"), self._admin_list_mounts),
+            ("POST", ("admin", "mounts"), self._admin_create_mount),
+            ("PATCH", ("admin", "mounts", "*"), self._admin_patch_mount),
+            ("DELETE", ("admin", "mounts", "*"), self._admin_delete_mount),
+            ("GET", ("admin", "mounts", "*", "list"), self._admin_mount_list),
+            ("POST", ("admin", "mounts", "*", "fetch"), self._admin_mount_fetch),
+            ("GET", ("admin", "videos"), self._admin_list_videos),
+            ("GET", ("admin", "mapping"), self._admin_mapping),
+            ("POST", ("admin", "import", "parse"), self._admin_import_parse),
+            ("GET", ("admin", "export", "*"), self._admin_export),
         ]
         allowed: set[str] = set()
         for verb, pattern, handler in table:
@@ -855,6 +984,23 @@ class Server:
         # `/admin` 与 `/admin/` 都给首页。缺了后者的话，浏览器地址栏里那个尾随斜杠
         # （用户手打、或者从别处跳过来时补上的）会得到 404。
         name = "index.html" if rest in ("", "/") else rest[1:]
+
+        # 每个分区一个自己的 URI：`/admin/users`、`/admin/photos`…
+        #
+        # 这些路径**也返回首页**，由前端读 `location.pathname` 决定打开哪个分区
+        # （history.pushState 换地址，前进后退与刷新都成立）。
+        #
+        # 为什么要在服务端加这一句：不加的话 `/admin/users` 会走下面的文件查找，
+        # 而 `users` 恰好符合文件名白名单 → 去找一个叫 `users` 的文件 → 404。
+        # 也就是说**刷新页面就白屏**，而这正是「独立 URI」最主要的用途（收藏、
+        # 发给别人、刷新）。
+        #
+        # 只认这张固定清单，不做「任何找不到的文件都回首页」的兜底：那种写法会把
+        # `/admin/app.js` 拼错时的 404 变成一份 HTML，而浏览器会拿 HTML 当 JS 解，
+        # 报出来的是一句莫名其妙的语法错误。
+        if name.rstrip("/") in _WEBUI_TABS:
+            name = "index.html"
+
         if not _WEBUI_NAME_RE.match(name):
             raise HttpError(404, "not_found", "管理台没有这个文件")
         path = self._webui_roots.resolve(str(self.webui_dir / name))
@@ -1015,6 +1161,13 @@ class Server:
             ratio=float(values["recog.ratio"]),
         )
         latency_ms = int((time.perf_counter() - t0) * 1000)
+        # 第二名与前几名一起记进历史。**这不是可选的诊断糖**：一次真实排查里 941 条
+        # 记录只有 inliers 一列，其中 897 条内点数 160~229（门槛 40）却判了未命中，
+        # 而光凭这张表分不出挡住它们的是 det 越界还是库里有近重复 —— 那两件事一件
+        # 要改取景、一件要清库。真相是后者，而它在这张表上完全不可见。
+        ranked = sorted(results, key=lambda r: -r.inliers)
+        runner_up = ranked[1].inliers if len(ranked) > 1 else 0
+        topk = [(r.photo_id, r.inliers) for r in ranked[:DEDUP_LOG_TOP_K]]
         via = req.header(ENDPOINT_HEADER)
 
         # 留帧在判定之后、分支之前：三条出口（未命中 / orphan / 命中）都要留，
@@ -1034,7 +1187,13 @@ class Server:
 
         if not decision.matched or decision.photo_id is None:
             self.catalog.log_recognize(
-                photo_id=None, inliers=decision.inliers, latency_ms=latency_ms, via=via
+                photo_id=None,
+                inliers=decision.inliers,
+                latency_ms=latency_ms,
+                via=via,
+                reason=decision.reason,
+                runner_up=runner_up,
+                topk=topk,
             )
             # spec §7：未命中返回 200 而非 404 —— 扫描时未命中是正常状态，
             # 客户端每 400ms 调一次，不该产生错误日志噪音。
@@ -1050,7 +1209,13 @@ class Server:
             # 这种不一致，这里当成未命中而不是 500：客户端继续扫下一帧，
             # 用户不会卡住。
             self.catalog.log_recognize(
-                photo_id=None, inliers=decision.inliers, latency_ms=latency_ms, via=via
+                photo_id=None,
+                inliers=decision.inliers,
+                latency_ms=latency_ms,
+                via=via,
+                reason="orphan",
+                runner_up=runner_up,
+                topk=topk,
             )
             return json_response(
                 200,
@@ -1066,6 +1231,9 @@ class Server:
             inliers=decision.inliers,
             latency_ms=latency_ms,
             via=via,
+            reason=decision.reason,
+            runner_up=runner_up,
+            topk=topk,
         )
         pid = decision.photo_id
 
@@ -1625,6 +1793,7 @@ class Server:
             quality_gate=bool(values["ingest.quality_gate"]),
             min_quality_score=int(values["ingest.min_quality_score"]),
             dedup_gate=bool(values["ingest.dedup_gate"]),
+            synth_long_edge=int(values["ingest.synth_long_edge"]),
             # 把**入库那一刻**的全局默认写进 photo.fit_mode，而不是留 NULL 跟随全局。
             #
             # 两种做法的差别只在一句话："以后改了全局默认，已入库的照片跟不跟着变"。
@@ -1647,6 +1816,51 @@ class Server:
                 "transcoded": result.transcoded,
                 "elapsedMs": result.elapsed_ms,
                 "libraryPhotos": len(self.library),
+            },
+        )
+
+    def _photo_replace_ref(
+        self, req: Request, prin: Principal, photo_id: str
+    ) -> Response:
+        """换掉这张照片的参考图，photo_id 不变。
+
+        检查顺序与 `_photo_attach_video` 一致（先 photo 级授权，再 admin），理由也
+        一样：一个拿着别人 photoId 来调的 viewer 该知道的是「这张不是你的」，而不是
+        「这个操作要管理员」。
+
+        为什么要有这个接口：`POST /v1/photo` 只能新建，而「先拿手机拍的糊照片入了库、
+        后来有了扫描件」是真实需求。走「删掉重建」的话授权会全丢
+        （`photo_grant.photo_id` 是 ON DELETE CASCADE），而且删除要把识别库里后面
+        所有 slot 往前挪 —— 完整论证在 `ingest.replace_ref` 的 docstring 里。
+        """
+        self._photo_or_404(photo_id, prin)
+        self._require_admin(prin, "换参考图")
+        doc = req.json_body()
+        raw = doc.get("refPath")
+        if not raw:
+            raise HttpError(400, "missing_ref_path", "需要 refPath")
+        ref = self.roots.resolve(str(raw))
+        values = self.config.all()
+        result = ingest.replace_ref(
+            cfg=self.cfg,
+            catalog=self.catalog,
+            library=self.library,
+            photo_id=photo_id,
+            ref_path=ref,
+            quality_gate=bool(values["ingest.quality_gate"]),
+            min_quality_score=int(values["ingest.min_quality_score"]),
+            dedup_gate=bool(values["ingest.dedup_gate"]),
+            synth_long_edge=int(values["ingest.synth_long_edge"]),
+        )
+        return json_response(
+            200,
+            {
+                "photoId": result.photo_id,
+                "qualityScore": result.quality_score,
+                "selfScore": result.self_score,
+                "imgdbBytes": result.imgdb_bytes,
+                "slot": result.slot,
+                "elapsedMs": result.elapsed_ms,
             },
         )
 
@@ -1682,11 +1896,41 @@ class Server:
             )
         # 落地路径同样过白名单校验，而不是信任配置里的前缀直接拼接
         dst = self.roots.resolve(str(Path(self.cfg.upload_dir_root) / safe))
-        if dst.exists():
-            raise HttpError(409, "already_exists", f"目标文件已存在：{safe}")
-        written = req.stream_to(dst, MAX_UPLOAD_BYTES)
-        return json_response(
-            201, {"path": str(dst), "bytes": written}
+        if not dst.exists():
+            written = req.stream_to(dst, MAX_UPLOAD_BYTES)
+            return json_response(
+                201, {"path": str(dst), "bytes": written, "reused": False}
+            )
+
+        # 同名文件已经在了。**不能直接 409 了事** —— 从手机相册第二次挑同一张照片，
+        # 拿到的就是同一个文件名，而那时用户要的不是一句「已存在」，是「那张照片
+        # 现在配的是哪段视频」。所以先看内容一不一样。
+        #
+        # 落到临时文件再比哈希，而不是先读进内存：这条路上可能是一段几百 MB 的视频。
+        # 临时名带 pid 与线程 id，两个管理员同时传同名文件时不会互相踩。
+        tmp = dst.with_name(
+            f"{dst.name}.upload-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            written = req.stream_to(tmp, MAX_UPLOAD_BYTES)
+            same = sha256_file(tmp) == sha256_file(dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        if same:
+            # 同名同内容 = 这个文件已经在服务端了，直接复用那条路径。
+            # 200 而不是 201：没有新建任何东西。`reused` 让调用方能把这件事说给用户
+            # （App 那边会顺手去查这个文件在库里的身份，见 `_admin_lookup`）。
+            return json_response(
+                200, {"path": str(dst), "bytes": written, "reused": True}
+            )
+        raise HttpError(
+            409,
+            "name_taken",
+            f"服务端已经有一个叫 {safe} 的文件，但**内容不一样**。"
+            f"换个文件名再传（比如加上日期），否则会覆盖别人的素材。",
+            existingPath=str(dst),
+            suggestedName=_suggest_name(safe),
         )
 
     def _history(self, req: Request, prin: Principal) -> Response:
@@ -1712,6 +1956,16 @@ class Server:
                     "inliers": r["inliers"],
                     "latencyMs": r["latency_ms"],
                     "via": r["via"],
+                    # 未命中时这三个才是有信息量的那部分：`weak` 要改取景、
+                    # `ambiguous` 要清库，而只看 inliers 分不出是哪一种。
+                    # 旧记录这几列是 NULL（加它们之前记的），界面上按缺省显示。
+                    "reason": r["reason"] if "reason" in r.keys() else None,
+                    "runnerUp": r["runner_up"] if "runner_up" in r.keys() else None,
+                    "topk": (
+                        json.loads(r["topk_json"])
+                        if ("topk_json" in r.keys() and r["topk_json"])
+                        else None
+                    ),
                 }
             )
         return json_response(200, {"entries": rows})
@@ -1725,6 +1979,14 @@ class Server:
         return {
             "id": uid,
             "name": row["name"],
+            # 规范化后的名字（登录时真正用来查人的那个键）。
+            #
+            # 暴露它是为了批量导入：执行者是浏览器，它得把表里的「张三 」对上库里
+            # 已有的「张三」。让 JS 自己实现一遍 `normalize_name` 是错的 —— casefold
+            # 与 toLowerCase 对某些字符结果不同（ß → ss），两套实现只要有一处不一致，
+            # 表现就是**授权静默不生效**：用户建出来了、照片入库了，就是没关联上，
+            # 而界面上每一步都显示成功。把服务端算好的那个键发出来，匹配就由构造保证。
+            "nameKey": row["name_key"],
             "role": row["role"],
             "disabled": bool(row["disabled"]),
             "grantAll": bool(row["grant_all"]),
@@ -2046,6 +2308,896 @@ class Server:
                 "words": result.n_words,
                 "elapsedMs": result.elapsed_ms,
             },
+        )
+
+    # ---- 批量导入 / 导出 / 双向映射 ----
+
+    # 导入文件的体积上限。5000 行 × 10 列的中文 xlsx 实测约 1 MB，8 MiB 有充足余量。
+    # 单独一个常量而不是复用 MAX_UPLOAD_BYTES（几百 MB）：那个是给视频用的，拿它当
+    # 表格的上限等于允许把一个视频当表格传进来，然后在 zip 解析里慢慢失败。
+    MAX_IMPORT_BYTES = 8 * 1024 * 1024
+
+    def _admin_import_parse(self, req: Request, prin: Principal) -> Response:
+        """把上传的表格解析成一份**执行计划**，一行都不写库。
+
+        请求体是文件的原始字节（不是 multipart）—— 浏览器 `fetch(url, {body: file})`
+        就是这个形状，而 multipart 只是为了在一个请求里塞多个字段，这里只有一个文件。
+
+        为什么只解析不执行：见 `batch` 模块的 docstring。要点是几十行的表逐行执行要
+        几分钟（每张照片都要跑 arcoreimg + 特征，视频还可能转码），做成一个同步接口
+        会先被反向代理的超时掐断，而且第 37 行才发现路径写错时前 36 行已经落库了。
+        由浏览器拿着这份计划去逐个调既有接口，预演、进度、逐行重试就都是免费的。
+        """
+        self._require_admin(prin, "批量导入")
+        raw = req.read_body(self.MAX_IMPORT_BYTES)
+        if not raw:
+            raise HttpError(400, "empty_body", "请求体是空的，需要上传 .xlsx 或 .csv")
+        try:
+            table = sheet_mod.read_table(raw)
+        except SheetError as exc:
+            # SheetError 的 code 直接当 HTTP 的 error code 用（bad_xlsx /
+            # bad_encoding / sheet_too_big）—— 它们本来就是给人看的分类。
+            raise HttpError(400, exc.code, exc.message) from exc
+        plan = batch.build_plan(
+            table,
+            normalize_name=normalize_name,
+            check_path=self._check_import_path,
+        )
+        payload = plan.to_json()
+        payload["format"] = sheet_mod.detect_format(raw)
+        # no-store 而不是 no-cache：响应体里含表格里的口令原文（理由见
+        # `batch.PlanRow.to_json`）。no-cache 允许存下来但每次revalidate，
+        # 那还是存在磁盘上了；no-store 是「一个字节都别落盘」。
+        return json_response(200, payload, **{"Cache-Control": "no-store"})
+
+    def _check_import_path(self, raw: str, kind: str) -> str | None:
+        """校验表里的一个路径。返回错误信息，或 None 表示没问题。
+
+        在**预览**阶段就查白名单和文件是否存在，是这个设计最实用的部分：一份表里最
+        常见的错就是路径写错（复制粘贴时带了空格、写的是 Windows 路径、写的是宿主机
+        路径而不是容器内路径），而它们现在全在动手之前一次说完。
+
+        故意不区分「不在白名单」和「文件不存在」的措辞严厉程度 —— 调用方已经是
+        admin，`/v1/fs/list` 对他是开放的，这里没有可泄露的东西。
+        """
+        try:
+            path = self.roots.resolve(raw)
+        except PathDenied as exc:
+            return (
+                f"{exc}。路径要写**容器内**的路径（和 PHOTOAR_ROOTS 一致），"
+                "不是宿主机上的路径。"
+            )
+        if not path.exists():
+            return f"文件不存在：{path}"
+        if not path.is_file():
+            return f"这是个目录，不是文件：{path}"
+        actual = fsbrowser.kind_of(path)
+        if actual != kind:
+            want = "图片" if kind == "image" else "视频"
+            got = {"image": "图片", "video": "视频"}.get(actual or "", "认不出的类型")
+            return f"这一列要{want}，但 {path.name} 是{got}"
+        return None
+
+    # ---- 素材挂载点 ----
+
+    _MOUNT_MGMT = "管理素材挂载点"
+
+    def _mount_json(self, row: dict[str, Any]) -> dict[str, Any]:
+        """一个挂载点的对外形状。
+
+        **口令永不回显。** 只给一个布尔，管理台用它显示「已设置口令」。回显它没有任何
+        用处（管理台不需要拿它去别处认证），而一个会把口令发出来的接口迟早会被某个
+        日志、某个代理、某个截图带出去。
+        """
+        return {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "kind": row["kind"],
+            "location": row["location"],
+            "username": row["username"],
+            "hasPassword": bool(row["password"]),
+            "enabled": bool(row["enabled"]),
+            "createdAt": int(row["created_at"]),
+        }
+
+    def _mount_or_404(self, mount_id: str) -> dict[str, Any]:
+        row = self.catalog.get_mount(mount_id)
+        if row is None:
+            raise HttpError(404, "mount_not_found", f"没有这个挂载点：{mount_id}")
+        return row
+
+    def _admin_list_mounts(self, req: Request, prin: Principal) -> Response:
+        self._require_admin(prin, self._MOUNT_MGMT)
+        rows = [self._mount_json(m) for m in self.catalog.list_mounts()]
+        return json_response(
+            200,
+            {
+                "mounts": rows,
+                # 环境变量给的那几个根也列出来（只读）。不列的话管理台上会出现
+                # 「我明明配了 /share/Photo，怎么这里是空的」这种困惑 —— 那几个根
+                # 确实存在，只是不是在这里配的。
+                "envRoots": [
+                    {"name": r.name, "path": str(r.path)}
+                    for r in Roots(self._env_roots).roots
+                ],
+            },
+        )
+
+    def _admin_create_mount(self, req: Request, prin: Principal) -> Response:
+        self._require_admin(prin, self._MOUNT_MGMT)
+        doc = req.json_body()
+        name, kind, location = self._mount_fields(doc, require=True)
+        try:
+            mid = self.catalog.create_mount(
+                name=name,
+                kind=kind,
+                location=location,
+                username=(doc.get("username") or None),
+                password=(doc.get("password") or None),
+                enabled=bool(doc.get("enabled", True)),
+            )
+        except NameTaken as exc:
+            raise HttpError(409, "name_taken", str(exc)) from exc
+        row = self._mount_or_404(mid)
+        self._after_mount_change(row, "新增")
+        return json_response(201, self._mount_json(row))
+
+    def _admin_patch_mount(
+        self, req: Request, prin: Principal, mount_id: str
+    ) -> Response:
+        self._require_admin(prin, self._MOUNT_MGMT)
+        self._mount_or_404(mount_id)
+        doc = req.json_body()
+        name, kind, location = self._mount_fields(doc, require=False)
+        try:
+            self.catalog.update_mount(
+                mount_id,
+                name=name,
+                kind=kind,
+                location=location,
+                username=doc.get("username"),
+                # `password` 缺省 = 不动（管理台的口令框是空的，因为服务端不回显）。
+                # 要真的清空得显式传空字符串，`update_mount` 那边解释了为什么这两件
+                # 事必须分得开。
+                password=doc.get("password"),
+                enabled=doc.get("enabled"),
+            )
+        except NameTaken as exc:
+            raise HttpError(409, "name_taken", str(exc)) from exc
+        row = self._mount_or_404(mount_id)
+        self._after_mount_change(row, "改动")
+        return json_response(200, self._mount_json(row))
+
+    def _admin_delete_mount(
+        self, req: Request, prin: Principal, mount_id: str
+    ) -> Response:
+        self._require_admin(prin, self._MOUNT_MGMT)
+        row = self._mount_or_404(mount_id)
+        self.catalog.delete_mount(mount_id)
+        print(f"[photoar] 删除素材挂载点 {row['name']!r}（{row['location']}）")
+        self._rebuild_roots()
+        # 已经入库的照片不受影响 —— 它们的 asset.nas_path 还指着原来的位置。
+        # 如果那条路径只由这个挂载点覆盖着，它们会在下一次一致性检查里被标 missing，
+        # 那是如实反映现状。
+        return json_response(200, {"deleted": mount_id})
+
+    def _mount_fields(
+        self, doc: dict[str, Any], *, require: bool
+    ) -> tuple[str | None, str | None, str | None]:
+        """校验 name / kind / location 三个字段，返回规范化后的值（None = 没给）。
+
+        校验放在写库之前一次做完：半套生效的挂载点（kind 改了、location 还没改）会让
+        「浏览」用 WebDAV 客户端去打一个本地路径，报出来的错和真实原因毫无关系。
+        """
+        name = doc.get("name")
+        if name is None:
+            if require:
+                raise HttpError(400, "missing_name", "需要 name")
+        else:
+            name = str(name).strip()
+            if not name:
+                raise HttpError(400, "bad_name", "name 不能是空的")
+
+        kind = doc.get("kind")
+        if kind is None:
+            if require:
+                raise HttpError(400, "missing_kind", "需要 kind")
+        else:
+            kind = str(kind)
+            if kind not in MOUNT_KINDS:
+                raise HttpError(
+                    400, "bad_kind", f"kind 只能是 {list(MOUNT_KINDS)}，收到 {kind!r}"
+                )
+
+        location = doc.get("location")
+        if location is None:
+            if require:
+                raise HttpError(400, "missing_location", "需要 location")
+        else:
+            location = str(location).strip()
+            if not location:
+                raise HttpError(400, "bad_location", "location 不能是空的")
+            # 按最终的 kind 校验 location。PATCH 只改一个字段时，另一个要从库里取。
+            effective_kind = kind
+            if effective_kind is None:
+                raise HttpError(
+                    400,
+                    "missing_kind",
+                    "改 location 时要一并给出 kind（两者的校验规则不同）",
+                )
+            location = self._check_mount_location(effective_kind, location)
+        return name, kind, location
+
+    def _check_mount_location(self, kind: str, location: str) -> str:
+        """按类型校验挂载点位置，返回规范化后的值。"""
+        if kind == MOUNT_WEBDAV:
+            if not location.startswith(("http://", "https://")):
+                raise HttpError(
+                    400,
+                    "bad_location",
+                    "WebDAV 的地址要以 http:// 或 https:// 开头。"
+                    "群晖是 `https://<host>:5006/`，Nextcloud 是 "
+                    "`https://<host>/remote.php/dav/files/<用户名>/`。",
+                )
+            return location.rstrip("/")
+
+        # local：必须是绝对路径、必须存在、必须是目录。
+        #
+        # 要求它**已经存在**而不是自动创建：这个字段是人手打的容器内路径，打错一个字
+        # （`/media/photo` 而不是 `/media/photos`）时自动创建会得到一个空目录，然后
+        # 「我的照片怎么一张都没有」——而真因是路径错了。让它当场失败。
+        p = Path(location)
+        if not p.is_absolute():
+            raise HttpError(
+                400,
+                "bad_location",
+                f"要绝对路径，收到 {location!r}。注意填的是**容器内**的路径"
+                "（和 PHOTOAR_ROOTS 一个口径），不是你电脑上的路径。",
+            )
+        resolved = p.expanduser().resolve()
+        if not resolved.exists():
+            raise HttpError(
+                404,
+                "location_not_found",
+                f"这个路径在服务端不存在：{resolved}。填的是**容器内**的路径 —— "
+                "宿主机上的目录要先在 compose 里挂进容器。",
+            )
+        if not resolved.is_dir():
+            raise HttpError(
+                400, "bad_location", f"这是个文件，不是目录：{resolved}"
+            )
+        return str(resolved)
+
+    def _after_mount_change(self, row: dict[str, Any], what: str) -> None:
+        """挂载点变动之后：重建白名单，并把这件事记一行。
+
+        日志里要记，是因为 local 挂载点**扩大了服务端愿意读的范围**。admin 本来就是
+        最高权限，所以这不是漏洞；但「谁什么时候加了哪个根」应该有据可查。
+        """
+        kind = str(row["kind"])
+        print(
+            f"[photoar] {what}素材挂载点 {row['name']!r}｜{kind}｜{row['location']}"
+            f"｜{'启用' if row['enabled'] else '停用'}"
+        )
+        if kind == MOUNT_WEBDAV and row["password"] and str(
+            row["location"]
+        ).startswith("http://"):
+            print(
+                "[photoar] ⚠️ 这个 WebDAV 挂载点走明文 http 且带口令 —— "
+                "Basic 认证在 http 上等于明文传口令。"
+            )
+        self._rebuild_roots()
+
+    def _admin_mount_list(
+        self, req: Request, prin: Principal, mount_id: str
+    ) -> Response:
+        """列一个挂载点下的目录。`?path=` 是相对挂载点根的路径。
+
+        两种 kind 的响应**形状一样**（`{path, parent, entries:[{name,isDir,kind,bytes}]}`），
+        这样管理台上一个文件浏览器就能同时用在本地目录和 WebDAV 上。形状不同的话那边
+        要写两套渲染，而它们看起来该是一样的。
+        """
+        self._require_admin(prin, self._MOUNT_MGMT)
+        row = self._mount_or_404(mount_id)
+        if not row["enabled"]:
+            raise HttpError(
+                409, "mount_disabled", f"挂载点 {row['name']!r} 是停用状态"
+            )
+        rel = req.q1("path") or ""
+        if str(row["kind"]) == MOUNT_LOCAL:
+            return json_response(200, self._local_mount_list(row, rel))
+        return json_response(200, self._webdav_mount_list(row, rel))
+
+    def _local_mount_list(self, row: dict[str, Any], rel: str) -> dict[str, Any]:
+        """local 挂载点走既有的 `fsbrowser.list_dir`。
+
+        路径仍然过 `self.roots.resolve` —— 挂载点已经在白名单里了（`_rebuild_roots`
+        把它加进去的），所以这里不需要、也不该另写一套前缀比较。`rel` 里的 `..`
+        由那一步挡掉。
+        """
+        base = Path(str(row["location"]))
+        target = base if not rel else base / rel.lstrip("/")
+        resolved = self.roots.resolve(str(target))
+        listing = fsbrowser.list_dir(self.roots, str(resolved))
+        # parent 换成**相对挂载点根**的形式，让管理台不用知道绝对路径。
+        listing["path"] = _rel_to(base, resolved)
+        listing["parent"] = (
+            None if resolved == base else _rel_to(base, resolved.parent)
+        )
+        return listing
+
+    def _webdav_mount_list(self, row: dict[str, Any], rel: str) -> dict[str, Any]:
+        client = self._webdav_of(row)
+        try:
+            entries = client.list_dir(rel)
+        except WebDavError as exc:
+            # WebDavError 的 code 直接当 HTTP 的 error code 用 —— 它们本来就是按
+            # 「下一步该做什么」分的（改凭证 / 改地址 / 检查网络）。
+            raise HttpError(502, exc.code, exc.message) from exc
+        return {
+            "path": rel,
+            # WebDAV 这边的 parent 靠 href 算不可靠（服务端给的 href 前缀各不相同），
+            # 所以按调用方传进来的 rel 退一层。rel 为空就是根，没有上级。
+            "parent": None if not rel else rel.rstrip("/").rsplit("/", 1)[0],
+            "entries": [
+                {
+                    "name": e.name,
+                    # href 而不是 name：继续往下走要用它（已编码、绝对）。名字里有
+                    # 斜杠或者服务端做过重写时，靠 name 拼出来的路径是错的。
+                    "href": e.href,
+                    "isDir": e.is_dir,
+                    "kind": None if e.is_dir else fsbrowser.kind_of(e.name),
+                    "bytes": e.bytes,
+                    "mtime": e.mtime,
+                }
+                for e in entries
+            ],
+        }
+
+    def _webdav_of(self, row: dict[str, Any]) -> WebDavClient:
+        try:
+            return WebDavClient(
+                str(row["location"]),
+                username=row["username"] or None,
+                password=row["password"] or None,
+            )
+        except WebDavError as exc:
+            raise HttpError(400, exc.code, exc.message) from exc
+
+    def _admin_mount_fetch(
+        self, req: Request, prin: Principal, mount_id: str
+    ) -> Response:
+        """把挂载点上的一个文件变成「服务端本地的一条路径」，返回那条路径。
+
+        两种 kind 的行为不同，但**对调用方是一样的**：给一个挂载点内的路径，拿回一条
+        能直接喂给 `POST /v1/photo` 的绝对路径。
+
+        - local：不拷贝，直接返回那条绝对路径。文件本来就在服务端的文件系统上，
+          拷一份只是白占一倍磁盘 —— 而这个部署形态下磁盘就是 NAS 的磁盘。
+        - webdav：下载到上传落地目录（`PHOTOAR_UPLOAD_DIR`），返回落地后的路径。
+
+        webdav 的落地文件按**原名**存，撞名时的处理与 `/v1/upload` 一致（同名同内容
+        复用、同名不同内容拒绝并给出建议名）—— 两条入库前的路径行为不一致的话，
+        用户会以为是挂载点的问题。
+        """
+        self._require_admin(prin, self._MOUNT_MGMT)
+        row = self._mount_or_404(mount_id)
+        if not row["enabled"]:
+            raise HttpError(
+                409, "mount_disabled", f"挂载点 {row['name']!r} 是停用状态"
+            )
+        doc = req.json_body()
+        rel = doc.get("path")
+        if not rel:
+            raise HttpError(400, "missing_path", "需要 path（挂载点内的路径）")
+        rel = str(rel)
+
+        if str(row["kind"]) == MOUNT_LOCAL:
+            base = Path(str(row["location"]))
+            resolved = self.roots.resolve(str(base / rel.lstrip("/")))
+            if not resolved.is_file():
+                raise HttpError(404, "not_found", f"文件不存在：{resolved}")
+            return json_response(
+                200, {"path": str(resolved), "copied": False, "bytes": None}
+            )
+
+        if not self.cfg.upload_dir_root:
+            raise HttpError(
+                503,
+                "upload_disabled",
+                "从 WebDAV 取文件要先落到本地，而服务端没配 PHOTOAR_UPLOAD_DIR。"
+                "配好它再来（local 类型的挂载点不需要这个）。",
+            )
+        # rel 可能是 PROPFIND 回来的 href（百分号编码的），所以先解码再取文件名。
+        safe = _safe_upload_name(unquote(rel))
+        dst = self.roots.resolve(str(Path(self.cfg.upload_dir_root) / safe))
+        client = self._webdav_of(row)
+
+        if dst.exists():
+            tmp = dst.with_name(
+                f"{dst.name}.dav-{os.getpid()}-{threading.get_ident()}"
+            )
+            try:
+                got = client.download_to(rel, tmp, MAX_UPLOAD_BYTES)
+                same = sha256_file(tmp) == sha256_file(dst)
+            except WebDavError as exc:
+                tmp.unlink(missing_ok=True)
+                raise HttpError(502, exc.code, exc.message) from exc
+            finally:
+                tmp.unlink(missing_ok=True)
+            if same:
+                return json_response(
+                    200, {"path": str(dst), "copied": False, "bytes": got}
+                )
+            raise HttpError(
+                409,
+                "name_taken",
+                f"落地目录里已经有一个叫 {safe} 的文件，但内容不一样。"
+                "把 WebDAV 上那个文件改个名字再取。",
+                existingPath=str(dst),
+                suggestedName=_suggest_name(safe),
+            )
+
+        try:
+            got = client.download_to(rel, dst, MAX_UPLOAD_BYTES)
+        except WebDavError as exc:
+            raise HttpError(502, exc.code, exc.message) from exc
+        return json_response(201, {"path": str(dst), "copied": True, "bytes": got})
+
+    def _admin_inbox(self, req: Request, prin: Principal) -> Response:
+        """落地目录里**还没有被用起来**的素材。
+
+        为什么需要它：手机传上来的文件先落到 `PHOTOAR_UPLOAD_DIR`，然后才入库。中间任何
+        一步断了（入库超时、质量分不过、近重复被拒、或者人挑完视频就退出了），那个文件就
+        躺在那儿，而**管理台上任何一处都看不到它** —— 照片列表只列已入库的，挂载点浏览器
+        要人自己去翻目录。用户看到的是「我传上去了，但哪儿都找不到」。
+
+        「没被用起来」= 磁盘上有这个文件，但它不是任何 asset 的路径。已经入库的照片、
+        已经配上的视频都不会出现在这里 —— 那些在照片列表里看得到。
+
+        只看**一层**，不递归：落地目录是平的（`/v1/upload` 只允许纯文件名），递归只会把
+        用户手工放进去的目录结构也扫进来。
+        """
+        self._require_admin(prin, "查看未入库的素材")
+        root = self.cfg.upload_dir_root
+        if not root:
+            # 没配落地目录 = 上传功能整体关闭。空列表 + 一句说明，而不是报错：
+            # 这一页在那种部署下本来就该是空的。
+            return json_response(
+                200,
+                {
+                    "dir": None,
+                    "files": [],
+                    "note": "服务端没配 PHOTOAR_UPLOAD_DIR，上传功能是关闭的。",
+                },
+            )
+        base = self.roots.resolve(str(root))
+        out = []
+        if base.is_dir():
+            for child in sorted(base.iterdir(), key=lambda p: p.name.casefold()):
+                if not child.is_file():
+                    continue
+                kind = fsbrowser.kind_of(child)
+                if kind is None:
+                    # 既不是图也不是视频（`.upload-xxx` 临时文件、`.DS_Store` 之类）。
+                    # 列出来只是噪声 —— 用户对它们无事可做。
+                    continue
+                if self.catalog.get_asset_by_path(str(child)) is not None:
+                    continue  # 已经用起来了，在照片列表里看得到
+                st = child.stat()
+                out.append(
+                    {
+                        "path": str(child),
+                        "name": child.name,
+                        "kind": kind,
+                        "bytes": int(st.st_size),
+                        "mtime": int(st.st_mtime * 1000),
+                    }
+                )
+        return json_response(
+            200,
+            {"dir": str(base), "files": out, "note": None},
+            **{"Cache-Control": "no-store"},
+        )
+
+    def _upload_check(self, req: Request, prin: Principal) -> Response:
+        """**上传之前**问一次：这个文件是不是已经在服务端了。
+
+        请求体 `{name, sha256, bytes}`，都由客户端在本地算好。
+
+        存在的理由很直接：原来要等 20 MB 传完才知道「已存在」，而手机上那是几十秒的
+        等待换来一句「白等了」。哈希是客户端算的，一次请求几百字节。
+
+        两条独立的判断，**都要报**，因为它们的下一步动作不同：
+
+        - **按内容**（sha256）：这份内容在库里已经有了 → 直接告诉他那是哪个文件、
+          在库里是什么身份（是某张照片的参考图？被哪些照片当视频用？）。这一条比按
+          名字有用得多 —— 相册第二次导出同一张照片，文件名可能变了，内容不会变。
+        - **按名字**：落地目录里已经有同名文件 → 内容一样就是「可以复用」，不一样就得
+          换个名字（给出建议名）。
+
+        `sha256` 是可选的：不给就只做按名字那一半。留这个余地是因为老版本 App 不会算
+        哈希，而「少一半信息」比「整个接口用不了」好。
+        """
+        self._require_admin(prin, "上传前校验")
+        doc = req.json_body()
+        name = doc.get("name")
+        if not name or not isinstance(name, str):
+            raise HttpError(400, "missing_name", "需要 name（目标文件名）")
+        safe = _safe_upload_name(name)
+        sha = (doc.get("sha256") or "").strip().lower() or None
+        if sha is not None and not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise HttpError(
+                400, "bad_sha256", "sha256 要是 64 位小写十六进制（不给也可以）"
+            )
+
+        out: dict[str, Any] = {
+            "name": safe,
+            # 按名字
+            "nameTaken": False,
+            "sameContent": False,
+            "existingPath": None,
+            "suggestedName": None,
+            # 按内容
+            "knownContent": False,
+            "matches": [],
+        }
+
+        if self.cfg.upload_dir_root:
+            dst = self.roots.resolve(str(Path(self.cfg.upload_dir_root) / safe))
+            if dst.is_file():
+                out["nameTaken"] = True
+                out["existingPath"] = str(dst)
+                if sha is not None:
+                    out["sameContent"] = sha256_file(dst) == sha
+                if not out["sameContent"]:
+                    out["suggestedName"] = _suggest_name(safe)
+
+        if sha is not None:
+            for asset in self.catalog.get_assets_by_sha256(sha):
+                out["matches"].append(self._identity_of_asset(asset))
+            out["knownContent"] = bool(out["matches"])
+        return json_response(200, out, **{"Cache-Control": "no-store"})
+
+    def _identity_of_asset(self, asset: dict[str, Any]) -> dict[str, Any]:
+        """一个 asset 在库里的身份。给 `lookup` 与 `upload/check` 共用。
+
+        提出来是因为两处必须一致：用户在上传前看到「这是某张照片的参考图」，传完之后
+        又在别处看到不一样的说法，那比不说更糟。
+
+        `photo` 最多一个、`usedByPhotos` 是列表 —— 这个不对称就是「一张照片只能配一段
+        视频，但一段视频可以被多张照片配」在数据上的样子。
+        """
+        asset_id = str(asset["id"])
+        as_ref = self.catalog.get_photo_by_ref_asset(asset_id)
+        photo = None
+        if as_ref is not None:
+            pid = str(as_ref["id"])
+            video = (
+                self.catalog.get_asset(str(as_ref["video_asset_id"]))
+                if as_ref["video_asset_id"]
+                else None
+            )
+            photo = {
+                "photoId": pid,
+                "title": as_ref["title"],
+                "refThumbUrl": f"/v1/photo/{pid}/thumb",
+                "videoPath": (video or {}).get("nas_path"),
+                "qualityScore": int(as_ref["quality_score"]),
+                "createdAt": int(as_ref["created_at"]),
+            }
+        used = []
+        for p in self.catalog.photos_referencing_asset(asset_id):
+            # 排掉「它是自己的参考图」那条 —— `photos_referencing_asset` 查的是三列
+            # （ref / video / playable），不排的话一张照片会出现在自己的
+            # usedByPhotos 里。
+            if str(p["ref_asset_id"]) == asset_id:
+                continue
+            used.append(
+                {
+                    "photoId": str(p["id"]),
+                    "title": p["title"],
+                    "refThumbUrl": f"/v1/photo/{p['id']}/thumb",
+                }
+            )
+        return {
+            "assetId": asset_id,
+            "path": asset.get("nas_path"),
+            "kind": asset.get("kind"),
+            "bytes": asset.get("bytes"),
+            "missing": bool(asset.get("missing")),
+            "photo": photo,
+            "usedByPhotos": used,
+        }
+
+    def _admin_lookup(self, req: Request, prin: Principal) -> Response:
+        """这个 NAS 路径在库里是什么身份：某张照片的参考图？某些照片的视频？还是没人用。
+
+        存在的理由是**重复上传不该是死胡同**。从手机相册第二次挑同一张照片，服务端会
+        （正确地）拦下来，但那时用户要的不是一句「已存在」—— 是「那张照片现在配的是哪段
+        视频」，好接着决定要不要换。这个接口就回答那个问题。
+
+        两种身份的**基数不一样**，而这正是界面上能给出什么动作的依据：
+
+        - `photo`：这个文件是**某一张**照片的参考图。一张照片只能有一个参考图，所以这里
+          最多一条。
+        - `usedByPhotos`：这个文件是**这些**照片配的视频。一段视频可以被多张照片用
+          （一段迎宾视频配给几十张是正常用法），所以这里是个列表。
+
+        反过来说：拿一段已经在用的视频去配一张新照片是**完全正常**的，不该报任何错；而拿
+        一张已经入库的照片再入一次库必然冲突，只能去改那张已有的。
+        """
+        self._require_admin(prin, "查询文件在库里的身份")
+        raw = req.q1("path")
+        if not raw:
+            raise HttpError(400, "missing_path", "需要 path 参数")
+        path = self.roots.resolve(raw)
+
+        asset = self.catalog.get_asset_by_path(str(path))
+        out: dict[str, Any] = {
+            "path": str(path),
+            "exists": path.is_file(),
+            "kind": fsbrowser.kind_of(path),
+            "assetId": None,
+            "photo": None,
+            "usedByPhotos": [],
+        }
+        if asset is None:
+            # 文件可能在磁盘上但从没入过库 —— 那是「可以拿它入库」的状态，不是错误。
+            return json_response(200, out)
+
+        # 身份那部分与 `upload/check` 共用一个函数：两处说法不一致（上传前看到一种、
+        # 传完在别处看到另一种）比不说更糟。
+        identity = self._identity_of_asset(asset)
+        out["assetId"] = identity["assetId"]
+        out["photo"] = identity["photo"]
+        out["usedByPhotos"] = identity["usedByPhotos"]
+        return json_response(200, out)
+
+    def _admin_list_videos(self, req: Request, prin: Principal) -> Response:
+        """视频侧的反查：库里在用的视频，以及每段视频被哪些照片引用。
+
+        这是「双向映射」里**反**的那个方向。正向（照片 → 视频）一直都有
+        （`GET /v1/photo/<id>` 里的 videoPath），反向以前没有 —— 想知道「这段视频
+        配给了哪几张照片」只能把全部照片拉下来自己聚合，而那正是管理台想问的问题
+        （一段迎宾视频往往配给很多张照片，改它之前要知道会影响谁）。
+
+        `playable` 与 `source` 分开列：转码过的照片有两个 asset，而人关心的是自己
+        当初挑的那个源文件（`source`），`playable` 只是实现细节。混在一起会让管理台
+        上出现一堆 `xxx_h264.mp4` 这种自己没见过的文件名。
+        """
+        self._require_admin(prin, "查看视频映射")
+        # asset_id → (asset 行, 引用它的照片)
+        by_asset: dict[str, dict[str, Any]] = {}
+        for p in self.catalog.list_photos():
+            vid = p["video_asset_id"]
+            if not vid:
+                continue
+            vid = str(vid)
+            entry = by_asset.get(vid)
+            if entry is None:
+                asset = self.catalog.get_asset(vid) or {}
+                entry = {
+                    "videoAssetId": vid,
+                    "path": asset.get("nas_path"),
+                    "bytes": asset.get("bytes"),
+                    "durationMs": asset.get("duration_ms"),
+                    "missing": bool(asset.get("missing")),
+                    "photos": [],
+                }
+                by_asset[vid] = entry
+            entry["photos"].append(
+                {
+                    "photoId": str(p["id"]),
+                    "title": p["title"],
+                    "refThumbUrl": f"/v1/photo/{p['id']}/thumb",
+                    # 这张照片实际播的是转码产物还是源文件
+                    "transcoded": str(p["playable_asset_id"] or "") != vid,
+                }
+            )
+        videos = sorted(
+            by_asset.values(), key=lambda v: (str(v["path"] or "")).casefold()
+        )
+        # 没配视频的照片单独给一份 —— 「哪些照片还没配」是这一页的另一半工作，
+        # 而让浏览器拿全量照片自己减一遍等于把同一个聚合写两遍。
+        unmapped = [
+            {
+                "photoId": str(p["id"]),
+                "title": p["title"],
+                "refThumbUrl": f"/v1/photo/{p['id']}/thumb",
+            }
+            for p in self.catalog.list_photos()
+            if not p["video_asset_id"]
+        ]
+        return json_response(
+            200,
+            {"videos": videos, "unmapped": unmapped, "total": len(videos)},
+        )
+
+    def _photo_detach_video(
+        self, req: Request, prin: Principal, photo_id: str
+    ) -> Response:
+        """解除照片与视频的关联。
+
+        检查顺序与 `_photo_attach_video` 一致（先 photo 级授权再 admin），理由同那边。
+
+        **只清 photo 表上那两列**，asset 行与磁盘上的转码产物都留着。这不是偷懒：
+        同一段视频可能配给了别的照片（见 `_admin_list_videos`），顺手删掉会让那些
+        照片的播放变成 404；而「没有任何照片引用的转码产物」是垃圾回收的活，不该由
+        一次解除关联来顺带做 —— 那会让这个接口的失败模式变成「解除关联时删了别人的
+        视频」。
+
+        幂等：本来就没配视频时返回 200 而不是 404。调用方要的结果（这张照片没有视频）
+        已经成立，回 404 只会让管理台弹一个没有意义的错。
+        """
+        self._photo_or_404(photo_id, prin)
+        self._require_admin(prin, "解除照片的视频关联")
+        self.catalog.set_photo_video(
+            photo_id, video_asset_id=None, playable_asset_id=None
+        )
+        return json_response(200, {"photoId": photo_id, "hasVideo": False})
+
+    def _photo_delete(self, req: Request, prin: Principal, photo_id: str) -> Response:
+        """把一张照片从库里删掉。
+
+        ## 为什么这个接口必须存在
+
+        库里进了两张同一内容的照片时，比值检验（`verify.RATIO`）会把**两张都**判成
+        ambiguous —— 于是两张都永久扫不出来。这不是假设：一次真实排查里 941 帧真机
+        记录只命中 44 帧，内点数 160~229（门槛 40），挡住它们的就是这一条。
+
+        去重闸门现在会拦住新的（`library.conflicts` 的 `query_features`），但**已经
+        进去的那一对拦不住**，而在有这个接口之前解开它的唯一办法是重建整个库。
+
+        ## 顺序：先退役库、再删 catalog 行
+
+        反过来的话，中间那一瞬 catalog 里没有这张、库里还有 —— 此时一次识别命中它，
+        `_decide_and_respond` 会走到 `photo is None` 那条 orphan 分支，回未命中。
+        那是**已经处理过**的状态（不崩、不错播）。而先删 catalog 的反序里，如果退役
+        那一步失败了，库里会永久留一张查不到元数据的照片，它继续参与比值检验、继续
+        把别人挤成 ambiguous —— 也就是这个接口本来要解决的那个问题。
+
+        `retire` 与 `delete_photo` 都是幂等的，所以重复点删除不会 500。
+        """
+        self._photo_or_404(photo_id, prin)
+        self._require_admin(prin, "删除照片")
+        slot = self.library.retire(photo_id)
+        self.catalog.delete_photo(photo_id)
+        # 整库 imgdb 不用显式作废：它的版本号是从**条目内容**算出来的
+        # （`targets._version_of`），少一张照片 → 版本变 → 端上下次同步会发现自己
+        # 那份过期。这里如果自己去删缓存文件，反而会把正在下载那一份的手机打断。
+        return json_response(200, {"photoId": photo_id, "deleted": True, "slot": slot})
+
+    def _mapping_snapshot(self) -> list[dict[str, Any]]:
+        """照片 ↔ 视频的现状，给映射页和映射导出共用。
+
+        提出来是因为这两处必须一致：管理台上看到的和导出的表如果对不上，人会以为
+        导出坏了。
+        """
+        grants_count: dict[str, int] = {}
+        for u in self.catalog.list_users():
+            for pid in self.catalog.granted_photo_ids(str(u["id"])):
+                grants_count[pid] = grants_count.get(pid, 0) + 1
+        out = []
+        for p in self.catalog.list_photos():
+            pid = str(p["id"])
+            ref = self.catalog.get_asset(str(p["ref_asset_id"])) or {}
+            video = (
+                self.catalog.get_asset(str(p["video_asset_id"]))
+                if p["video_asset_id"]
+                else None
+            )
+            out.append(
+                {
+                    "photoId": pid,
+                    "title": p["title"],
+                    "refPath": ref.get("nas_path"),
+                    "refThumbUrl": f"/v1/photo/{pid}/thumb",
+                    "refMissing": bool(ref.get("missing")),
+                    "videoAssetId": str(p["video_asset_id"] or "") or None,
+                    "videoPath": (video or {}).get("nas_path"),
+                    "videoMissing": bool((video or {}).get("missing")),
+                    "printWidthM": float(p["print_width_m"]),
+                    "qualityScore": int(p["quality_score"]),
+                    "grantCount": grants_count.get(pid, 0),
+                    # 下面这三项是给管理台的「照片」页用的。那一页把「库里有什么」和
+                    # 「各自配了哪段视频」合成了一张表 —— 它们本来就是同一份数据的
+                    # 两种看法，分成两个页签的结果是同一行信息要在两处各显示一半。
+                    # 合并之后这个接口是那一页的**唯一**数据源，所以要自带这几项，
+                    # 否则前端得再拉一次 `/v1/photos` 按 photoId 拼起来。
+                    "fitMode": self._fit_mode_of(p),
+                    "refStale": bool(p["ref_stale"]),
+                    "createdAt": int(p["created_at"]),
+                }
+            )
+        return out
+
+    def _admin_mapping(self, req: Request, prin: Principal) -> Response:
+        """照片侧的映射现状（正方向），一行一张照片。"""
+        self._require_admin(prin, "查看照片映射")
+        rows = self._mapping_snapshot()
+        return json_response(200, {"photos": rows, "total": len(rows)})
+
+    # 导出的种类 → (sheet 名, ASCII 文件名, 中文文件名)。
+    #
+    # 为什么文件名要**两份**：HTTP 头只能是 latin-1（`http.server.send_header` 就是
+    # 拿 latin-1 硬编码的），而 `Content-Disposition` 要给两种写法 ——
+    # `filename=` 给不认 RFC 5987 的老浏览器，`filename*=UTF-8''…` 给认的。
+    # 前者必须是纯 ASCII，后者是百分号编码。
+    #
+    # 第一版这里只有中文那一份，两处都用它。测试全绿，但真实请求打过来时服务端
+    # 线程直接 `UnicodeEncodeError` 崩掉 —— 因为测试是直接调 `Server.handle()` 的，
+    # 从不把响应头真的编码出去。`tests/server/conftest.py` 的 `Env.request` 现在会
+    # 逐个头做 latin-1 编码检查，就是为了让这一类 bug 不能再躲过测试。
+    _EXPORTS = {
+        "template": ("模板", "photoar-template", "photoar-模板"),
+        "users": ("用户", "photoar-users", "photoar-用户"),
+        "mapping": ("映射", "photoar-mapping", "photoar-映射"),
+    }
+
+    def _admin_export(self, req: Request, prin: Principal, what: str) -> Response:
+        """导出模板 / 用户 / 映射，`?format=xlsx|csv`（默认 xlsx）。
+
+        三种都走同一个出口，是因为它们的差别只有「哪些行」——表头、编码、
+        Content-Disposition 这些容易写歪的部分只该有一份。
+        """
+        self._require_admin(prin, "导出表格")
+        spec = self._EXPORTS.get(what)
+        if spec is None:
+            raise HttpError(
+                404,
+                "unknown_export",
+                f"没有 {what!r} 这种导出。可选：{sorted(self._EXPORTS)}",
+            )
+        sheet_name, ascii_stem, stem = spec
+        fmt = (req.q1("format") or "xlsx").lower()
+        if fmt not in ("xlsx", "csv"):
+            raise HttpError(400, "bad_format", "format 只能是 xlsx 或 csv")
+
+        if what == "template":
+            rows = batch.template_rows()
+        elif what == "users":
+            photos = {p["photoId"]: p for p in self._mapping_snapshot()}
+            users = self.catalog.list_users()
+            grants = {
+                str(u["id"]): self.catalog.granted_photo_ids(str(u["id"]))
+                for u in users
+            }
+            rows = [batch.TEMPLATE_HEADER, *batch.users_rows(users, photos, grants)]
+        else:
+            rows = [
+                batch.MAPPING_HEADER,
+                *batch.mapping_rows(self._mapping_snapshot()),
+            ]
+
+        if fmt == "csv":
+            body = sheet_mod.write_csv_bytes(rows)
+            ctype = "text/csv; charset=utf-8"
+        else:
+            body = sheet_mod.write_xlsx(rows, sheet_name=sheet_name)
+            ctype = (
+                "application/vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet"
+            )
+        return Response(
+            status=200,
+            headers={
+                "Content-Type": ctype,
+                # 两种写法都给：`filename=` 给不认 RFC 5987 的老浏览器，
+                # `filename*=UTF-8''…` 给认的（认的那些会优先用它，于是拿到中文名）。
+                #
+                # ⚠️ `filename=` 那份**必须是纯 ASCII**。HTTP 头只能是 latin-1，
+                # 往里放中文会让 `http.server.send_header` 抛 UnicodeEncodeError，
+                # 也就是整个响应线程崩掉 —— 不是「文件名难看」而是「下载不了」。
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_stem}.{fmt}"; '
+                    f"filename*=UTF-8''{quote(stem)}.{fmt}"
+                ),
+                # 导出的是当下的库状态，不该被缓存 —— 改完用户再点导出拿到旧表，
+                # 而且看不出是缓存。
+                "Cache-Control": "no-store",
+            },
+            body=body,
         )
 
 

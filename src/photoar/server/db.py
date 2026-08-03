@@ -37,7 +37,23 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: `recognize_log` 后补的两列。两列都可空，NULL = 这条是加它们之前记的。
+#:
+#: 为什么必须记 `reason`：一次真实排查里，941 条真机记录**全部**只有
+#: `inliers`，而其中 897 条的内点数在 160~229（门槛 40）却判了未命中 ——
+#: 光看这张表完全无法知道挡住它们的是 `weak`（det 越界）还是 `ambiguous`
+#: （库里有近重复，比值检验不过）。而这两件事的修法毫不相干：前者要改取景，
+#: 后者要清库。少这一列，等于把这张表最有用的一半扔了。
+#:
+#: `runner_up` 是第二名的内点数，`ambiguous` 唯一的判据就是 top1 与它的比值。
+#: 只记 reason 能知道「是 ambiguous」，记上它才能知道「差多少」—— 而那决定
+#: 阈值该不该动。
+_LOG_V3_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("reason", "TEXT"),
+    ("runner_up", "INTEGER"),
+)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS asset (
@@ -154,6 +170,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_name_key ON user(name_key);
 CREATE INDEX IF NOT EXISTS idx_grant_user      ON photo_grant(user_id);
 CREATE INDEX IF NOT EXISTS idx_session_expires ON session(expires_at);
 """
+
+# ---- schema v3：素材挂载点 ----
+#
+# 管理台上能配的「素材从哪来」。两种 kind：
+#
+#   local   服务端文件系统上的一个绝对路径。加进来 = **扩大白名单**（`Roots`），
+#           于是它下面的文件能被 `/v1/fs/list` 浏览、能直接入库，不用拷贝。
+#           已经用 mount/cifs 挂好的网络盘在容器里就是这种。
+#   webdav  一个 WebDAV 地址。不进白名单（它不在本地文件系统上），浏览走
+#           PROPFIND，入库前先拉到暂存目录。
+#
+# ⚠️ 为什么 local 挂载点是一件需要想清楚的事：它**扩大了服务端愿意读的范围**。
+# 一个管理员把 `/` 加进来，就能靠 `/v1/fs/thumb` 看到容器里任何文件。这是接受的：
+# admin 本来就是最高权限（他能改配置、能建管理员、能重建词表），而容器只挂了它
+# 该看到的那几个卷。但仍然要求路径**存在且是目录**，并且在日志里记一行 —— 让
+# 「谁什么时候加了哪个根」有据可查。
+#
+# `password` 存明文。这不好，但可选项更糟：加密要有密钥，而密钥只能放在同一台机器
+# 的同一个目录里（没有 KMS、没有 TPM 可用），那只是把明文换成「明文 + 一层需要
+# 维护的仪式」。真正的边界是 data/ 目录的文件权限与容器的 UID。所以这里如实存、
+# 在文档里说清、并且**不通过任何接口回显它**（见 `_mount_json`）。
+_DDL_V3 = """
+CREATE TABLE IF NOT EXISTS mount (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  kind        TEXT NOT NULL,
+  location    TEXT NOT NULL,
+  username    TEXT,
+  password    TEXT,
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+"""
+
+MOUNT_LOCAL = "local"
+MOUNT_WEBDAV = "webdav"
+MOUNT_KINDS = (MOUNT_LOCAL, MOUNT_WEBDAV)
 
 # v2 给 photo 加的两列。**唯一的声明处** —— 上面 `_DDL` 的 CREATE TABLE 里刻意
 # 没有它们。
@@ -278,7 +332,11 @@ class Catalog:
             conn.executescript(_DDL)
             # v2 的表引用了 photo(id)，必须排在 _DDL 之后。
             conn.executescript(_DDL_V2)
+            # v3 的 mount 表不引用任何别的表，顺序无所谓，但跟着一起无条件执行
+            # （幂等，理由见上面那段 docstring）。
+            conn.executescript(_DDL_V3)
             self._add_missing_columns(conn, "photo", _PHOTO_V2_COLUMNS)
+            self._add_missing_columns(conn, "recognize_log", _LOG_V3_COLUMNS)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
 
@@ -373,6 +431,21 @@ class Catalog:
             "SELECT * FROM asset WHERE nas_path = ?", (nas_path,)
         ).fetchone()
         return dict(row) if row else None
+
+    def get_assets_by_sha256(self, sha256: str) -> list[dict[str, Any]]:
+        """按内容哈希找 asset。
+
+        返回列表而不是单条：同一份内容可能在 NAS 上有好几个副本（`nas_path` 是
+        UNIQUE，`sha256` 不是）—— 用户把同一张照片放在两个目录里是常事。全给出来，
+        由调用方决定怎么呈现。
+
+        用途是**上传之前**就告诉用户「这个文件已经在库里了」：客户端先算哈希、
+        问一次，比传完 20 MB 再收到一句「已存在」有用得多。
+        """
+        rows = self._conn().execute(
+            "SELECT * FROM asset WHERE sha256 = ? ORDER BY created_at", (sha256,)
+        )
+        return [dict(r) for r in rows]
 
     def list_assets(self) -> list[dict[str, Any]]:
         return [
@@ -576,6 +649,41 @@ class Catalog:
             )
             conn.commit()
 
+    def set_photo_ref(
+        self,
+        photo_id: str,
+        *,
+        ref_asset_id: str,
+        quality_score: int,
+        self_score: int,
+        imgdb_path: str,
+        imgdb_bytes: int,
+        thumb_path: str,
+    ) -> None:
+        """换掉这张照片的参考图，以及跟着参考图变的那几列。
+
+        `ref_stale` 一并清零：它的含义是「磁盘上的参考图文件变了，但库里的特征还是
+        旧的」，而换参考图正是把特征重算了一遍 —— 不清零的话管理台会一直显示
+        「参考图已变」，而已经不是了。
+
+        **不动** `video_asset_id` / `playable_asset_id` / `title` / `print_width_m` /
+        `fit_mode`：换的是那张图，配的视频和这张照片的身份都还是原来那些。这正是
+        「换参考图」比「删掉重建」好的地方 —— 授权（外键指向 photo.id）和视频关联
+        全都留着。
+        """
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute(
+                "UPDATE photo SET ref_asset_id = ?, quality_score = ?,"
+                " self_score = ?, imgdb_path = ?, imgdb_bytes = ?,"
+                " thumb_path = ?, ref_stale = 0, updated_at = ? WHERE id = ?",
+                (
+                    ref_asset_id, int(quality_score), int(self_score),
+                    imgdb_path, int(imgdb_bytes), thumb_path, now_ms(), photo_id,
+                ),
+            )
+            conn.commit()
+
     def photos_referencing_asset(self, asset_id: str) -> list[dict[str, Any]]:
         rows = self._conn().execute(
             "SELECT * FROM photo WHERE ref_asset_id = ? OR video_asset_id = ?"
@@ -583,6 +691,26 @@ class Catalog:
             (asset_id, asset_id, asset_id),
         )
         return [dict(r) for r in rows]
+
+    def delete_photo(self, photo_id: str) -> None:
+        """删掉 photo 行与它的授权。**asset 行与磁盘文件都留着。**
+
+        与 `_photo_detach_video` 同一条理由：同一段视频可能配给了别的照片，asset
+        的清理是垃圾回收的活，不该由一次删除顺带做 —— 那会让这个操作的失败模式
+        变成「删一张照片时把别人的视频删了」。参考图的 asset 也留着，于是同一个
+        文件之后还能重新入库（内容哈希会认出它，不用再传一遍）。
+
+        `recognize_log` 里的历史**不动**：那是排查记录，删照片不该让「上周它扫得
+        出来」这件事消失。查不到 photo 行时那几条会显示成 orphan，`_history`
+        本来就能处理（`photo is None` 分支）。
+
+        幂等：不存在的 id 什么也不做。
+        """
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("DELETE FROM photo_grant WHERE photo_id = ?", (photo_id,))
+            conn.execute("DELETE FROM photo WHERE id = ?", (photo_id,))
+            conn.commit()
 
     # ---- recognize_log ----
 
@@ -593,15 +721,18 @@ class Catalog:
         inliers: int | None,
         latency_ms: int,
         via: str | None,
+        reason: str | None = None,
+        runner_up: int | None = None,
         topk: list[tuple[str, int]] | None = None,
     ) -> None:
         with self._write_lock:
             conn = self._conn()
             conn.execute(
                 "INSERT INTO recognize_log (ts, photo_id, inliers, latency_ms, via,"
-                " topk_json) VALUES (?,?,?,?,?,?)",
+                " reason, runner_up, topk_json) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     now_ms(), photo_id, inliers, int(latency_ms), via,
+                    reason, runner_up,
                     json.dumps(topk, ensure_ascii=False) if topk is not None else None,
                 ),
             )
@@ -907,6 +1038,100 @@ class Catalog:
             conn.commit()
 
     # ---- app_config ----
+
+    # ---- mount（素材挂载点，schema v3）----
+
+    def create_mount(
+        self,
+        *,
+        name: str,
+        kind: str,
+        location: str,
+        username: str | None = None,
+        password: str | None = None,
+        enabled: bool = True,
+    ) -> str:
+        if kind not in MOUNT_KINDS:
+            raise ValueError(f"mount.kind 只能是 {MOUNT_KINDS}，收到 {kind!r}")
+        mid = new_id()
+        ts = now_ms()
+        with self._write_lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    "INSERT INTO mount (id, name, kind, location, username,"
+                    " password, enabled, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (mid, name, kind, location, username, password,
+                     1 if enabled else 0, ts, ts),
+                )
+            except sqlite3.IntegrityError as exc:
+                # name 是 UNIQUE。重名不是「你填错了格式」，是「这个名字被占了」，
+                # 所以走 NameTaken 那条既有的路（HTTP 层会翻成 409）。
+                raise NameTaken(f"已经有一个叫 {name!r} 的挂载点") from exc
+            conn.commit()
+        return mid
+
+    def get_mount(self, mount_id: str) -> dict[str, Any] | None:
+        row = self._conn().execute(
+            "SELECT * FROM mount WHERE id = ?", (mount_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_mounts(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM mount"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY name COLLATE NOCASE"
+        return [dict(r) for r in self._conn().execute(sql)]
+
+    def update_mount(self, mount_id: str, **fields: Any) -> None:
+        """按需改几列。`password=None` 表示**不动**口令。
+
+        「不动」和「清空」必须分得开：管理台编辑一个挂载点时口令框是空的（服务端从不
+        回显它），提交上来的 None 意思是「我没改口令」。要真的清空得显式传空字符串。
+        混成一个的话，改一次名字就会把口令抹掉，而下一次浏览才会失败。
+        """
+        allowed = ("name", "kind", "location", "username", "password", "enabled")
+        sets, args = [], []
+        for k in allowed:
+            if k not in fields or fields[k] is None:
+                continue
+            v = fields[k]
+            if k == "kind" and v not in MOUNT_KINDS:
+                raise ValueError(f"mount.kind 只能是 {MOUNT_KINDS}，收到 {v!r}")
+            sets.append(f"{k} = ?")
+            # `enabled` 要转成 0/1。**不能写 `1 if isinstance(v, bool) else v`** ——
+            # 那对 False 也给 1，于是「停用」永远不生效（第一版就是这个 bug，被
+            # `test_停用的挂载点不在白名单里` 抓到的）。
+            args.append(int(bool(v)) if k == "enabled" else v)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        args.append(now_ms())
+        args.append(mount_id)
+        with self._write_lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    f"UPDATE mount SET {', '.join(sets)} WHERE id = ?", tuple(args)
+                )
+            except sqlite3.IntegrityError as exc:
+                raise NameTaken("这个挂载点名字已经被占了") from exc
+            conn.commit()
+
+    def delete_mount(self, mount_id: str) -> None:
+        """删掉一个挂载点。
+
+        **不动已经入库的照片。** 那些照片的 `asset.nas_path` 仍然指着原来的位置；
+        删挂载点只是「以后不从这儿找素材了」。如果那条路径同时也是 `PHOTOAR_ROOTS`
+        里的（或者别的挂载点覆盖着），照片照样能读；否则它们会在下一次一致性检查里
+        被标成 missing —— 那是如实反映现状，不是这个操作造成的损坏。
+        """
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("DELETE FROM mount WHERE id = ?", (mount_id,))
+            conn.commit()
 
     def all_app_config(self) -> dict[str, str]:
         """回**未解析**的 JSON 文本，解析交给 appconfig。

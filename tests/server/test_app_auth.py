@@ -258,6 +258,13 @@ def test_write_endpoints_are_admin_only(env, two_photos):
         ("GET", "/v1/history"),
         ("GET", "/v1/admin/users"),
         ("GET", "/v1/admin/config"),
+        # 这一轮新加的那几个也要在这张清单里。漏掉一个不会有任何地方报错 ——
+        # 只会有一个访客能调的管理接口，而它看起来一切正常。
+        ("GET", "/v1/admin/videos"),
+        ("GET", "/v1/admin/mapping"),
+        ("GET", "/v1/admin/export/template"),
+        ("GET", "/v1/admin/lookup?path=/x"),
+        ("GET", "/v1/admin/mounts"),
     ]
     for method, path in cases:
         r = env.request(method, path, as_=viewer)
@@ -271,6 +278,68 @@ def test_write_endpoints_are_admin_only(env, two_photos):
     assert r.status == 403 and env.body_json(r)["error"] == "admin_only"
     r = env.request("POST", "/v1/upload?name=x.mp4", body=b"x", as_=viewer)
     assert r.status == 403 and env.body_json(r)["error"] == "admin_only"
+    r = env.request("POST", "/v1/admin/import/parse", body=b"x", as_=viewer)
+    assert r.status == 403 and env.body_json(r)["error"] == "admin_only"
+    r = env.post_json("/v1/admin/mounts", {"name": "x", "kind": "local"}, as_=viewer)
+    assert r.status == 403 and env.body_json(r)["error"] == "admin_only"
+
+
+def test_访客能做的只有登录_识别_看自己被授权的那些(env, two_photos):
+    """把「普通用户只能扫出结果」这条钉死。
+
+    做法是**枚举路由表**、把每一条都拿访客去打一遍，然后断言「能通的那些正好是这张
+    白名单」。这比逐个接口写一条断言强的地方在于：以后新加一个接口，如果忘了给它
+    `_require_admin`，这条测试会**立刻**红 —— 而逐个断言的写法对新接口一无所知。
+
+    白名单里为什么是这些：
+      - `ping` / `auth/*`：不登录就没有别的可谈。
+      - `recognize` / `recognize/features` / `model/xfeat`：扫这件事本身。
+      - `targets/*`：端上离线识别要拉自己那份目标库（按授权范围裁过）。
+      - `photos` / `photo/<id>` 及其派生（thumb / ref / imgdb / media）与 `asset/*/stream`：
+        「扫出结果」之后要能看到那张照片和播那段视频。这些全都过 `photo_filter` 或
+        `_photo_or_404`，只给他被授权的那些。
+    """
+    a, _ = two_photos
+    viewer = env.viewer("只扫的人", photo_ids=[a])
+    # asset id 不在 `/v1/photo/<id>` 的响应里（那是实现细节，客户端拿 mediaUrl 就够），
+    # 所以从 catalog 直接取。
+    row = env.srv.catalog.get_photo(a)
+    asset_id = row["playable_asset_id"] or row["video_asset_id"]
+
+    # (方法, 路径) → 访客该不该通得过
+    allowed = [
+        ("GET", "/v1/ping"),
+        ("GET", "/v1/auth/me"),
+        ("GET", "/v1/targets/manifest"),
+        ("GET", "/v1/photos"),
+        ("GET", f"/v1/photo/{a}"),
+        ("GET", f"/v1/photo/{a}/thumb"),
+        ("GET", f"/v1/photo/{a}/ref"),
+        ("GET", f"/v1/photo/{a}/imgdb"),
+        ("GET", f"/v1/photo/{a}/media"),
+    ]
+    if asset_id:
+        allowed.append(("GET", f"/v1/asset/{asset_id}/stream"))
+    for method, path in allowed:
+        r = env.request(method, path, as_=viewer)
+        assert r.status in (200, 206, 304), f"访客该能打 {path}，却拿到 {r.status}"
+
+    # 反面：一切会**改**东西的，以及一切能看到别人东西的
+    denied = [
+        ("POST", "/v1/upload?name=x.jpg"),
+        ("GET", "/v1/fs/list"),
+        ("GET", "/v1/history"),
+        ("GET", "/v1/admin/users"),
+        ("GET", "/v1/admin/mapping"),
+        ("GET", "/v1/admin/videos"),
+        ("GET", "/v1/admin/mounts"),
+        ("GET", "/v1/admin/lookup?path=/x"),
+        ("GET", "/v1/admin/export/users"),
+        ("DELETE", f"/v1/photo/{a}/video"),
+    ]
+    for method, path in denied:
+        r = env.request(method, path, body=b"{}", as_=viewer)
+        assert r.status == 403, f"访客不该能打 {path}，却拿到 {r.status}"
 
 
 def test_attach_video_is_admin_only_even_for_a_granted_photo(env, two_photos):
