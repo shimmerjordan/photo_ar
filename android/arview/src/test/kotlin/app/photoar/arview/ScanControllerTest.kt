@@ -250,25 +250,80 @@ class ScanControllerTest {
     }
 
     @Test
-    fun `目标装好但一直没找到图会回到扫描`() {
+    fun `目标装好但一直没找到图_就一直等，既不放弃也不退全屏`() {
+        // 这条断言改过两次，两次的理由都要留着：
+        //  - 最早断言「回到扫描」。语义反了：识别是对的，再扫一遍也一样（失败原因不是
+        //    这一帧没对准），结果是「扫到了、认出来了、什么都没发生」。
+        //  - 然后断言「退到全屏播放」。那能保证有视频看，但它把**贴合为什么没成**盖住了：
+        //    屏幕上出现一段全屏视频，与「AR 完全正常」在观感上无从区分。
+        // 现在两条都不做：一直留在 TRACKING 等，把 ARCore 的原话打在调试日志里。
         matchOnce()
         c.onTargetLoaded(hit().photoId)
-        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
+        c.onMedia(hit().photoId, media())
+        c.onPlayerReady()
+        fx.clear()
+        clock.advance(60_000)
         c.tick()
-        assertEquals(ScanState.SCANNING, c.state)
-        assertTrue(fx.notices().contains(NoticeKind.TARGET_NOT_FOUND))
+
+        assertEquals("一直等，出口是用户按退出", ScanState.TRACKING, c.state)
+        assertEquals("没贴上就一帧都不该播", 0, fx.count("playVideo"))
+        assertEquals("也不该放掉这次命中", 0, fx.count("releaseTarget"))
+        assertTrue("但要一直有一句能照着做的提示", NoticeKind.TRACKING_HELP in fx.notices())
     }
 
     @Test
-    fun `没找到图的上限比播过之后丢失的短`() {
-        // 两个上限故意不一样：还没找到图时用户在「对准」，等久了不如早点放他重来；
-        // 播过之后是「手挪开了」，放弃等于扔掉进度。这条测试把这层语义钉住 ——
-        // 合成一个常量的话，两边必然有一边是错的。
+    fun `等的时候要给一句能照着做的提示`() {
+        // 库里的照片打印宽度大多未知，那时 ARCore 必须靠移动手机量尺度 —— 不告诉他
+        // 「晃一下」，它可能永远量不出来。而现在这一段没有放弃超时了，所以这句提示是
+        // 它**唯一**的输出。
         matchOnce()
         c.onTargetLoaded(hit().photoId)
-        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS)
+        fx.clear()
+
+        clock.advance(ScanController.TRACKING_HELP_MS - 1)
         c.tick()
-        assertEquals("到上限那一刻还不放弃", ScanState.TRACKING, c.state)
+        assertFalse("还不到时候", NoticeKind.TRACKING_HELP in fx.notices())
+
+        clock.advance(2)
+        c.tick()
+        assertTrue(NoticeKind.TRACKING_HELP in fx.notices())
+        assertEquals(ScanState.TRACKING, c.state)
+    }
+
+    @Test
+    fun `那句提示每次命中只给一次`() {
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        clock.advance(ScanController.TRACKING_HELP_MS + 1)
+        c.tick()
+        fx.clear()
+        clock.advance(500)
+        c.tick()
+        assertFalse(NoticeKind.TRACKING_HELP in fx.notices())
+    }
+
+    @Test
+    fun `贴合成功时不给那句提示`() {
+        // 正常路径上（装好目标之后几百毫秒就跟上）用户不该看到它闪一下。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        c.onTracking(hit().photoId, true)
+        fx.clear()
+        clock.advance(30_000)
+        c.tick()
+        assertFalse(NoticeKind.TRACKING_HELP in fx.notices())
+    }
+
+    @Test
+    fun `没贴上过就没有上限，播过之后丢失才有`() {
+        // 两段故意不一样：还没贴上过时放弃等于扔掉一次正确的命中（而且再扫一遍不会
+        // 更容易成功）；播过之后持续丢失是「手挪开了、换了一张」，那时候必须放手，
+        // 否则下一张照片永远扫不进来。合成一条的话，两边必然有一边是错的。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        clock.advance(10 * ScanController.LOST_GIVEUP_MS)
+        c.tick()
+        assertEquals("没贴上过：一直等", ScanState.TRACKING, c.state)
 
         val other = controllerWith(null)
         other.start()
@@ -281,9 +336,12 @@ class ScanControllerTest {
         other.onMedia(hit().photoId, media())
         other.onPlayerReady()
         other.onTracking(hit().photoId, false)
-        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
+        clock.advance(ScanController.LOST_GIVEUP_MS - 1)
         other.tick()
-        assertEquals("播过之后用的是更长的那个上限", ScanState.PAUSED, other.state)
+        assertEquals("到点之前还留着播放位置", ScanState.PAUSED, other.state)
+        clock.advance(2)
+        other.tick()
+        assertEquals("到点就放手，否则下一张照片扫不进来", ScanState.SCANNING, other.state)
     }
 
     // ---- 命中到出画的总预算 ----
@@ -341,14 +399,15 @@ class ScanControllerTest {
 
     @Test
     fun `还没找到图时不提示慢`() {
-        // 这一路有 TARGET_NOT_FOUND，那句话更准（说的是「再对准一下」）。
+        // 这一段由 TRACKING_HELP 负责，那句话更准（说的是「晃一下手机」）。
+        // 「视频有点慢」在这里是错的诊断 —— 卡住的不是视频。
         matchOnce()
         c.onTargetLoaded(hit().photoId)
         fx.clear()
-        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
+        clock.advance(ScanController.TRACKING_HELP_MS + 1)
         c.tick()
         assertFalse(NoticeKind.VIDEO_SLOW in fx.notices())
-        assertTrue(NoticeKind.TARGET_NOT_FOUND in fx.notices())
+        assertTrue(NoticeKind.TRACKING_HELP in fx.notices())
     }
 
     @Test
@@ -629,14 +688,14 @@ class ScanControllerTest {
     }
 
     @Test
-    fun `离线命中不会误报认出来但没找到`() {
+    fun `离线命中不会误报贴合失败`() {
         val local = controllerWith(hit())
         local.start()
         local.onTracking(hit().photoId, true)
         fx.clear()
         clock.advance(30_000)
         local.tick()
-        assertFalse(NoticeKind.TARGET_NOT_FOUND in fx.notices())
+        assertFalse(NoticeKind.TRACKING_HELP in fx.notices())
         assertEquals(ScanState.TRACKING, local.state)
     }
 

@@ -3,6 +3,7 @@ package app.photoar.arview.gl
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.util.Log
+import app.photoar.arview.FrameStats
 import app.photoar.arview.Geometry
 import app.photoar.arview.PoseFilter
 import app.photoar.arview.ar.ArSessionHolder
@@ -50,20 +51,32 @@ class ArRenderer(
          * 丢掉 FULL_TRACKING 之后还继续贴多久（毫秒）。
          *
          * 斜视时 ARCore 认不出图案（透视压缩 + 反光），会降级到 LAST_KNOWN_POSE；
-         * `getUpdatedTrackables` 也不保证每帧都带上这张图。这两件事都是**几十到几百
-         * 毫秒级的空档**，而不是「照片没了」。没有这个窗口，空档会被直接判成丢失 ——
-         * 视频暂停、弹提示、再恢复，表现为一动就闪。
+         * `getUpdatedTrackables` 也不保证每帧都带上这张图。没有这个窗口，这些空档会被
+         * 直接判成丢失 —— 视频暂停、弹提示、再恢复，表现为一动就闪。
          *
-         * 上限存在的理由：滑行期间用的是世界跟踪推出来的位姿，而世界跟踪会漂；照片
-         * 真被拿走时也只能靠超时发现（ARCore 不会告诉你「这张图不见了」，它只会一直
-         * 报 LAST_KNOWN_POSE）。2 秒是取舍点 —— 足够盖住斜视空档，又不至于让人走开
-         * 之后还有一块视频悬在空气里好几秒。
+         * 上限存在的理由：滑行期间用的是世界跟踪推出来的位姿，而世界跟踪会漂；照片真被
+         * 拿走时也只能靠超时发现（ARCore 不会告诉你「这张图不见了」，它只会一直报
+         * LAST_KNOWN_POSE）。
          *
-         * **这是真机上第一个要调的旋钮。** 如果还有「一动就闪」就往大调；如果出现
-         * 「视频黏在空气里」就往小调。
+         * ## 2 秒 → 3 秒
+         *
+         * 原来那 2 秒是按「斜视 + `getUpdatedTrackables` 空档」定的，那些是几十到几百
+         * 毫秒的事。但真机上用户的持握方式带来了一类更长的空档：**一只手拿着照片、手指
+         * 压在边缘**，加上覆膜反光 —— ARCore 会连续好几百毫秒认不出图案，而挪一下手指或者
+         * 换个角度避开反光又要一两秒。2 秒的窗口在这种情况下会反复到点，表现是视频每隔
+         * 几秒暂停一下、弹一句「照片离开画面」，比彻底不显示更烦人。
+         *
+         * 3 秒仍然远短于「走开之后一块视频悬在空气里」会让人觉得出错的时长。而且它只影响
+         * **已经贴上过**的那段 —— 还没贴上时归 `ScanController.TRACKING_HELP_MS` 管。
+         *
+         * **这仍然是真机上第一个要调的旋钮。** 还有「一动就闪」就往大调；出现「视频黏在
+         * 空气里」就往小调。
          */
-        const val COAST_MS = 2_000L
+        const val COAST_MS = 3_000L
         const val COAST_NS = COAST_MS * 1_000_000L
+
+        /** 贴不上时诊断日志的最小间隔（1 秒）。每帧一行会把 logcat 刷满。 */
+        const val DIAG_INTERVAL_NS = 1_000_000_000L
     }
 
     /** 渲染线程 → 主线程。实现里必须 post 到主线程，不能直接碰状态机。 */
@@ -74,6 +87,14 @@ class ArRenderer(
 
         /** GL 资源就绪、相机纹理已分配，此时才能 `session.resume()`。 */
         fun onGlReady()
+
+        /**
+         * 给调试界面的一行。**不参与任何判定。**
+         *
+         * 走 Host 而不是只写 logcat：让用户在手机上截个图就能告诉我，比教他连 adb 快
+         * 得多 —— 而现场出问题时手里只有手机。
+         */
+        fun onDiagnostic(line: String)
     }
 
     private val background = CameraBackground()
@@ -143,6 +164,21 @@ class ArRenderer(
     /** 打印宽度与 ARCore extentX 的对比只在换目标后报一次，不然每帧一行日志。 */
     private var widthCheckDone = false
 
+    /** 上一次打诊断的时刻（nanoTime）。0 = 还没打过。GL 线程独占。 */
+    private var lastDiagNs = 0L
+
+    /**
+     * 主线程写：要不要往调试界面报东西。
+     *
+     * 关着的时候连字符串都不拼（见 [FrameStats.frame] 的注释）。这不是省内存 ——
+     * 这些行是**在渲染线程上**拼的，而它每 16.7ms 就要交一帧。
+     */
+    @Volatile
+    var diagnostics: Boolean = false
+
+    /** GL 帧耗时。只在 GL 线程上碰。 */
+    private val stats = FrameStats()
+
     private val rawT = FloatArray(3)
     private val rawQ = FloatArray(4)
 
@@ -189,7 +225,33 @@ class ArRenderer(
         ar.session?.setDisplayGeometry(0, width, height)
     }
 
+    /**
+     * 只做计时，正事全在 [drawFrame] 里。
+     *
+     * 拆成两个方法是因为 [drawFrame] 有六处提前 return（会话没建好、相机不可用、
+     * 没在跟踪、视频还没帧…），而计时要**每条路都算上** —— 恰恰是「早早 return 的
+     * 那些帧」能证明慢的不是渲染。用 try/finally 而不是在每个 return 前补一句：
+     * 补漏一处，那一路就从统计里消失，而消失的方向永远是「看起来更快」。
+     *
+     * 计时不含 `session.update()` 之外的等待吗？含。`updateMode = BLOCKING` 会让
+     * update 卡到下一帧相机图像到达为止，所以这里量出来的 fps 就是相机的实际帧率，
+     * 而「均」里包含那段等待。判断卡不卡要看**峰值**和卡帧数，不是均值。
+     */
     override fun onDrawFrame(gl: GL10?) {
+        if (!diagnostics) {
+            drawFrame()
+            return
+        }
+        val startNs = System.nanoTime()
+        try {
+            drawFrame()
+        } finally {
+            val endNs = System.nanoTime()
+            stats.frame(endNs - startNs, endNs)?.let { host.onDiagnostic(it) }
+        }
+    }
+
+    private fun drawFrame() {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val session = ar.session ?: return
 
@@ -240,6 +302,23 @@ class ArRenderer(
         val effective = poseFilter.hasPose && worldOk &&
             lastFullAtNs != 0L && (nowNs - lastFullAtNs) <= COAST_NS
 
+        // 贴不上时每秒打一行 ARCore 的原话。理由见 `ArSessionHolder.diagnose` ——
+        // 一句话版：「贴不上」有三个修法毫不相干的原因，而不问 ARCore 就只能猜，
+        // 而我已经猜错过两次。
+        //
+        // 只在**没贴上**时打，而且限一秒一行：贴上之后这行没有信息量，而每帧一行会把
+        // logcat 刷满，反而看不到别的。
+        if (!effective && showVideo && diagnostics) {
+            if (nowNs - lastDiagNs >= DIAG_INTERVAL_NS) {
+                lastDiagNs = nowNs
+                val line = ar.diagnose(frame)
+                Log.i(TAG, "贴不上：$line")
+                host.onDiagnostic(line)
+            }
+        } else if (effective) {
+            lastDiagNs = 0L
+        }
+
         // 上报的名字必须在 dropPose 之前取。
         val reportName = if (effective) activeName else null
         val now = reportName to effective
@@ -260,7 +339,11 @@ class ArRenderer(
 
         // 尺度优先取 ARCore 量的 extentX（与 centerPose 同一个尺度），申报的
         // printWidthM 只在它还没给出来时垫一下；未知时 printWidthM 就是 0，合法。
-        val size = Geometry.quadSize(lastExtentX, lastExtentZ, printWidthM, refAspect) ?: return
+        val photo = Geometry.quadSize(lastExtentX, lastExtentZ, printWidthM, refAspect) ?: return
+        // 视频按自己的比例装进照片那块矩形：不裁、不变形，露出来的是照片本身。
+        // 理由见 [Geometry.videoQuad] —— 一句话版：比例对不上时该让的是「填满」，
+        // 不是「画面内容」。
+        val size = Geometry.videoQuad(photo, videoAspect)
         if (size.widthM != lastQuadW || size.heightM != lastQuadH) {
             lastQuadW = size.widthM
             lastQuadH = size.heightM
@@ -280,7 +363,7 @@ class ArRenderer(
             projection = projection,
             textureId = videoTexture.textureId,
             stMatrix = videoTexture.stMatrix,
-            uv = Geometry.fillCropUv(size.widthM / size.heightM, videoAspect),
+            uv = Geometry.FULL_UV,
             alpha = Geometry.fadeAlpha(elapsedMs),
         )
     }
@@ -313,13 +396,12 @@ class ArRenderer(
         widthCheckDone = true
         val declared = printWidthM
         val declaredText =
-            if (declared > 0f) "${"%.1f".format(declared * 100f)} cm" else "未知（由 ARCore 估）"
-        Log.i(
-            TAG,
-            "目标 ${image.name} 尺寸：申报 $declaredText，" +
-                "ARCore 量到 ${"%.1f".format(image.extentX * 100f)} × " +
-                "${"%.1f".format(image.extentZ * 100f)} cm。四边形用的是 ARCore 那个。",
-        )
+            if (declared > 0f) "${"%.1f".format(declared * 100f)}cm" else "未知(ARCore 自己量)"
+        val line = "贴上了 ${image.name.take(8)} 申报$declaredText " +
+            "ARCore ${"%.1f".format(image.extentX * 100f)}×" +
+            "${"%.1f".format(image.extentZ * 100f)}cm"
+        Log.i(TAG, "$line（四边形用的是 ARCore 那个）")
+        if (diagnostics) host.onDiagnostic(line)
     }
 
     private fun maybeCapture(frame: com.google.ar.core.Frame) {
@@ -329,7 +411,12 @@ class ArRenderer(
         var image: android.media.Image? = null
         try {
             image = frame.acquireCameraImage()
-            host.onFrameReady(seq, grabber.toJpeg(image))
+            // 这一段是 GL 线程上唯一与渲染无关的重活（YUV→NV21→JPEG，1280×960）。
+            // 单独计时的理由见 [FrameStats]：混进每帧均值里它会被 24 帧摊薄成看不见。
+            val t0 = if (diagnostics) System.nanoTime() else 0L
+            val jpeg = grabber.toJpeg(image)
+            if (diagnostics) stats.grab(System.nanoTime() - t0)
+            host.onFrameReady(seq, jpeg)
         } catch (e: NotYetAvailableException) {
             // 这一帧的 CPU 图像还没到，下一轮再试；不算失败
             host.onFrameFailed(seq)

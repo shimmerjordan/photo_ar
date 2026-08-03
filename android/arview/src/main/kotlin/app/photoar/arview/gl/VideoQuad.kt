@@ -112,7 +112,9 @@ class VideoQuad {
     /**
      * @param model      照片 centerPose 的 4x4 矩阵
      * @param stMatrix   SurfaceTexture 的变换矩阵；不套它视频会上下翻转
-     * @param uv         [Geometry.fillCropUv] 算出来的居中裁切
+     * @param uv         纹理的可见区域。AR 这条路现在恒定是 [Geometry.FULL_UV]
+     *                   （整张用，靠 [Geometry.videoQuad] 把四边形做成视频的比例）；
+     *                   参数留着，是因为裁切与「摆成什么形状」是两件正交的事。
      * @param alpha      淡入进度
      */
     fun draw(

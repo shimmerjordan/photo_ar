@@ -35,8 +35,15 @@ enum class NoticeKind {
     /** 走了 thumb 端上现场 addImage 的降级路径（§13）。 */
     IMGDB_FALLBACK,
 
-    /** 目标装好了但 10 秒没在画面里找到，回到扫描。 */
-    TARGET_NOT_FOUND,
+    /**
+     * 目标装好了、还没在画面里找到，给一句**能照着做**的提示。
+     *
+     * 这条替代了原来那句「再对准一下」。原来那句是错的建议：库里的照片打印宽度大多是
+     * 未知的（手机上传时问不出来），而 ARCore 对未知尺寸的图**必须靠移动手机来量尺度**
+     * （见 `ArSessionHolder.loadTargetFromBitmap` 的注释）。让用户拿得更稳，正好是
+     * 反方向。
+     */
+    TRACKING_HELP,
 
     /** 关联的视频文件已不在 NAS 上（§13）。 */
     ASSET_MISSING,
@@ -231,10 +238,25 @@ class ScanController(
          * | 识别一次 | 2.5s | [RECOGNIZE_WATCHDOG_MS]，HTTP 层是 2s |
          * | 装单张目标 | 4s | [TARGET_LOAD_TIMEOUT_MS]，imgdb 4.3KB + configure |
          * | 取视频地址 | 2.5s | `MEDIA_TIMEOUT_MS`，与上一段**并行** |
-         * | ARCore 找到图 | 4s | [TARGET_FIND_TIMEOUT_MS] |
+         * | ARCore 找到图 | **没有上限** | 见 [TRACKING_HELP_MS]，一直等 |
          * | 播放器就绪 | 剩下的 | 没有单独的超时，全靠这条总预算 |
          *
          * 抽帧与识别（4s）在命中**之前**，所以预算 6s 留给命中之后，总计 10s 打平。
+         *
+         * ⚠️ **「ARCore 找到图」那一行没有上限，所以这条 10 秒的承诺在贴不上时不成立。**
+         * 这一档改过两次，两次的理由都要留着：
+         *
+         * 1. 最早是 4 秒到点就把整次命中丢掉回扫描 —— 用户扫到了、认出来了，屏幕上什么
+         *    都没发生，而再扫一遍也一样（失败原因不是这一帧没对准）。
+         * 2. 然后是 8 秒到点退成全屏播放。这条能保证「有视频看」，但它把**贴合到底为什么
+         *    没成**盖住了：屏幕上出现的是一段全屏视频，与「AR 完全正常」在观感上无从区分，
+         *    于是两轮排查都只能靠外部现象反推。
+         * 3. 现在两条都不做：一直等，把 ARCore 的原话打在屏幕上（调试模式）。
+         *    出口是用户按「退出」。
+         *
+         * 这条预算的提示（[NoticeKind.VIDEO_SLOW]）不会在这段里误报 —— `tickPlayBudget`
+         * 第二行 `if (!everTracked) return` 挡住了：还没贴上时它一个字都不说，
+         * 那一段由 [NoticeKind.TRACKING_HELP] 负责，那句话更准。
          *
          * **它只在一个地方是唯一的闸门**：`everTracked && 播放器一直不就绪`。那种情况
          * `notTrackingSince` 是 null，[tickWaitingForTracking] 第一行就返回了 —— 在这条
@@ -246,18 +268,16 @@ class ScanController(
         const val HIT_TO_PLAY_BUDGET_MS = 6_000L
 
         /**
-         * 目标装好之后，多久没在画面里找到就放弃、回到扫描。
+         * 等了多久还没贴上，就把 [NoticeKind.TRACKING_HELP] 那句提示打出来。
          *
-         * **与 [LOST_GIVEUP_MS] 分开**（原来共用 10s）。两者的正确答案本来就不同：
+         * 1.5 秒：短到「贴合一切顺利」的情况看不到它（实测装好目标之后通常几百毫秒就
+         * 跟上了），长到不会在正常路径上闪一下。
          *
-         * - 这一条是「还没找到」：屏幕上什么都没有，纯死等，而且整段都算在命中到出画
-         *   的 10 秒里 —— 应该短。放弃的代价也很低：回到扫描后 400ms 就再试一次。
-         * - [LOST_GIVEUP_MS] 是「播过之后丢了」：用户很可能只是在挪手机，放弃要连播放
-         *   位置一起丢 —— 应该长。
-         *
-         * 共用一个数的结果是「还没找到」白占 10 秒，直接把总预算吃穿。
+         * **没有配套的放弃超时了。** 原来这条提示是「在 `TARGET_FIND_TIMEOUT_MS` 到点
+         * 之前先教他怎么做」，那个超时已经删掉（见 [HIT_TO_PLAY_BUDGET_MS] 里那三条），
+         * 所以现在它是这一段唯一的输出：一直等、一直提示，出口是用户按「退出」。
          */
-        const val TARGET_FIND_TIMEOUT_MS = 4_000L
+        const val TRACKING_HELP_MS = 1_500L
 
         /** §11.6：**播过之后**持续丢失跟踪超过 10 秒，视为已转向另一张照片，回到扫描。 */
         const val LOST_GIVEUP_MS = 10_000L
@@ -317,6 +337,10 @@ class ScanController(
     private var everTracked = false
     private var tracking = false
     private var notTrackingSince: Long? = null
+
+    /** 这次命中已经打过「怎么贴上」那句提示。见 [TRACKING_HELP_MS]。 */
+    private var trackingHelpShown = false
+
     private var playerReady = false
     private var media: MediaInfo? = null
 
@@ -393,7 +417,7 @@ class ScanController(
      */
     private fun tickPlayBudget(now: Long) {
         if (everPlayed || slowNoticeShown) return
-        if (!everTracked) return // 还没找到图：交给 TARGET_FIND_TIMEOUT_MS，那条的提示更准
+        if (!everTracked) return // 还没贴上：那一段归 TRACKING_HELP 管，那句话更准
         if (videoProblemReported) return // 已经说过更具体的原因了
         if (now - hitAt <= HIT_TO_PLAY_BUDGET_MS) return
         slowNoticeShown = true
@@ -427,12 +451,24 @@ class ScanController(
 
     private fun tickWaitingForTracking(now: Long) {
         val since = notTrackingSince ?: return
-        // 「还没找到过」与「播过之后丢了」用不同的上限，理由见 TARGET_FIND_TIMEOUT_MS。
-        val limit = if (everTracked) LOST_GIVEUP_MS else TARGET_FIND_TIMEOUT_MS
-        if (now - since <= limit) return
-        // §11.6：只有两个恢复抽帧的条件 —— 用户主动退出，或持续丢失跟踪
-        // 超过上限（视为已转向另一张照片）。
-        if (!everTracked) notice(NoticeKind.TARGET_NOT_FOUND)
+
+        // 还没贴上时，先把「怎么做」告诉他。必须在超时之前给，而且要留时间让他照着做
+        // —— 未知尺寸的图要靠移动手机才量得出尺度，不说他不会动。
+        if (!everTracked && !trackingHelpShown && now - since >= TRACKING_HELP_MS) {
+            trackingHelpShown = true
+            notice(NoticeKind.TRACKING_HELP)
+        }
+
+        // **还没贴上过：一直等，没有上限。**
+        //
+        // 这一段以前有过两种出口，都删了（理由见 [HIT_TO_PLAY_BUDGET_MS] 里那三条）：
+        // 4 秒回扫描，等于扔掉一次正确的命中；8 秒退全屏，等于把「为什么贴不上」盖住。
+        // 现在的出口只有一个 —— 用户按「退出」。屏幕上同时有 [TRACKING_HELP] 那句
+        // 可执行的提示，调试模式下还有 ARCore 的原话（`ArSessionHolder.diagnose`）。
+        if (!everTracked) return
+
+        // 播过之后丢了这么久：视为已转向另一张照片（§11.6 恢复抽帧的两个条件之一）。
+        if (now - since <= LOST_GIVEUP_MS) return
         resetTarget()
         setState(ScanState.SCANNING)
     }
@@ -535,7 +571,7 @@ class ScanController(
     /**
      * @param alreadyTracking 目标此刻**已经**在画面里被跟踪着 —— 离线命中就是这种
      *   情况：是 ARCore 先认出来才有这次命中的，不存在「装好了但还没找到」的空窗，
-     *   所以那 10 秒的 [NoticeKind.TARGET_NOT_FOUND] 判定不该启动。
+     *   所以那段「装好了但还没找到」的判定（[TRACKING_HELP_MS]）不该启动。
      */
     fun onTargetLoaded(
         photoId: String,
@@ -611,9 +647,9 @@ class ScanController(
     }
 
     fun onPlaybackEnded() {
+        // 没有 ARCore 的机型是全屏播放，播完就回到扫描（那是它唯一的出口）。
+        // AR 模式下播放器是循环的，正常不会走到这里。
         if (!arAvailable) {
-            // 全屏兜底模式播完就回到扫描。AR 模式下播放器是循环的，
-            // 正常不会走到这里。
             exitTarget()
         } else if (state == ScanState.PLAYING) {
             fx.playVideo()
@@ -700,6 +736,7 @@ class ScanController(
         everPlayed = false
         videoProblemReported = false
         slowNoticeShown = false
+        trackingHelpShown = false
         // §11.6：命中后立即停止抽帧与识别请求。靠 state 不再是 SCANNING 实现。
         pendingCaptureSeq = null
         inFlightSeq = null
@@ -732,6 +769,9 @@ class ScanController(
         tracking = false
         everTracked = false
         notTrackingSince = null
+        // **本次命中**的属性，必须清 —— 不清的话下一次命中一上来就不再提示「晃一下
+        // 手机」，而那句提示是这一段唯一能让用户照着做的东西。
+        trackingHelpShown = false
         // hitAt / everPlayed / videoProblemReported / slowNoticeShown 不在这里清：
         // 它们都是「本次命中」的属性，由 acceptHit 统一置位。这里清了没坏处，但
         // 会让「哪里负责初始化」变成两个地方 —— 而漏一个字段就是一次静默的错判。

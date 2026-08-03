@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Handler
@@ -20,6 +21,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.os.Build
+import app.photoar.arview.DiagLog
 import app.photoar.arview.EndpointCenter
 import app.photoar.arview.Hit
 import app.photoar.arview.NoticeKind
@@ -48,6 +50,15 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
 
         private const val REQ_CAMERA = 1001
 
+        // 与 `app.photoar.standalone.pixel.PixelPalette` 一一对应。见 buildUi 里那段
+        // 注释：跨模块引不过来（会成环），所以这五个值是**手抄**的，改配色要一起改。
+        private const val PIXEL_INK = 0xFFE8EAF0.toInt()
+        private const val PIXEL_PANEL = 0xE6171A21.toInt() // 带一点透明，相机画面透出来
+        private const val PIXEL_EDGE = 0xFF3A4150.toInt()
+        private const val PIXEL_AMBER = 0xFFFFC46B.toInt()
+        private const val PIXEL_AMBER_DEEP = 0xFF6B4A12.toInt()
+        private const val PIXEL_ON_AMBER = 0xFF2A1A00.toInt()
+
         /**
          * 从「开始安装」到「必须有结论」的上限。
          *
@@ -71,6 +82,18 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
     private lateinit var notice: TextView
     private lateinit var exitButton: Button
     private lateinit var saveButton: Button
+
+    /**
+     * 调试日志。只在调试模式下建出来（版本号连点 10 次开）。
+     *
+     * 放在**左上角**而不是跟着底部那条提示：底部那条是给用户看的（「晃一下手机」），
+     * 这一块是给排查看的十几行状态 —— 两者叠在一起会把前者挤掉，而前者是用户唯一
+     * 能照着做的东西。
+     */
+    private var diagView: TextView? = null
+
+    /** 非空 ⇔ 调试模式开着。滚动窗口与折叠都在它里面，见 [DiagLog]。 */
+    private var diagLog: DiagLog? = null
 
     /**
      * 当前锁住的那张照片。从 [ScanEvent.Matched] 拿，退出目标时清掉。
@@ -131,29 +154,57 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
         }
     }
 
+    /**
+     * 像素风的一块面板：实心底 + 2dp 直角硬边框。
+     *
+     * 用 `GradientDrawable` 而不是 XML 里的 shape：这个 Activity 声明在 **library**
+     * 的清单里，整屏布局都是代码写的（外壳只要 include 这个模块就自动有它，不用抄
+     * 一份资源）。为一个 drawable 破例引入 res/ 会让"这一屏不带资源"这条约定失效。
+     */
+    private fun pixelPanel(fill: Int, stroke: Int): android.graphics.drawable.Drawable =
+        android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+            setColor(fill)
+            setStroke(dp(2), stroke)
+            cornerRadius = 0f // 直角。像素画里没有抗锯齿的曲线。
+        }
+
+    /** 像素风的按钮：琥珀底、深色字、直角、等宽。 */
+    private fun pixelButton(label: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            text = label
+            isAllCaps = false
+            typeface = Typeface.MONOSPACE
+            setTextColor(PIXEL_ON_AMBER)
+            background = pixelPanel(PIXEL_AMBER, PIXEL_AMBER_DEEP)
+            stateListAnimator = null // 默认那套是抬起的阴影，而阴影是模糊的
+            minHeight = dp(48) // Material 的触摸目标下限
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            visibility = View.GONE
+            setOnClickListener { onClick() }
+        }
+
     private fun buildUi() {
         root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             layoutParams = ViewGroup.LayoutParams(MATCH, MATCH)
         }
 
+        // 这一屏是原生 View（不是 Compose），所以像素风的那套值要在这里再写一遍。
+        // 三个值必须和 `pixel.PixelPalette` 对上：琥珀 #FFC46B、面板 #171A21、
+        // 边框 2dp 直角。对不上的后果是外壳一套风格、扫描界面另一套，而用户在这两屏
+        // 之间来回跳。**没有办法在编译期检查这件事** —— `:arview` 在 `:app` 下层，
+        // 引不到那个包（引了会成环）。所以改配色时这里要一起改。
         notice = TextView(this).apply {
-            setTextColor(Color.WHITE)
+            setTextColor(PIXEL_INK)
             textSize = 15f
+            typeface = Typeface.MONOSPACE
             setPadding(dp(16), dp(10), dp(16), dp(10))
-            setBackgroundColor(Color.argb(180, 0, 0, 0))
+            background = pixelPanel(PIXEL_PANEL, PIXEL_EDGE)
             visibility = View.GONE
         }
-        exitButton = Button(this).apply {
-            text = "退出这张"
-            visibility = View.GONE
-            setOnClickListener { runtime?.controller?.exitTarget() }
-        }
-        saveButton = Button(this).apply {
-            text = SAVE_IDLE_TEXT
-            visibility = View.GONE
-            setOnClickListener { onSaveClicked() }
-        }
+        exitButton = pixelButton("退出这张") { runtime?.controller?.exitTarget() }
+        saveButton = pixelButton(SAVE_IDLE_TEXT) { onSaveClicked() }
         // 两个按钮并排。竖排的话底部这一条会占掉画面下半部分 —— 而画面正中间是
         // 用户要对准照片的地方。
         val actions = LinearLayout(this).apply {
@@ -174,6 +225,28 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
                 bottomMargin = dp(24)
             },
         )
+        if (debugEnabled()) {
+            diagLog = DiagLog()
+            diagView = TextView(this).apply {
+                setTextColor(PIXEL_AMBER)
+                textSize = 8f
+                // 等宽：每行的时间戳要对齐成一列，否则十几行下来眼睛得逐行找起点。
+                typeface = Typeface.MONOSPACE
+                setPadding(dp(6), dp(4), dp(6), dp(4))
+                setBackgroundColor(Color.argb(150, 0, 0, 0))
+                // 半透明而不是实底：这块日志占了屏幕上四分之一，而它盖住的正是用户
+                // 要对准照片的那一片。透一点，至少还看得见照片在不在框里。
+                text = "调试日志：等第一行…"
+            }
+            root.addView(
+                diagView,
+                // 左上角、宽度只占 3/4：右上角留给系统状态栏那些图标，而且这块日志
+                // 每行都不长，铺满整宽只是把背景色摊得更大。
+                FrameLayout.LayoutParams(MATCH, WRAP, Gravity.TOP or Gravity.START).apply {
+                    marginEnd = dp(72)
+                },
+            )
+        }
         setContentView(root)
     }
 
@@ -381,8 +454,12 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
             // （settings.gradle.kts 里那条约束），拿不到外壳的 Activity 类。
             onNeedLogin = { main.post { finish() } },
             onDeviceFeatures = center.config.onDeviceFeatures,
+            // 判 diagLog 而不是再调一次 debugEnabled()：两者必须同真同假，否则运行时
+            // 会一路打点然后全部丢掉（或者反过来，界面上一行都不出）。
+            diagnostics = diagLog != null,
         )
         runtime = rt
+        onDiagnostic(if (arReady) "AR 模式" else "无 ARCore，全屏兜底")
         if (arReady) {
             val gl = GLSurfaceView(this)
             glView = gl
@@ -418,6 +495,22 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
     }
 
     // ---- ScanRuntime.Listener ----
+
+    /**
+     * 调试日志的一行。只在调试模式下显示（版本号连点 10 次开）。
+     *
+     * 常态下不显示：它是一屏状态名和数字，对宾客毫无意义。但排查「卡在哪一步」时它是
+     * 唯一的依据 —— 所以要能一键看到，而不是只能连 adb。
+     *
+     * 折叠与时间戳都在 [DiagLog] 里，这里只负责把渲染结果塞进 TextView。**每行都重新
+     * `render()` 一遍整块文本**：一秒十几行，重拼十几个短字符串远不到能看见的开销，
+     * 而换成 append 就要自己处理「折叠时改的是最后一行」，那是两份状态。
+     */
+    override fun onDiagnostic(line: String) {
+        val log = diagLog ?: return
+        log.add(System.currentTimeMillis(), line)
+        diagView?.text = log.render()
+    }
 
     override fun onScanEvent(event: ScanEvent) {
         when (event) {
@@ -513,6 +606,23 @@ class ArScanActivity : Activity(), ScanRuntime.Listener {
         clearNotice = null
         notice.visibility = View.GONE
     }
+
+    /**
+     * 调试模式开着吗。
+     *
+     * ⚠️ **跨模块契约**：这两个字符串必须与 `app.photoar.standalone.DebugMode` 里的
+     * `PREFS` / `KEY_ENABLED` 逐字一致（那边是写入方，入口是设置页连点版本号 10 下）。
+     *
+     * 为什么不直接引那个对象：它在 `:app` 模块里，而这个 Activity 在 `:arview` ——
+     * `:app` 依赖 `:arview`，反过来引会成环。而把 `DebugMode` 搬下来也不行，它用的是
+     * Compose state，而 `:arview` 没有 Compose（这个界面是纯 View 写的）。
+     *
+     * 两处字符串对不上的后果很轻（调试行不显示），但会让人以为「开关没生效」，
+     * 所以两边都留了指向对方的注释。
+     */
+    private fun debugEnabled(): Boolean =
+        getSharedPreferences("photoar_debug", Context.MODE_PRIVATE)
+            .getBoolean("enabled", false)
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 }

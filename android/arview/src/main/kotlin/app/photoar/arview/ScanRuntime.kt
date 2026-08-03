@@ -72,6 +72,14 @@ class ScanRuntime(
      * 把一条没验过的路径设成所有人的默认行为。
      */
     onDeviceFeatures: Boolean = false,
+    /**
+     * 调试模式开着（设置页连点版本号 10 下）。
+     *
+     * 关着的时候这一层与渲染线程**一个字符串都不拼**。不是省内存 —— 打点密度是每
+     * 400ms 一次识别 + 每帧一次渲染，而这两条分别在网络线程和 GL 线程上，后者每
+     * 16.7ms 就要交一帧。
+     */
+    private val diagnostics: Boolean = false,
 ) : ScanEffects {
 
     private companion object {
@@ -84,6 +92,31 @@ class ScanRuntime(
 
         /** 相机 / 会话这类硬失败，界面要给出可操作的提示。 */
         fun onFatal(message: String)
+
+        /**
+         * 调试日志的一行。只在调试模式下显示（设置页连点版本号 10 下）。
+         *
+         * 为什么要显示在屏幕上而不是只写 logcat：一次扫描要穿过抽帧 → 识别 → 装目标 →
+         * 找图 → 取地址 → 播放器就绪 → 贴合，其中**任何一步**不动，屏幕上看到的都是
+         * 「什么都没发生」。而这个 App 出问题的场合恰好是在外面，手里只有手机 ——
+         * 让用户截个图发过来，比教他连 adb 抓 logcat 快得多。
+         *
+         * 实现方负责攒成滚动窗口（[DiagLog]），这里只管一行一行地喂。
+         */
+        fun onDiagnostic(line: String) = Unit
+    }
+
+    /**
+     * 往调试日志写一行。任意线程可调，自己 post 到主线程。
+     *
+     * 用 lambda 而不是直接传 String：关着的时候连拼串都不做（这是在网络线程和 GL 线程
+     * 上调的，见 [diagnostics]）。开着时也不判重 —— 折叠交给 [DiagLog]，它才知道上一行
+     * 是什么。
+     */
+    private inline fun diag(line: () -> String) {
+        if (!diagnostics) return
+        val text = line()
+        main.post { listener.onDiagnostic(text) }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -189,10 +222,20 @@ class ScanRuntime(
     private val player = VideoPlayer(
         context = activity,
         endpoints = endpoints,
-        onReady = { controller.onPlayerReady() },
+        onReady = {
+            diag { "播放器就绪" }
+            controller.onPlayerReady()
+        },
         onEnded = { controller.onPlaybackEnded() },
-        onError = { controller.onPlayerError(it) },
+        onError = {
+            diag { "播放器出错 ${it ?: ""}" }
+            controller.onPlayerError(it)
+        },
         onVideoSize = { w, h ->
+            // 视频比例是四边形形状的输入（`Geometry.videoQuad`）：它没上报之前，视频
+            // 是按**照片**的形状铺的，也就是可能被压扁一两帧。这行日志能区分「一直
+            // 变形」和「头两帧变形」。
+            diag { "视频尺寸 ${w}x$h" }
             renderer?.videoAspect = if (h > 0) w.toFloat() / h else 0f
             videoView?.let { fitVideoView(it, w, h) }
         },
@@ -220,6 +263,7 @@ class ScanRuntime(
         val tex = videoTexture!!
         glView = view
         val r = ArRenderer(holder, tex, rendererHost)
+        r.diagnostics = diagnostics
         renderer = r
         view.preserveEGLContextOnPause = true
         view.setEGLContextClientVersion(2)
@@ -227,6 +271,12 @@ class ScanRuntime(
         view.setRenderer(r)
         view.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         holder.create()?.let { listener.onFatal("ARCore 会话建不起来：$it") }
+        // CPU 图像档位是识别率的**上限**（见 ArSessionHolder.applyCameraConfig），而挑
+        // 没挑上只有这一个数能说明。它也是「相机卡顿」的第一嫌疑：帧率决定 GL 线程的
+        // 预算，60fps 只有 16.7ms/帧。所以这两个数要和帧耗时摆在同一块日志里对着看。
+        diag {
+            "相机 ${holder.cpuImageSize} @${holder.cameraFps ?: "?"}fps 特征路=${featurePath.path}"
+        }
     }
 
     /** 全屏兜底模式：一路相机预览 + 一路视频。 */
@@ -396,6 +446,9 @@ class ScanRuntime(
      * 而真实情况是模型正在下。所以准备工作在另一条线程上做，扫描一秒都不停。
      */
     override fun recognize(seq: Long, jpeg: ByteArray) {
+        diag { "识别#$seq 发出 ${jpeg.size / 1024}KB 走${
+            if (featurePath.path == RecognizePath.FEATURES) "端上特征" else "整帧"
+        }" }
         if (featurePath.path == RecognizePath.FEATURES) {
             val ready = cachedExtractor
             if (ready != null) {
@@ -412,10 +465,21 @@ class ScanRuntime(
 
     /** 跑一次识别并把结果 / 失败送回状态机。两条路共用。 */
     private fun deliver(seq: Long, block: () -> RecognizeOutcome) {
+        // 用 nanoTime 而不是 currentTimeMillis：量的是一段耗时，而墙上时钟会被 NTP 校
+        // 到过去，那时候这个数会变成负的。
+        val startNs = System.nanoTime()
         try {
             val outcome = block()
+            diag {
+                val ms = (System.nanoTime() - startNs) / 1_000_000L
+                "识别#$seq 回 ${ms}ms ${describe(outcome)}"
+            }
             main.post { controller.onRecognized(seq, outcome) }
         } catch (e: HttpFailure) {
+            diag {
+                val ms = (System.nanoTime() - startNs) / 1_000_000L
+                "识别#$seq 失败 ${ms}ms ${e.kind} ${e.message ?: ""}"
+            }
             main.post {
                 if (e.kind == NetErrorKind.UNAUTHORIZED) {
                     controller.onUnauthorized(e.message)
@@ -424,10 +488,26 @@ class ScanRuntime(
                 }
             }
         } catch (e: Throwable) {
+            diag {
+                val ms = (System.nanoTime() - startNs) / 1_000_000L
+                "识别#$seq 异常 ${ms}ms ${e.message ?: e.javaClass.simpleName}"
+            }
             main.post {
                 controller.onRecognizeFailed(seq, NetErrorKind.TRANSPORT, e.message)
             }
         }
+    }
+
+    /**
+     * 一次识别结果压成一行。
+     *
+     * 没命中时把服务端给的 `reason` 原样带出来 —— 「阈值不过」「库里没有」「图太糊」是
+     * 三个不同的下一步，归成一句「没命中」等于把这块日志最有用的一半扔了。
+     */
+    private fun describe(outcome: RecognizeOutcome): String = when (outcome) {
+        is RecognizeOutcome.Matched -> "命中 ${outcome.hit.photoId.take(8)}"
+        is RecognizeOutcome.NoMatch ->
+            "没命中(${outcome.reason ?: "无原因"} 服务端${outcome.latencyMs}ms)"
     }
 
     /**
@@ -540,6 +620,14 @@ class ScanRuntime(
                         holder.loadTargetFromImgdb(hit.photoId, target.bytes)
                     is TargetLoader.Target.Thumb ->
                         holder.loadTargetFromBitmap(hit.photoId, target.bitmap, hit.printWidthM)
+                }
+                diag {
+                    val kind = when (target) {
+                        is TargetLoader.Target.Imgdb -> "imgdb ${target.bytes.size}B"
+                        is TargetLoader.Target.Thumb ->
+                            "缩略图 ${target.bitmap.width}x${target.bitmap.height}"
+                    }
+                    if (err != null) "装目标失败 $kind：$err" else "装上目标 $kind"
                 }
                 main.post {
                     if (err != null) {
@@ -701,9 +789,12 @@ class ScanRuntime(
 
     override fun preparePlayer(hit: Hit, media: MediaInfo) {
         val url = media.resolvedUrl(endpoints()) ?: run {
+            diag { "播放器：没有可播的地址" }
             controller.onMediaFailed(hit.photoId, "没有可播的地址")
             return
         }
+        // 只记 scheme + 是不是本地：完整 URL 里带签名参数，而这块日志是要被截图发出来的。
+        diag { "播放器 prepare ${if (url.startsWith("file:")) "本地文件" else "网络流"}" }
         videoTexture?.let { tex ->
             tex.markStale()
             tex.surface?.let { player.attach(it) }
@@ -741,6 +832,20 @@ class ScanRuntime(
     }
 
     override fun emit(event: ScanEvent) {
+        // 状态迁移是这块日志的骨架：其余每一行都要靠「当时在哪个状态」才读得懂。
+        // 提示也一起记 —— 界面上那条只显示最新一句，被下一句盖掉的往往才是关键的。
+        diag {
+            when (event) {
+                is ScanEvent.StateChanged -> "状态 ${event.from}→${event.to}"
+                is ScanEvent.Matched ->
+                    "锁定 ${event.hit.photoId.take(8)} 申报宽${
+                        "%.0f".format(event.hit.printWidthM * 100f)
+                    }cm 参考比例${"%.2f".format(event.hit.refAspect ?: 0f)}"
+                is ScanEvent.Notice -> "提示 ${event.kind}${
+                    event.detail?.let { "：${it.take(40)}" } ?: ""
+                }"
+            }
+        }
         // lastSeenAt 是「最近 200 张」的排序键（CachePlanner.rank）。在线命中也要记：
         // 不记的话排序退化成入库时间，墙上那张天天扫的会被刚打印的一批顶掉，
         // 而「常扫照片离线可用」正是这份缓存的出口条件。
@@ -786,6 +891,10 @@ class ScanRuntime(
 
         override fun onFrameFailed(seq: Long) {
             main.post { controller.onFrameFailed(seq) }
+        }
+
+        override fun onDiagnostic(line: String) {
+            main.post { listener.onDiagnostic(line) }
         }
 
         override fun onGlReady() {

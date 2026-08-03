@@ -70,7 +70,21 @@ data class FsListing(
     val atRoots: Boolean get() = path == null
 }
 
-/** `GET /v1/history` 里的一条。未命中的记录 [photoId] 为 null。 */
+/**
+ * `GET /v1/history` 里的一条。未命中的记录 [photoId] 为 null。
+ *
+ * @param reason 服务端的判定原因。`ok` / `weak`（内点数或 det 不过）/ `ambiguous`
+ *   （第一名没比第二名高出 `RATIO` 倍，说明库里有近重复）/ `orphan` / `empty`。
+ *   旧记录是 null（这一列是后加的）。
+ *
+ *   **这一列是这个界面存在的理由。** 一次真实排查里 941 条记录只有 `inliers`，
+ *   其中 897 条内点数 160~229（门槛 40）却判了未命中 —— 光看内点数完全分不出挡住
+ *   它们的是「取景不行」还是「库里有重复」，而那两件事一件要改扫描姿势、一件要清库。
+ *   真相是后者。
+ *
+ * @param runnerUp 第二名的内点数。`ambiguous` 的判据就是它和 [inliers] 的比值，
+ *   所以只有原因没有它仍然答不出「差多少、阈值该不该动」。旧记录是 null。
+ */
 data class HistoryEntry(
     val ts: Long,
     val photoId: String?,
@@ -79,8 +93,13 @@ data class HistoryEntry(
     val inliers: Int,
     val latencyMs: Int,
     val via: String?,
+    val reason: String? = null,
+    val runnerUp: Int? = null,
 ) {
     val matched: Boolean get() = photoId != null
+
+    /** 未命中且原因是「库里有近重复」。这一类的修法是删掉重复的那张，不是改取景。 */
+    val ambiguous: Boolean get() = !matched && reason == "ambiguous"
 }
 
 /** `POST /v1/photo` 成功（201）。质量分不达标时服务端返回 4xx，走异常路径。 */
@@ -101,6 +120,91 @@ data class AttachResult(
     val videoAssetId: String?,
     val playableAssetId: String?,
     val transcoded: Boolean,
+)
+
+/**
+ * `GET /v1/admin/lookup` 的结果：一个 NAS 路径在库里是什么身份。
+ *
+ * 两个字段的**基数不一样**，而这正是界面上能给出什么动作的依据：
+ *
+ * - [photo] 最多一个 —— 这个文件是**某一张**照片的参考图（一张照片只有一个参考图）。
+ * - [usedByPhotos] 是个列表 —— 这个文件是**这些**照片配的视频（一段视频可以被多张
+ *   照片用，一段迎宾视频配给几十张是正常用法）。
+ *
+ * 所以：重复的**照片**只能去改那一张已有的（换它的视频）；重复的**视频**根本不是问题，
+ * 直接配给新照片就行。
+ */
+data class LookupResult(
+    val path: String,
+    val exists: Boolean,
+    val kind: String?,
+    val photo: LookupPhoto?,
+    val usedByPhotos: List<LookupPhotoRef>,
+)
+
+/** 这个文件作为参考图对应的那张照片。 */
+data class LookupPhoto(
+    val photoId: String,
+    val title: String?,
+    /** 它**现在**配的视频。null = 还没配。 */
+    val videoPath: String?,
+    val qualityScore: Int,
+)
+
+data class LookupPhotoRef(val photoId: String, val title: String?)
+
+/**
+ * `POST /v1/upload/check` 的结果：**上传之前**问出来的重复情况。
+ *
+ * 两条判断分开，因为下一步动作不同：
+ *
+ * - [nameTaken] / [sameContent]：落地目录里有同名文件。内容一样 → 直接复用那条路径，
+ *   一个字节都不用传；不一样 → 得换个名字（[suggestedName]）。
+ * - [knownContent] / [matches]：这份**内容**库里已经有了。这一条比按名字有用得多 ——
+ *   相册第二次导出同一张照片，文件名可能变了，内容不会变。
+ */
+data class UploadCheck(
+    val name: String,
+    val nameTaken: Boolean,
+    val sameContent: Boolean,
+    val existingPath: String?,
+    val suggestedName: String?,
+    val knownContent: Boolean,
+    val matches: List<AssetIdentity>,
+) {
+    /**
+     * 这次上传能不能整个跳过。
+     *
+     * 同名同内容时那条路径就是我们要的；库里已经认识这份内容时，[matches] 第一条的
+     * 路径同样可用。两种都不用再传一遍。
+     */
+    val reusablePath: String?
+        get() = when {
+            nameTaken && sameContent -> existingPath
+            knownContent -> matches.firstOrNull()?.path
+            else -> null
+        }
+}
+
+/** 一份内容在库里的身份。与服务端 `_identity_of_asset` 一一对应。 */
+data class AssetIdentity(
+    val assetId: String,
+    val path: String?,
+    val kind: String?,
+    val missing: Boolean,
+    /** 它是这张照片的参考图。最多一个 —— 一张照片只有一个参考图。 */
+    val photo: LookupPhoto?,
+    /** 这些照片把它当视频用。是列表 —— 一段视频可以被多张照片配。 */
+    val usedByPhotos: List<LookupPhotoRef>,
+)
+
+/** `POST /v1/photo/<id>/ref` 的结果。换参考图之后那几个跟着图变的数。 */
+data class ReplaceRefResult(
+    val photoId: String,
+    val qualityScore: Int,
+    val selfScore: Int,
+    val imgdbBytes: Long,
+    val elapsedMs: Long,
 )
 
 /** 外壳侧的解析。命名沿用 [ApiParse]，两者合起来才是完整的 §7 客户端。 */
@@ -182,6 +286,14 @@ object CatalogParse {
                 inliers = o.optInt("inliers", 0),
                 latencyMs = o.optInt("latencyMs", 0),
                 via = str(o, "via"),
+                reason = str(o, "reason"),
+                // `optInt` 拿不到时给 0，而 0 和「这条记录没有这一列」是两件事：
+                // 前者是真的没有第二名（库里只有一张），后者是旧记录。
+                runnerUp = if (o.has("runnerUp") && !o.isNull("runnerUp")) {
+                    o.optInt("runnerUp", 0)
+                } else {
+                    null
+                },
             )
         }
 
@@ -198,6 +310,15 @@ object CatalogParse {
             libraryPhotos = o.optInt("libraryPhotos", 0),
         )
     }
+
+    /**
+     * `/v1/upload` 的响应 → 文件在服务端的绝对路径。
+     *
+     * 抛异常而不是回空串：这个路径的下一步用途是拿去 `/v1/photo` 入库，空串会变成
+     * 一句「refPath 不能为空」，而真正的问题在上一步。
+     */
+    fun uploadedPath(json: String): String =
+        str(obj(json), "path") ?: throw ApiParseException("上传响应里没有 path")
 
     fun attachResult(json: String): AttachResult {
         val o = obj(json)
@@ -221,6 +342,89 @@ object CatalogParse {
 
     fun attachBody(videoPath: String): String =
         JSONObject().apply { put("videoPath", videoPath) }.toString()
+
+    fun lookup(json: String): LookupResult {
+        val o = obj(json)
+        val p = if (o.isNull("photo")) null else o.optJSONObject("photo")
+        return LookupResult(
+            path = str(o, "path") ?: "",
+            exists = o.optBoolean("exists", false),
+            kind = str(o, "kind"),
+            photo = p?.let {
+                LookupPhoto(
+                    photoId = str(it, "photoId")
+                        ?: throw ApiParseException("lookup 的 photo 里没有 photoId"),
+                    title = str(it, "title"),
+                    videoPath = str(it, "videoPath"),
+                    qualityScore = it.optInt("qualityScore", 0),
+                )
+            },
+            usedByPhotos = array(o, "usedByPhotos").mapObjects { r ->
+                LookupPhotoRef(
+                    photoId = str(r, "photoId") ?: "",
+                    title = str(r, "title"),
+                )
+            }.filter { it.photoId.isNotEmpty() },
+        )
+    }
+
+    fun uploadCheckBody(name: String, sha256: String): String =
+        JSONObject().apply {
+            put("name", name)
+            put("sha256", sha256)
+        }.toString()
+
+    fun uploadCheck(json: String): UploadCheck {
+        val o = obj(json)
+        return UploadCheck(
+            name = str(o, "name") ?: "",
+            nameTaken = o.optBoolean("nameTaken", false),
+            sameContent = o.optBoolean("sameContent", false),
+            existingPath = str(o, "existingPath"),
+            suggestedName = str(o, "suggestedName"),
+            knownContent = o.optBoolean("knownContent", false),
+            matches = array(o, "matches").mapObjects { assetIdentity(it) },
+        )
+    }
+
+    private fun assetIdentity(o: JSONObject): AssetIdentity {
+        val p = if (o.isNull("photo")) null else o.optJSONObject("photo")
+        return AssetIdentity(
+            assetId = str(o, "assetId") ?: "",
+            path = str(o, "path"),
+            kind = str(o, "kind"),
+            missing = o.optBoolean("missing", false),
+            photo = p?.let {
+                LookupPhoto(
+                    photoId = str(it, "photoId") ?: "",
+                    title = str(it, "title"),
+                    videoPath = str(it, "videoPath"),
+                    qualityScore = it.optInt("qualityScore", 0),
+                )
+            }?.takeIf { it.photoId.isNotEmpty() },
+            usedByPhotos = array(o, "usedByPhotos").mapObjects { r ->
+                LookupPhotoRef(
+                    photoId = str(r, "photoId") ?: "",
+                    title = str(r, "title"),
+                )
+            }.filter { it.photoId.isNotEmpty() },
+        )
+    }
+
+    fun refBody(refPath: String): String =
+        JSONObject().apply { put("refPath", refPath) }.toString()
+
+    fun replaceRefResult(json: String): ReplaceRefResult {
+        val o = obj(json)
+        return ReplaceRefResult(
+            photoId = str(o, "photoId")
+                ?: throw ApiParseException("换参考图的响应里没有 photoId"),
+            qualityScore = o.optInt("qualityScore", 0),
+            selfScore = o.optInt("selfScore", 0),
+            imgdbBytes = o.optLong("imgdbBytes", 0L),
+            elapsedMs = o.optLong("elapsedMs", 0L),
+        )
+    }
 
     /**
      * 拼 NAS 路径。服务端只认白名单内的规范化绝对路径，所以这里不做任何

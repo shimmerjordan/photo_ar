@@ -160,6 +160,26 @@ class FramesTest {
         )
     }
 
+    @Test
+    fun `最后一个色度行没有尾部补齐时不抛异常`() {
+        // 相机只给到最后一个有效字节、不补齐整个 rowStride。按 rowStride 整行批量读会
+        // BufferUnderflowException —— 这是「改成按行批量拷」唯一新增的失效模式，所以
+        // 钉一条。（老的逐字节写法在这种输入上会 IndexOutOfBounds，所以这条不是回归，
+        // 是新增的健壮性；断言只覆盖**确实读到了的**那些字节，读不到的那个不做承诺。）
+        val w = 4
+        val h = 4
+        val y = ByteBuffer.wrap(ByteArray(4 * 4) { (it + 1).toByte() })
+        // 两个色度行，行距 4，但整块只有 7 字节 —— 第二行的最后一个 U 样本不存在
+        val uv = byteArrayOf(20, 10, 0, 0, 21, 11, 0)
+        val u = ByteBuffer.wrap(uv, 1, 6).slice()
+        val v = ByteBuffer.wrap(uv, 0, 7).slice()
+        val out = ByteArray(Frames.nv21Size(w, h))
+        Frames.toNv21(w, h, y, 4, u, 4, 2, v, 4, 2, out)
+        val chroma = out.drop(16)
+        assertEquals("第一个色度行完整", listOf<Byte>(20, 10, 0, 0), chroma.take(4))
+        assertEquals("第二行读得到的那一对", listOf<Byte>(21, 11), chroma.drop(4).take(2))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun `输出缓冲太小报错`() {
         Frames.toNv21(
@@ -194,7 +214,7 @@ class FramesTest {
         assertEquals(0, v.position())
     }
 
-    // ---- 档位选择：尺寸优先，再在同尺寸里取最高帧率 ----
+    // ---- 档位选择：尺寸达标是硬闸门，达标之后帧率优先 ----
 
     @Test
     fun `同尺寸里取最高帧率`() {
@@ -218,6 +238,34 @@ class FramesTest {
             )
         )
         assertEquals(Frames.CameraOption(Frames.Size(1440, 1080), 30), got)
+    }
+
+    @Test
+    fun `达标之后为了帧率可以换一个更大的尺寸`() {
+        // 这是「跟随帧率再高一倍」那一档：1280×960 只有 30fps，而 1920×1440 有 60fps。
+        // 两个尺寸都达标（≥1280），所以该挑 60 那个 —— ARCore 的位姿更新率就是相机
+        // 帧率，30→60 等于跟随速度翻倍。老规则先把尺寸锁在最小的达标档，于是那个
+        // 60fps 从来没被看见过。
+        val got = Frames.pickCameraOption(
+            listOf(
+                Frames.CameraOption(Frames.Size(1280, 960), 30),
+                Frames.CameraOption(Frames.Size(1920, 1440), 60),
+            )
+        )
+        assertEquals(Frames.CameraOption(Frames.Size(1920, 1440), 60), got)
+    }
+
+    @Test
+    fun `同帧率里仍然取最小的尺寸`() {
+        // 帧率一样时偏小的那个：大帧的上行更贵，而识别率在达标之后就饱和了。
+        val got = Frames.pickCameraOption(
+            listOf(
+                Frames.CameraOption(Frames.Size(1920, 1440), 60),
+                Frames.CameraOption(Frames.Size(1280, 960), 60),
+                Frames.CameraOption(Frames.Size(2560, 1920), 60),
+            )
+        )
+        assertEquals(Frames.CameraOption(Frames.Size(1280, 960), 60), got)
     }
 
     @Test

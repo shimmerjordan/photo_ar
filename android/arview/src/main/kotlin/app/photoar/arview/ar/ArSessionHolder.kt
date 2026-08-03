@@ -78,6 +78,18 @@ class ArSessionHolder(private val activity: Activity) {
     var cpuImageSize: Size? = null
         private set
 
+    /**
+     * 实际生效的相机帧率上限。会话建成后才有值。
+     *
+     * 暴露出来的理由和 [cpuImageSize] 一样，但答的是另一个问题：**跟随帧率**。ARCore
+     * 的位姿更新率就等于相机帧率（[baseConfig] 里 `updateMode = BLOCKING`，渲染跟着
+     * 相机走），所以「贴合跟不跟得上手」这件事的上限就是这个数。挑到 30 还是 60 取决于
+     * 机型给了什么档位（见 [Frames.pickCameraOption]），而不打出来的话真机上完全无从
+     * 判断 —— 而这正是「跟随帧率能不能再高一倍」唯一的判据。
+     */
+    var cameraFps: Int? = null
+        private set
+
     private var paused = true
 
     /**
@@ -255,6 +267,52 @@ class ArSessionHolder(private val activity: Activity) {
      * 剩下的风险（照片被拿走了、世界跟踪自己漂了）由渲染层的两道闸挡：滑行有时限，
      * 且只在 `frame.camera.trackingState == TRACKING` 时滑行。
      */
+    /**
+     * ARCore 此刻到底怎么看这张图 —— 给诊断用，不参与任何判定。
+     *
+     * ## 为什么必须有它
+     *
+     * 「贴不上」有三个**修法毫不相干**的原因，而从外面看它们一模一样（屏幕上什么都没有）：
+     *
+     * | ARCore 说的 | 真实原因 | 该怎么修 |
+     * |---|---|---|
+     * | 压根没报告这张图 | 检测失败：imgdb 没装上 / 图案在画面里太小 / 太暗太糊 | 查目标库、让人靠近点 |
+     * | 报告了但 PAUSED | 见过、但此刻拿不到位姿（未知物理尺寸时要靠视差定尺度） | 给尺寸，或改成 2D 贴合 |
+     * | `camera.trackingState != TRACKING` | **SLAM 自己没初始化**（环境纹理太少、一直没动） | 任何图都贴不上，先让 SLAM 起来 |
+     *
+     * 原来的日志（`maybeCheckWidth`）只在**已经跟上**时才打一行，也就是说上面三种情况
+     * 一个字都不留。两次诊断错在这上面：只能从外部现象反推，而反推是猜。
+     *
+     * `getAllTrackables` 与 `getUpdatedTrackables` 都要看：后者只给**这一帧更新过**的，
+     * 一张处于 PAUSED 的图不会出现在里面，但会出现在前者里 —— 而「见过但拿不到位姿」
+     * 与「压根没见过」正是最需要分开的两种。
+     */
+    fun diagnose(frame: Frame): String {
+        val cam = runCatching { frame.camera.trackingState.name }.getOrElse { "?" }
+        val reason = runCatching {
+            frame.camera.trackingFailureReason?.name ?: "-"
+        }.getOrElse { "?" }
+        val all = runCatching {
+            session?.getAllTrackables(AugmentedImage::class.java)?.toList() ?: emptyList()
+        }.getOrElse { emptyList() }
+        val updated = runCatching {
+            frame.getUpdatedTrackables(AugmentedImage::class.java).toList()
+        }.getOrElse { emptyList() }
+
+        val want = loadedPhotoId
+        val mine = all.firstOrNull { want == null || it.name == want }
+        val mineText = if (mine == null) {
+            "目标图=ARCore 从没报告过它"
+        } else {
+            "目标图 ${mine.name.take(8)} state=${mine.trackingState.name}" +
+                " method=${mine.trackingMethod.name}" +
+                " extent=${"%.1f".format(mine.extentX * 100f)}x" +
+                "${"%.1f".format(mine.extentZ * 100f)}cm"
+        }
+        return "相机=$cam(失败原因 $reason) 库里图数=${all.size} 本帧更新=${updated.size}" +
+            " 装的是=${if (multiImageLoaded) "多图库" else (want?.take(8) ?: "无")} $mineText"
+    }
+
     fun trackedImage(frame: Frame): Tracked? {
         val want = loadedPhotoId
         if (want == null && !multiImageLoaded) return null
@@ -343,6 +401,7 @@ class ArSessionHolder(private val activity: Activity) {
         // 帧率也打出来。不打的话「到底跑没跑到 60」在真机上无从判断 —— 而这两个数
         // 恰好是一对取舍（见 Frames.pickCameraOption），只看一个会误判成另一个的问题。
         val fps = runCatching { s.cameraConfig.fpsRange }.getOrNull()
+        cameraFps = fps?.upper
         Log.i(
             TAG,
             "ARCore CPU 图像尺寸 = $cpuImageSize（期望长边 ${Frames.LONG_EDGE}）｜帧率 = $fps",

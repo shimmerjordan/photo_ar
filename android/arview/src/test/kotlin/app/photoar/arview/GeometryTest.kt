@@ -109,48 +109,71 @@ class GeometryTest {
         assertEquals(null, Geometry.quadSize(0f, 0f, 0.0001f, 1.5f))
     }
 
-    // ---- 纹理裁切 ----
+    // ---- 视频那块矩形（装进去，不裁切） ----
 
     @Test
-    fun `比例一致时整张铺满`() {
-        val uv = Geometry.fillCropUv(1.5f, 1.5f)
-        assertEquals(1f, uv.uScale, 1e-6f)
-        assertEquals(1f, uv.vScale, 1e-6f)
-        assertEquals(0f, uv.uOffset, 1e-6f)
-        assertEquals(0f, uv.vOffset, 1e-6f)
+    fun `比例一致时视频正好等于照片`() {
+        val photo = Geometry.QuadSize(0.15f, 0.10f)
+        val v = Geometry.videoQuad(photo, 1.5f)
+        assertEquals(0.15f, v.widthM, 1e-6f)
+        assertEquals(0.10f, v.heightM, 1e-6f)
     }
 
     @Test
-    fun `十六比九的视频贴到三比二的照片上切左右`() {
-        val uv = Geometry.fillCropUv(quadAspect = 1.5f, videoAspect = 16f / 9f)
-        assertEquals(1.5f / (16f / 9f), uv.uScale, 1e-6f)
-        assertEquals(1f, uv.vScale, 1e-6f)
-        assertEquals("裁切必须居中", (1f - uv.uScale) / 2f, uv.uOffset, 1e-6f)
+    fun `十六比九的视频贴到三比二的照片上宽度顶满`() {
+        val photo = Geometry.QuadSize(0.15f, 0.10f) // 3:2
+        val v = Geometry.videoQuad(photo, 16f / 9f)
+        assertEquals("视频更宽，宽度顶满", 0.15f, v.widthM, 1e-6f)
+        assertEquals(0.15f / (16f / 9f), v.heightM, 1e-6f)
+        assertTrue("高度必须比照片矮，露出的是照片本身", v.heightM < photo.heightM)
     }
 
     @Test
-    fun `竖版视频贴到横版照片上切上下`() {
-        val uv = Geometry.fillCropUv(quadAspect = 1.5f, videoAspect = 9f / 16f)
-        assertEquals(1f, uv.uScale, 1e-6f)
-        assertEquals((9f / 16f) / 1.5f, uv.vScale, 1e-6f)
-        assertEquals((1f - uv.vScale) / 2f, uv.vOffset, 1e-6f)
+    fun `竖版视频贴到横版照片上高度顶满`() {
+        val photo = Geometry.QuadSize(0.15f, 0.10f)
+        val v = Geometry.videoQuad(photo, 9f / 16f)
+        assertEquals(0.10f, v.heightM, 1e-6f)
+        assertEquals(0.10f * (9f / 16f), v.widthM, 1e-6f)
+        assertTrue(v.widthM < photo.widthM)
     }
 
     @Test
-    fun `裁切后的可见区域始终在 0 到 1 之间`() {
-        val cases = listOf(0.5f, 0.75f, 1f, 1.33f, 1.5f, 1.78f, 2.35f)
-        for (q in cases) for (v in cases) {
-            val uv = Geometry.fillCropUv(q, v)
-            assertTrue("$q/$v", uv.uOffset >= -1e-6f && uv.uOffset + uv.uScale <= 1f + 1e-6f)
-            assertTrue("$q/$v", uv.vOffset >= -1e-6f && uv.vOffset + uv.vScale <= 1f + 1e-6f)
+    fun `永远装得进照片、且比例永远是视频的`() {
+        // 「不变形」是这个函数唯一不能违反的性质：人眼对人脸比例极其敏感，
+        // 拉扁一点点就比小一圈难看得多。
+        val photo = Geometry.QuadSize(0.15f, 0.10f)
+        for (v in listOf(0.4f, 0.5f, 0.75f, 1f, 1.33f, 1.5f, 1.78f, 2.35f, 3f)) {
+            val q = Geometry.videoQuad(photo, v)
+            assertTrue("$v 超出照片宽", q.widthM <= photo.widthM + 1e-6f)
+            assertTrue("$v 超出照片高", q.heightM <= photo.heightM + 1e-6f)
+            assertEquals("$v 变形了", v, q.aspect, 1e-4f)
         }
     }
 
     @Test
-    fun `视频尺寸还没报上来时整张铺满`() {
-        val uv = Geometry.fillCropUv(1.5f, 0f)
-        assertEquals(1f, uv.uScale, 1e-6f)
-        assertEquals(1f, uv.vScale, 1e-6f)
+    fun `恰好有一个维度和照片贴满，另一个不超出`() {
+        // 用户对「差不多」的定义，逐字：「至少有一个维度（长或者宽）是贴合图片的，
+        // 按视频最大化完整显示为准」。也就是说这个函数必须同时满足三件事：
+        //   1. 有一条边和照片严丝合缝（不是缩在中间留四条边）
+        //   2. 另一条边不超出照片
+        //   3. 视频完整、不变形（比例是视频自己的）
+        // 三条里少任何一条都是另一种取舍，所以整条钉住。
+        val photo = Geometry.QuadSize(0.15f, 0.10f)
+        for (v in listOf(0.4f, 0.6f, 0.75f, 1f, 1.5f, 1.78f, 2.35f, 3f)) {
+            val q = Geometry.videoQuad(photo, v)
+            val wFlush = kotlin.math.abs(q.widthM - photo.widthM) < 1e-6f
+            val hFlush = kotlin.math.abs(q.heightM - photo.heightM) < 1e-6f
+            assertTrue("$v：一条边都没贴满（${q.widthM}×${q.heightM}）", wFlush || hFlush)
+            assertTrue("$v 超出了照片", q.widthM <= photo.widthM + 1e-6f && q.heightM <= photo.heightM + 1e-6f)
+            assertEquals("$v 变形了", v, q.aspect, 1e-4f)
+        }
+    }
+
+    @Test
+    fun `视频尺寸还没报上来时按照片的形状铺`() {
+        val photo = Geometry.QuadSize(0.15f, 0.10f)
+        assertEquals(photo, Geometry.videoQuad(photo, 0f))
+        assertEquals(photo, Geometry.videoQuad(photo, Float.NaN))
     }
 
     // ---- 淡入 ----

@@ -11,12 +11,15 @@ import app.photoar.arview.FsListing
 import app.photoar.arview.HistoryEntry
 import app.photoar.arview.Hit
 import app.photoar.arview.LoginResult
+import app.photoar.arview.LookupResult
 import app.photoar.arview.MediaInfo
 import app.photoar.arview.NetErrorKind
 import app.photoar.arview.PhotoDetail
 import app.photoar.arview.PhotoSummary
 import app.photoar.arview.RecognizeOutcome
+import app.photoar.arview.ReplaceRefResult
 import app.photoar.arview.TargetsManifest
+import app.photoar.arview.UploadCheck
 import org.json.JSONObject
 
 /** [PhotoArClient.fetchModel] 的结果。304 与 200 对调用方是两种完全不同的动作。 */
@@ -455,6 +458,15 @@ class PhotoArClient(
         getJson("/v1/photo/$photoId", CatalogParse::photoDetail)
 
     /** [path] 为 null 时返回白名单根目录列表（§7）。 */
+    /**
+     * 这个 NAS 路径在库里是什么身份。
+     *
+     * 用途是**重复上传不该是死胡同**：`POST /v1/photo` 回 409 `already_ingested` 时，
+     * 拿这个接口问出「那张照片是哪一张、现在配的是哪段视频」，好让用户接着决定要不要换。
+     */
+    fun lookup(path: String): LookupResult =
+        getJson("/v1/admin/lookup?path=" + urlEncode(path), CatalogParse::lookup)
+
     fun fsList(path: String?): FsListing {
         val url = if (path.isNullOrEmpty()) "/v1/fs/list"
         else "/v1/fs/list?path=" + urlEncode(path)
@@ -487,6 +499,71 @@ class PhotoArClient(
         INGEST_TIMEOUT_MS,
         CatalogParse::attachResult,
     )
+
+    /**
+     * 换掉这张照片的**参考图**，photoId 不变。
+     *
+     * 服务端会重算质量分、特征、自匹配分，重建 imgdb 与缩略图，并原地替换识别库里那个
+     * slot —— 所以**授权、配的视频、标题、打印宽度全都留着**（走「删掉重建」的话授权会
+     * 被级联删除）。用 `INGEST_TIMEOUT_MS` 而不是 META：这条路上的活和入库一样重
+     * （arcoreimg + 20 次扰动查询），几秒到几十秒。
+     */
+    fun replaceRef(photoId: String, refPath: String): ReplaceRefResult = postJson(
+        "/v1/photo/$photoId/ref",
+        CatalogParse.refBody(refPath),
+        INGEST_TIMEOUT_MS,
+        CatalogParse::replaceRefResult,
+    )
+
+    /**
+     * **上传之前**问一次：这个文件是不是已经在服务端了。
+     *
+     * 一次请求几百字节，换掉的是「传完 20 MB 才收到一句已存在」那几十秒白等。
+     * 哈希在本地算（见 `MediaScreen` 里的 `sha256Of`）。
+     *
+     * 超时用 [META_TIMEOUT_MS]：服务端这一步只做一次哈希比对和两次索引查询，不碰重活。
+     */
+    fun uploadCheck(name: String, sha256: String): UploadCheck = postJson(
+        "/v1/upload/check",
+        CatalogParse.uploadCheckBody(name, sha256),
+        META_TIMEOUT_MS,
+        CatalogParse::uploadCheck,
+    )
+
+    /**
+     * 把一个文件传到 NAS 上的 `PHOTOAR_UPLOAD_DIR`，返回它在服务端的绝对路径。
+     *
+     * @param name 纯文件名，不能带路径分隔符（服务端会拒）。
+     * @param length 字节数，必须准确 —— 服务端只按 Content-Length 读体，数错了会挂住
+     *   而不是报错（见 [HttpTransport.postStream]）。
+     * @param write 往输出流里写内容。调用方负责关掉自己的输入流。
+     *
+     * 走的是**流式**上传，不把文件读进内存：一段婚礼视频几百 MB，读成 ByteArray
+     * 会在手机上 OOM。
+     *
+     * ⚠️ 这个接口在隧道上会被服务端按 `cf-ray` 头挡掉（413，§9.4 的 100MB 上限）。
+     * 调用之前应该先看 `EndpointCenter.uploadAllowed()`，别让用户白等一次失败。
+     */
+    fun upload(
+        name: String,
+        mime: String,
+        length: Long,
+        write: (java.io.OutputStream) -> Unit,
+    ): String {
+        val ep = endpoints()
+        val reply = transport.postStream(
+            url = ep.api("/v1/upload?name=" + urlEncode(name)),
+            contentType = mime,
+            length = length,
+            headers = headers(ep),
+            // 连接超时用普通的接口超时（连不上就是连不上），读超时由 postStream
+            // 自己按上传的量级定。
+            timeoutMs = META_TIMEOUT_MS,
+            write = write,
+        )
+        check(reply, "/v1/upload")
+        return parse { CatalogParse.uploadedPath(reply.text()) }
+    }
 
     private inline fun <T> getJson(relative: String, mapper: (String) -> T): T {
         val ep = endpoints()

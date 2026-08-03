@@ -115,28 +115,44 @@ object Geometry {
         val vOffset: Float,
     )
 
+    /** 整张纹理，不裁不偏。视频按自身比例摆之后就是这个（见 [videoQuad]）。 */
+    val FULL_UV = UvRect(uScale = 1f, uOffset = 0f, vScale = 1f, vOffset = 0f)
+
     /**
-     * 视频比例与照片比例不一致时怎么贴：**居中裁切填满**，不留黑边。
+     * 视频那块四边形该做多大：**按视频自己的比例，装进照片的矩形里**。
      *
-     * 照片区域里出现黑边看起来就是坏了（用户看到的是一张实体照片"活"起来，
-     * 而不是一个播放器窗口）。拉伸变形比黑边更糟，所以只能裁。
+     * ## 为什么从「裁切填满」改成「装进去」
+     *
+     * 原来是 `fillCropUv`：把视频居中裁掉一部分，正好填满照片的矩形，理由是「照片区域里
+     * 出现黑边看起来就是坏了」。那个理由站不住，因为它把一件不存在的事当成了前提 ——
+     * **这里没有黑边**。视频四边形是贴在相机画面上的一块半透明贴图，它比照片小的时候，
+     * 露出来的是**照片本身**，不是黑色。
+     *
+     * 而裁切的代价是实打实的：视频和照片的比例经常不一致（竖屏拍的视频配横着的 6 寸
+     * 照片，`16:9` 对 `3:2`），裁到填满要切掉视频左右各三成 —— 而人像视频被切掉的正好
+     * 是人。用户的话是「视频尺寸和照片尺寸比例有可能不对，差不多就行」，那么「差不多」
+     * 里最不能丢的是画面内容。
+     *
+     * 所以现在：等比缩放到能放进照片矩形的最大尺寸，居中，纹理整张用（[FULL_UV]）。
+     * 结果是视频完整、不变形，四条边里有两条和照片对齐、另两条留出一点照片的底 ——
+     * 而它仍然**贴在照片那个平面上**（位姿是同一个），这是这件事唯一的硬要求。
+     *
+     * @param photo 照片自己那块矩形，[quadSize] 算出来的
+     * @param videoAspect 视频的像素宽高比；≤0 或非有限（ExoPlayer 还没报 videoSize）
+     *   时原样返回 [photo] —— 那几帧按照片的形状铺，等比例来了再换。
      */
-    fun fillCropUv(quadAspect: Float, videoAspect: Float): UvRect {
-        if (!quadAspect.isFinite() || !videoAspect.isFinite() ||
-            quadAspect <= 0f || videoAspect <= 0f
+    fun videoQuad(photo: QuadSize, videoAspect: Float): QuadSize {
+        if (!videoAspect.isFinite() || videoAspect <= 0f) return photo
+        if (!photo.widthM.isFinite() || !photo.heightM.isFinite() ||
+            photo.widthM <= 0f || photo.heightM <= 0f
         ) {
-            // 拿不到视频真实比例时（ExoPlayer 还没报 videoSize）先整张铺满，
-            // 等 onVideoSizeChanged 之后再算一次。
-            return UvRect(1f, 0f, 1f, 0f)
+            return photo
         }
-        return if (videoAspect > quadAspect) {
-            // 视频更宽 → 切左右
-            val s = quadAspect / videoAspect
-            UvRect(uScale = s, uOffset = (1f - s) / 2f, vScale = 1f, vOffset = 0f)
+        // 视频比照片「宽」→ 宽度顶满，高度按视频比例缩；反之高度顶满。
+        return if (videoAspect >= photo.aspect) {
+            QuadSize(widthM = photo.widthM, heightM = photo.widthM / videoAspect)
         } else {
-            // 视频更高 → 切上下
-            val s = videoAspect / quadAspect
-            UvRect(uScale = 1f, uOffset = 0f, vScale = s, vOffset = (1f - s) / 2f)
+            QuadSize(widthM = photo.heightM * videoAspect, heightM = photo.heightM)
         }
     }
 

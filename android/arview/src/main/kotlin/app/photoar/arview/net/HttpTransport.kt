@@ -61,6 +61,34 @@ interface HttpTransport {
         headers: Map<String, String>,
         timeoutMs: Int,
     ): HttpReply
+
+    /**
+     * 流式 POST：请求体由 [write] 往流里写，不在内存里囤。
+     *
+     * 这个方法是给**上传**用的，而上传的体可能是一段几百 MB 的视频 —— 先读成
+     * ByteArray 再发会在手机上直接 OOM（`/v1/upload` 服务端那侧上限是 2 GiB）。
+     *
+     * [length] 必须是准确的字节数：服务端是手写的 `http.server`，只按 Content-Length
+     * 读体，不支持 chunked。数错了的后果不是报错而是**挂住**（服务端等不到声明的
+     * 字节数）。
+     *
+     * ## 为什么给了默认实现
+     *
+     * 测试里有四个假 transport（`PhotoArClientTest`、`CacheSyncTest`、`ModelCacheTest`、
+     * `HttpProberTest`），它们全都不上传。加成抽象方法要在四个地方各写一个空实现，
+     * 而那四个空实现没有任何一处会被调用。默认实现直接抛，语义是「这个 transport
+     * 不支持上传」—— 真要测上传的假 transport 自己覆盖它。
+     */
+    fun postStream(
+        url: String,
+        contentType: String,
+        length: Long,
+        headers: Map<String, String>,
+        timeoutMs: Int,
+        write: (java.io.OutputStream) -> Unit,
+    ): HttpReply = throw UnsupportedOperationException(
+        "这个 HttpTransport 不支持流式上传（${this::class.java.simpleName}）",
+    )
 }
 
 /**
@@ -68,6 +96,15 @@ interface HttpTransport {
  * POST，而 ExoPlayer 自带的 `DefaultHttpDataSource` 已经把 Range + 断点那部分
  * 做了，App 侧再多一个 HTTP 栈没有收益。
  */
+/**
+ * 上传时等响应的超时。
+ *
+ * 10 分钟。它等的不是网络往返，是**服务端处理完**：`/v1/upload` 落盘之后没别的事，
+ * 但请求体本身可能是几百 MB，而 `readTimeout` 从发出请求头就开始算。给小了的表现是
+ * 「上传总是失败，但文件其实传上去了」—— 最难查的一类症状。
+ */
+private const val UPLOAD_READ_TIMEOUT_MS = 10 * 60 * 1000
+
 class UrlTransport : HttpTransport {
 
     override fun get(url: String, headers: Map<String, String>, timeoutMs: Int): HttpReply =
@@ -112,6 +149,51 @@ class UrlTransport : HttpTransport {
         timeoutMs,
         json.toByteArray(Charsets.UTF_8),
     )
+
+    override fun postStream(
+        url: String,
+        contentType: String,
+        length: Long,
+        headers: Map<String, String>,
+        timeoutMs: Int,
+        write: (java.io.OutputStream) -> Unit,
+    ): HttpReply {
+        val conn = try {
+            URL(url).openConnection() as HttpURLConnection
+        } catch (e: Exception) {
+            throw HttpFailure(NetErrorKind.TRANSPORT, null, "URL 不可用：$url（${e.message}）")
+        }
+        try {
+            conn.requestMethod = "POST"
+            conn.connectTimeout = timeoutMs
+            // readTimeout **不**用 timeoutMs：上传一段视频要几十秒到几分钟，而
+            // timeoutMs 是按「一次接口调用」定的。这里的读超时是等**响应**，而响应
+            // 只有在整个体发完之后才会来 —— 用接口的超时值会在上传还没发完时就
+            // 判超时，表现是「每次上传都失败，但文件其实传上去了」。
+            conn.readTimeout = UPLOAD_READ_TIMEOUT_MS
+            conn.useCaches = false
+            conn.doOutput = true
+            headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
+            conn.setRequestProperty("Content-Type", contentType)
+            // 固定长度且**不缓冲**。用 setFixedLengthStreamingMode(Long) 而不是
+            // int 那个重载：视频超过 2 GiB 时 int 会溢出成负数。
+            conn.setFixedLengthStreamingMode(length)
+            conn.outputStream.use(write)
+            val status = conn.responseCode
+            val stream: InputStream? =
+                if (status in 200..299) conn.inputStream else conn.errorStream
+            val data = stream?.use { readAll(it) } ?: ByteArray(0)
+            return HttpReply(status, data, responseHeaders(conn))
+        } catch (e: SocketTimeoutException) {
+            throw HttpFailure(NetErrorKind.TIMEOUT, null, "上传超时：$url")
+        } catch (e: HttpFailure) {
+            throw e
+        } catch (e: Exception) {
+            throw HttpFailure(NetErrorKind.TRANSPORT, null, e.message ?: e.toString())
+        } finally {
+            conn.disconnect()
+        }
+    }
 
     private fun run(
         url: String,

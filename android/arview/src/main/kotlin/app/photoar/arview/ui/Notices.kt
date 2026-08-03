@@ -43,7 +43,11 @@ object Notices {
         NoticeKind.UNAUTHORIZED -> "登录已失效，请重新登录"
         NoticeKind.TARGET_LOAD_FAILED -> "这张照片的识别数据加载失败，稍后再试"
         NoticeKind.IMGDB_FALLBACK -> "正在用缩略图跟踪，贴合可能略有偏差"
-        NoticeKind.TARGET_NOT_FOUND -> "认出来了，但没在画面里找到，再对准一下"
+        // 「轻轻晃一下」是这句话的重点，而不是客套。库里的照片打印宽度大多未知，
+        // ARCore 那时必须靠视差自己量出照片有多大 —— 拿得越稳，它越量不出来。
+        // 后半句针对的是用户实际的持握方式：一只手拿着照片，手指压在边上。
+        NoticeKind.TRACKING_HELP ->
+            "正在贴合：轻轻左右晃一下手机（它在量照片有多大）；手指别压住边缘，避开反光"
         NoticeKind.ASSET_MISSING ->
             if (detail.isNullOrBlank()) "关联的视频已不在 NAS 上"
             else "关联的视频已不在 NAS 上：$detail"
