@@ -64,7 +64,10 @@ from .verify import DEDUP_MIN_INLIERS, DET_MAX, DET_MIN, RATIO, verify_pair
 
 
 def self_score(
-    ref: Features, perturbed_queries: Sequence[Features]
+    ref: Features,
+    perturbed_queries: Sequence[Features],
+    *,
+    verify_fn: Callable[..., Any] | None = None,
 ) -> int:
     """照片的**现实自匹配分**：扰动查询图 vs 自己，取各次内点数的中位数。
 
@@ -77,12 +80,25 @@ def self_score(
     双向漏检。取中位得到的是"典型一次查询"的分数。
 
     det 出界记 0 分，与 `scan_pairs` 同一口径。
+
+    `verify_fn` 可注入是为了识别后端能换（XFeat 走 `verify.verify_pair_xfeat`，
+    余弦互近邻而不是 Hamming）。**必须能换**：自匹配分是去重判据的分子，用另一个后端
+    的配对函数算出来的是一个不同量纲的数，闸门会整体失准 —— 而
+    `min(s, s') < ratio * m` 里两边都是数字，不会有任何一处报错。
+
+    默认值写成 `None` 再在函数体里落到模块级的 `verify_pair`，而**不是**写成
+    `verify_fn=verify_pair` 当默认参数：后者在 `def` 执行的那一刻就把函数对象绑死了，
+    于是 `monkeypatch.setattr(dedup, "verify_pair", ...)` 从此无效 ——
+    `tests/test_dedup.py::TestSelfScore` 正是这么测"取中位不取最大"和"det 出界记 0"
+    的（用假的 PairResult，不跑真 RANSAC）。参数名也刻意不叫 `verify_pair`：那会在
+    函数体内遮住模块级的同名函数，下面这行就只能拿到 None。
     """
     if not perturbed_queries:
         raise ValueError("perturbed_queries 不能为空：没有扰动查询图就算不出自匹配分")
+    check = verify_fn if verify_fn is not None else verify_pair
     vals = []
     for q in perturbed_queries:
-        r = verify_pair(q, ref, photo_id="self")
+        r = check(q, ref, photo_id="self")
         vals.append(r.inliers if DET_MIN <= r.det <= DET_MAX else 0)
     return int(median(vals))
 

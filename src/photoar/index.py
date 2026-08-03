@@ -109,9 +109,17 @@ class InvertedIndex:
         的 df 都等于 n_docs(=1)，所以它必然在这里面。供 build_corpus /
         load_corpus 报告"这份语料里有多少张照片实际上不可被检索"，而不是
         让它们悄无声息地消失（见 I3）。
+
+        用 numpy 的布尔标记而不是 `{int(d) for d in self._doc_ids}`：结果逐元素
+        相同（两者都按下标升序返回缺失的那些），但那个集合推导是对 postings 总数的
+        Python 循环 —— 1 万张照片约 300 万条 postings。`PhotoLibrary._make_snapshot`
+        现在**每次重建索引都调它**（理由写在那边），而重建发生在每一次入库的路径上，
+        所以这里从"启动时一次"变成了"每张照片一次"，那个循环就不能留了。
         """
-        present = {int(d) for d in self._doc_ids}
-        return [d for d in range(self._n_docs) if d not in present]
+        present = np.zeros(self._n_docs, bool)
+        if self._doc_ids.size:
+            present[self._doc_ids] = True
+        return [int(d) for d in np.flatnonzero(~present)]
 
     def query(self, words: np.ndarray, top_k: int) -> list[tuple[int, float]]:
         n_words = self._idf.shape[0]
