@@ -15,7 +15,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -54,8 +58,24 @@ import kotlinx.coroutines.withContext
  * 不同的下一步动作，归成一句「连接失败」等于把排查信息扔了。
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+/**
+ * 设置。
+ *
+ * ## 瘦身之后这一页只剩「配一次就不动」的东西
+ *
+ * 改造前它是 595 行：账号、通道、离线缓存、调试开关全在一屏里往下滚，而它们的使用
+ * 频率差好几个数量级 —— 通道地址配一次就不动，离线缓存是出门前的动作，识别历史是
+ * 排查时才看的。现在后两样搬到了「管理」页（[AdminScreen]），这里只留下账号、通道、
+ * 关于。
+ *
+ * 访客看到的也是这一页，而且**没有删减** —— 他要能改地址（换了网络）、看自己是谁、
+ * 退出登录。这三件事对宾客同样成立，藏起来只会让他在扫不出来时无路可走。
+ *
+ * @param onAuthChanged 退出登录之后调一次，让外面把登录蒙版重新竖起来。
+ *   不在这里自己跳：这一页不知道「蒙版」的存在，那是 [AppRoot] 的事。
+ */
 @Composable
-fun SettingsScreen(shell: Shell, resolution: Resolution?) {
+fun SettingsScreen(shell: Shell, resolution: Resolution?, onAuthChanged: () -> Unit = {}) {
     val center = shell.center
     var cfg by remember { mutableStateOf(center.config) }
     var saving by remember { mutableStateOf(false) }
@@ -70,7 +90,7 @@ fun SettingsScreen(shell: Shell, resolution: Resolution?) {
             // 实测把「开源地址」那行的链接压掉了一半。
             .padding(bottom = 88.dp),
     ) {
-        AccountSection(shell)
+        AccountSection(shell, onAuthChanged)
 
         Section("通道")
         Text(
@@ -80,20 +100,38 @@ fun SettingsScreen(shell: Shell, resolution: Resolution?) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        cfg.candidates.forEachIndexed { i, c ->
+        // 四条通道原来是四张卡片堆在一起 —— 一屏放不下，而绝大多数时候只有一条需要改。
+        // 改成下拉框选一条、只展开那一条：常见操作（改 LAN 地址）从「往下滚过三张不相关
+        // 的卡」变成「选一下、改一下」。
+        //
+        // 下拉框里带上每条的探活结果，因为「我该改哪一条」的答案通常就是「不通的那条」。
+        var picked by remember { mutableStateOf(0) }
+        val index = picked.coerceIn(0, (cfg.candidates.size - 1).coerceAtLeast(0))
+        if (cfg.candidates.isNotEmpty()) {
+            ChannelPicker(
+                candidates = cfg.candidates,
+                selected = index,
+                statusOf = { c -> statusOf(probedFor(resolution, c)) },
+                onSelect = { picked = it },
+            )
+            val c = cfg.candidates[index]
             CandidateCard(
                 c = c,
                 probed = probedFor(resolution, c),
                 onChange = { next ->
                     cfg = cfg.copy(
-                        candidates = cfg.candidates.toMutableList().also { it[i] = next },
+                        candidates = cfg.candidates.toMutableList().also { it[index] = next },
                     )
                 },
                 onDelete = if (cfg.candidates.size > 1) {
                     {
                         cfg = cfg.copy(
-                            candidates = cfg.candidates.toMutableList().also { it.removeAt(i) },
+                            candidates = cfg.candidates.toMutableList()
+                                .also { it.removeAt(index) },
                         )
+                        // 删掉的可能正是当前选中那条，索引要退一格，否则下一帧会
+                        // 越界（`coerceIn` 兜住了，但那样会静默跳到最后一条）。
+                        picked = (index - 1).coerceAtLeast(0)
                     }
                 } else {
                     null
@@ -174,19 +212,9 @@ fun SettingsScreen(shell: Shell, resolution: Resolution?) {
             }
         }
 
-        Section("离线缓存")
-        Text(
-            text = "把最近扫到的照片和视频存到手机上，没网也能扫（§15）。" +
-                "缓存多少、什么时候同步都在那一页里。",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        OutlinedButton(
-            onClick = { shell.push(Route.Cache) },
-            modifier = Modifier.padding(top = 8.dp),
-        ) {
-            Text("管理离线缓存")
-        }
+        // 「离线缓存」的入口搬到了「管理」页（[AdminScreen]）：它是出门前做一次的
+        // 运维动作，和这一页「配一次就不动」的东西不是一类。访客那边**刻意没有**这个
+        // 入口 —— 缓存要拉全库的目标库与视频，那是策展者的活。
 
         if (DebugMode.enabled) {
             FeaturePathSection(shell)
@@ -311,7 +339,7 @@ private const val SOURCE_URL = "https://github.com/shimmerjordan/photo_ar"
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AccountSection(shell: Shell) {
+private fun AccountSection(shell: Shell, onAuthChanged: () -> Unit) {
     val center = shell.center
     val scope = rememberCoroutineScope()
 
@@ -349,6 +377,8 @@ private fun AccountSection(shell: Shell) {
                     busy = false
                     refresh()
                     Thumbs.clear()
+                    // 登出之后这一页就不该还看得见了 —— 外面会把登录蒙版竖起来。
+                    onAuthChanged()
                 }
             },
             enabled = !busy,
@@ -498,6 +528,68 @@ private fun FeaturePathSection(shell: Shell) {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
+
+/**
+ * 通道下拉框。
+ *
+ * 每一项带上探活结果（`通 · 23ms` / `401` / `不通`），因为「我该改哪一条」的答案通常
+ * 就是「不通的那条」—— 光有名字的话得一条条点开看。
+ *
+ * 用 `ExposedDropdownMenuBox` 而不是一排标签：通道可以自己加（数量不固定），而标签
+ * 一多就换行成两三排，把下面真正要改的表单挤下去。打印尺寸那边用标签是因为**固定
+ * 七个**且都很短。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChannelPicker(
+    candidates: List<EndpointCandidate>,
+    selected: Int,
+    statusOf: (EndpointCandidate) -> String,
+    onSelect: (Int) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val current = candidates[selected]
+    ExposedDropdownMenuBox(
+        expanded = open,
+        onExpandedChange = { open = it },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp),
+    ) {
+        OutlinedTextField(
+            value = "${current.name}　${statusOf(current)}",
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("要看/改哪条通道") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = open) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+        )
+        ExposedDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            candidates.forEachIndexed { i, c ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(c.name + if (c.enabled) "" else "（已停用）")
+                            Text(
+                                text = statusOf(c) +
+                                    if (c.base.isBlank()) "　· 还没填地址" else "",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    onClick = {
+                        onSelect(i)
+                        open = false
+                    },
+                )
+            }
+        }
+    }
+}
+
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable

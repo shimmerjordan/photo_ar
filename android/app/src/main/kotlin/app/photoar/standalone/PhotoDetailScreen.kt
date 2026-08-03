@@ -96,18 +96,12 @@ fun PhotoDetailScreen(shell: Shell, photoId: String) {
                 OutlinedButton(onClick = { ArScanActivity.start(context) }) { Text("去扫这张") }
             }
 
-            OutlinedButton(
-                onClick = {
-                    shell.push(Route.Browse(Pick.VIDEO_FOR_PHOTO, null, d.photoId))
-                },
-                modifier = Modifier.padding(top = 12.dp),
-            ) {
-                Text(if (d.hasVideo) "换视频" else "配视频")
-            }
-
+            // 换视频/换照片都在「素材」页做：那两件事都要先把文件从手机传上去，而
+            // 上传的进度、隧道限制、原始文件名的记录都在那一页里。这里只留一句指路，
+            // 不做第二个入口 —— 同一件事两处实现，其中一处迟早落后。
             Text(
                 text = "试播是全屏放一遍，不开相机；「去扫这张」才走 AR。" +
-                    "换视频会重新转码，几十秒到几分钟都正常。",
+                    "要换这张的照片或视频，去底栏「素材」页的上传历史里改。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),

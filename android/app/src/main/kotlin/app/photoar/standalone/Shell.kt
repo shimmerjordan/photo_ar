@@ -11,20 +11,47 @@ import app.photoar.arview.net.UrlTransport
 
 /** 界面栈上的一页。 */
 sealed interface Route {
-    /** 底部导航的三个根。切根会清空栈 —— 根之间没有「返回」关系。 */
+    /** 底部导航的根。切根会清空栈 —— 根之间没有「返回」关系。 */
     val root: Boolean get() = false
+
+    /**
+     * 访客的首页：整页一个「扫一扫」。
+     *
+     * 管理员没有这一页 —— 他的扫一扫是悬在底栏上那颗 FAB。见 [NavPolicy]。
+     */
+    data object ScanHome : Route {
+        override val root: Boolean get() = true
+    }
 
     data object Photos : Route {
         override val root: Boolean get() = true
     }
 
-    data object History : Route {
+    /** 素材：手机 → NAS 的上传，以及浏览 NAS。 */
+    data object Media : Route {
+        override val root: Boolean get() = true
+    }
+
+    /** 管理：内嵌管理台入口 + 识别历史 + 离线缓存。 */
+    data object Admin : Route {
         override val root: Boolean get() = true
     }
 
     data object Settings : Route {
         override val root: Boolean get() = true
     }
+
+    /**
+     * 识别历史。
+     *
+     * 从底栏的根**降级**成了「管理」页下面的一页：`/v1/history` 在服务端是 admin only
+     * （它是全库的记录），而改造前它占着一个所有人都看得见的底栏格子 —— 访客点进去
+     * 只有 403。
+     */
+    data object History : Route
+
+    /** 内嵌的 Web 管理台。 */
+    data object AdminWeb : Route
 
     data class Detail(val photoId: String) : Route
 
@@ -46,38 +73,14 @@ sealed interface Route {
      */
     data object Cache : Route
 
-    /**
-     * NAS 浏览。[dir] 为 null 是白名单根目录列表。
-     *
-     * 每进一层目录就 push 一页，所以系统返回键天然等于「上一级」—— 自己维护一个
-     * 当前目录变量的话，返回键会一步跳出整个浏览器。
-     */
-    data class Browse(val pick: Pick, val dir: String?, val photoId: String? = null) : Route
-
-    /** 入库表单。参考图与视频都在 [Shell.draft] 里。 */
-    data object Create : Route
-}
-
-/** 浏览器这一趟是来挑什么的。 */
-enum class Pick {
-    /** 挑参考图 → 进入库表单。 */
-    IMAGE,
-
-    /** 给入库表单挑视频，挑完退回表单。 */
-    VIDEO_FOR_DRAFT,
-
-    /** 给已入库的照片换视频，挑完直接调 attach。 */
-    VIDEO_FOR_PHOTO,
-}
-
-/** 入库表单的草稿。跨页存活（挑视频要离开表单再回来），所以放在 [Shell] 上。 */
-class Draft(val refPath: String) {
-    var widthText by mutableStateOf("")
-    var title by mutableStateOf("")
-    var videoPath by mutableStateOf<String?>(null)
-
-    /** 参考图是横的吗。缩略图解出来之后填，用来算相纸预设该取长边还是短边。 */
-    var landscape by mutableStateOf(true)
+    // NAS 浏览（`Browse`）与入库表单（`Create`）已经移除。
+    //
+    // 入库现在只有一条路：「素材」页挑手机里的一张照片 + 一段视频，一次传完就是一组
+    // 映射（见 [MediaScreen]）。而 NAS 上**已有**的文件走管理台的批量导入 —— 那边有
+    // 完整的路径校验和执行前预演，比在手机上翻目录可靠得多。
+    //
+    // 两条路都指向同一个 `POST /v1/photo`，区别只在素材从哪来。留着 App 里的文件
+    // 浏览器就是同一件事的第二个入口，而它还得自己处理白名单、类型判断、缩略图。
 }
 
 /**
@@ -97,6 +100,10 @@ class Shell(context: Context) {
         viaLabel = { center.viaLabel() },
     )
 
+    // 初始那一页只是个占位：真正落在哪由 [MainActivity.AppRoot] 在知道角色之后
+    // 用 `tab()` 定（访客落扫描页，管理员落照片库，见 [NavPolicy.landingTab]）。
+    // 写 Photos 是因为它是管理员的落地页，而未登录时这个值根本不会被渲染 ——
+    // 那时显示的是登录蒙版。
     private val stack = mutableStateListOf<Route>(Route.Photos)
 
     val current: Route get() = stack.last()
@@ -107,8 +114,6 @@ class Shell(context: Context) {
     /** 照片库的版本号。入库 / 关联成功后 +1，列表和详情跟着它重取。 */
     var libraryRev by mutableStateOf(0)
         private set
-
-    var draft: Draft? by mutableStateOf(null)
 
     fun push(route: Route) {
         stack.add(route)
@@ -121,12 +126,12 @@ class Shell(context: Context) {
         return true
     }
 
-    /** 一路弹回当前的根。入库完成后回照片列表用它。 */
+    /** 一路弹回当前的根。 */
     fun popToRoot() {
         while (stack.size > 1) stack.removeAt(stack.size - 1)
     }
 
-    /** 弹到栈里最后一个 [Route.Detail]；没有就回根。给「换视频」用。 */
+    /** 弹到栈里最后一个 [Route.Detail]；没有就回根。 */
     fun popToDetail() {
         while (stack.size > 1 && stack.last() !is Route.Detail) {
             stack.removeAt(stack.size - 1)

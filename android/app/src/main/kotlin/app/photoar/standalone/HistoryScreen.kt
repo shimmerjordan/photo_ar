@@ -102,12 +102,14 @@ private fun HistoryRow(shell: Shell, e: HistoryEntry) {
                 .fillMaxWidth(),
         ) {
             Text(
-                text = e.title ?: e.photoId ?: "没认出来",
+                text = e.title ?: e.photoId ?: reasonText(e),
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (e.matched) {
-                    MaterialTheme.colorScheme.onSurface
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
+                color = when {
+                    e.matched -> MaterialTheme.colorScheme.onSurface
+                    // ambiguous 单独标红：其余未命中是「这一帧没拍好」（下一帧就好了），
+                    // 而它是「库里有两张一样的」—— 不处理的话每一帧都会这样。
+                    e.ambiguous -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -120,6 +122,13 @@ private fun HistoryRow(shell: Shell, e: HistoryEntry) {
                     append(" · ")
                     append(e.latencyMs)
                     append("ms")
+                    // 第二名只在未命中时有意义 —— 而它恰好是 ambiguous 唯一的判据。
+                    if (!e.matched) {
+                        e.runnerUp?.let {
+                            append(" / 第二名 ")
+                            append(it)
+                        }
+                    }
                     e.via?.let {
                         append(" · ")
                         append(it)
@@ -130,4 +139,21 @@ private fun HistoryRow(shell: Shell, e: HistoryEntry) {
             )
         }
     }
+}
+
+/**
+ * 未命中时那一行标题写什么。
+ *
+ * 原来一律是「没认出来」。那句话把四种毫不相干的情况归成了一句，而它们的下一步完全
+ * 不同：`ambiguous` 要去清库（库里有两张一样的，不处理的话**每一帧**都会这样），
+ * `weak` 是这一帧没拍好（下一帧可能就好了），`orphan` 是库和 catalog 不同步（运维），
+ * `empty` 是粗排一个候选都没给（词表没训 / 库是空的）。
+ */
+private fun reasonText(e: HistoryEntry): String = when (e.reason) {
+    "ambiguous" -> "库里有近重复，两张互相挤掉了"
+    "weak" -> "内点不够（这一帧没拍好）"
+    "orphan" -> "库里有、catalog 里没有"
+    "empty" -> "粗排没给出候选"
+    null -> "没认出来"
+    else -> "没认出来（${e.reason}）"
 }

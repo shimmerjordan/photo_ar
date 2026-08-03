@@ -24,6 +24,10 @@ object DebugMode {
     /** 连点几下算数。够多到不会误触，又不至于点不出来 —— 安卓「开发者选项」也是这个数。 */
     const val TAPS_TO_ENABLE = 10
 
+    // ⚠️ **跨模块契约**：这两个字符串在 `:arview` 的 `ArScanActivity.debugEnabled()`
+    // 里又读了一遍（那边引不到这个对象 —— 它在 `:app`，而 `:app` 依赖 `:arview`，
+    // 反向引用会成环；搬下去也不行，这里用了 Compose state 而 `:arview` 没有 Compose）。
+    // 改这两个名字要一起改，否则扫描界面上那行 AR 诊断会静默不显示。
     private const val PREFS = "photoar_debug"
     private const val KEY_ENABLED = "enabled"
 
