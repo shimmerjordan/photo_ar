@@ -166,6 +166,12 @@ const state = {
   tab: 'users',
   grants: null,             // {userId, all, ids:Set, baseAll, baseIds:Set, q}
   config: null,             // {fields, values, edits:{}}
+  mapping: null,            // {photos, videos, unmapped}
+  mapDir: 'photo',          // 映射页的方向：'photo' | 'video'
+  // 批量页。plan = /admin/import/parse 的结果；run = 执行进度（null = 还没跑）。
+  batch: { fileName: '', plan: null, run: null, busy: false },
+  mounts: null,             // {mounts, envRoots}
+  inbox: null,              // {dir, files, note} —— 传上来但还没入库的素材
 };
 
 // ============================== 提示条 ==============================
@@ -173,8 +179,13 @@ const state = {
 /**
  * 成功的提示 4 秒后自己消失；失败的**不自动消失**，等人点掉。
  * 后端那句中文 message 是排查的全部线索，自动消失等于把它吞掉。
+ *
+ * @param sticky 不自动消失，由调用方拿返回值 `.remove()` 撤掉。给「正在做…」这类
+ *   进度提示用：一次入库要几十秒，而 4 秒就消失的「正在入库」会让人以为已经完了、
+ *   然后去点别的。
+ * @return 那个节点。
  */
-function toast(kind, message, code) {
+function toast(kind, message, code, sticky) {
   const box = $('toasts');
   const body = el('div', { cls: 'body' }, [
     el('span', { text: message }),
@@ -185,7 +196,8 @@ function toast(kind, message, code) {
   const kill = () => { if (t.parentNode) box.removeChild(t); };
   x.addEventListener('click', kill);
   box.appendChild(t);
-  if (kind !== 'bad') setTimeout(kill, 4000);
+  if (kind !== 'bad' && !sticky) setTimeout(kill, 4000);
+  return t;
 }
 
 const ok = (m) => toast('ok', m);
@@ -290,7 +302,10 @@ function enter(me) {
   $('app').hidden = false;
   $('me-name').textContent = me.name;
   $('me-role').textContent = roleLabel(me.role);
-  showTab(state.tab);
+  // 按**地址栏**决定开哪个分区，这样 `/admin/config` 这种收藏/别人发来的链接
+  // 在登录之后会直接落在对的地方。push=true 让 `/admin`（没有分区名）也被
+  // 规范化成 `/admin/users`，否则第一次「后退」会跳到一个没有分区的地址。
+  showTab(tabFromPath(location.pathname));
 }
 
 $('login-form').addEventListener('submit', async (ev) => {
@@ -339,10 +354,20 @@ $('denied-out').addEventListener('click', async () => {
 
 // ============================== 页签 ==============================
 
-const TABS = ['users', 'grants', 'config', 'photos'];
+/**
+ * 分区清单。
+ *
+ * ⚠️ 必须与服务端 `app._WEBUI_TABS` **一致**：那张清单决定 `/admin/<名字>` 会不会
+ * 返回首页。这里多一项 → 那个地址刷新时 404；那边多一项 → 地址打得开但这里不认，
+ * 回落到默认分区（地址栏和内容对不上）。
+ */
+const TABS = ['users', 'grants', 'config', 'photos', 'batch'];
 
 // 「刷新」按钮走这个（一定重新取数据）
-const LOADERS = { users: loadUsers, grants: loadGrants, config: loadConfig, photos: loadPhotos };
+const LOADERS = {
+  users: loadUsers, grants: loadGrants, config: loadConfig, photos: loadPhotos,
+  mounts: loadMounts,
+};
 
 /**
  * 切到某个页签时走这个。
@@ -358,11 +383,40 @@ const ENTER = {
   grants: () => (
     state.grants === null || state.users === null || state.photos === null
       ? loadGrants() : renderGrants()),
-  config: () => (state.config === null ? loadConfig() : renderConfig()),
+  config: () => {
+    if (state.config === null) loadConfig(); else renderConfig();
+    // 挂载点和配置字段是同一页上的两块，各自取各自的数据。
+    if (state.mounts === null) loadMounts(); else renderMounts();
+  },
   photos: () => (state.photos === null ? loadPhotos() : renderPhotos()),
+  // 批量页没有要取的数据（模板与导出都是 <a download>，导入要人选文件）。
+  // 进来时重画是为了把上一次的执行结果留在原处 —— 那份逐行结果是「哪几行没成」
+  // 的唯一记录，切走再切回来就没了的话，人得重新导一遍才能知道。
+  batch: () => renderBatch(),
 };
 
-function showTab(name) {
+/**
+ * 每个分区一个自己的 URI：`/admin/users`、`/admin/photos`…
+ *
+ * 用真实路径 + `history.pushState`，不用 `#hash`。理由是这些地址是要**发给别人**和
+ * **收藏**的（"配置在这儿：<地址>/admin/config"），而 hash 在很多聊天软件里会被吞掉
+ * 或者变成不可点的一段。代价是服务端要认这些路径（`app._WEBUI_TABS`），否则刷新会
+ * 404 —— 那一句已经加上了。
+ */
+const BASE = '/admin';
+
+/** 从地址栏解出当前分区。认不出就给默认的 `users`。 */
+function tabFromPath(pathname) {
+  const rest = pathname.slice(BASE.length).replace(/^\/+|\/+$/g, '');
+  return TABS.includes(rest) ? rest : 'users';
+}
+
+/**
+ * @param push 是否往历史里压一条。点页签时压（于是「后退」回上一个分区），
+ *   而**响应 popstate 与首次进入时不压** —— 压了会让后退键在两个分区之间来回弹，
+ *   永远退不出这个页面。
+ */
+function showTab(name, push = true) {
   if (!TABS.includes(name)) name = 'users';
   state.tab = name;
   for (const t of TABS) {
@@ -372,10 +426,44 @@ function showTab(name) {
     btn.setAttribute('aria-selected', on ? 'true' : 'false');
     panel.hidden = !on;
   }
+  const want = `${BASE}/${name}`;
+  if (push && location.pathname !== want) {
+    history.pushState({ tab: name }, '', want);
+  }
   // 数据只在第一次进这个页签时取，之后靠它自己的「刷新」按钮。管理台的数据几秒钟
   // 变一次是常态，但自动轮询会把「我正在改的这一屏」刷掉。
   ENTER[name]();
 }
+
+// 后退/前进。`state.me` 为空时（还在登录界面）什么都不做 —— 那时分区面板全是隐藏的，
+// 切一个出来会让登录框和主界面叠在一起。
+window.addEventListener('popstate', () => {
+  if (!state.me) return;
+  showTab(tabFromPath(location.pathname), false);
+});
+
+/**
+ * 回到这个页面时自动刷新「照片」页。
+ *
+ * 解决的是一个具体的困惑：**在手机上加完照片，电脑上的管理台还是旧的。** 原来这一页只在
+ * 第一次进入时取数据，之后要手点「刷新」—— 而人没有理由知道这一点，他会以为是手机那边
+ * 没成功。
+ *
+ * ## 为什么只刷这一页，而且只在「回到页面」时刷
+ *
+ * 不做定时轮询：`config` 与 `grants` 页上有**正在编辑的状态**（勾了一半的授权、改了没保存
+ * 的字段），定时刷会把它刷掉。而照片页没有编辑态 —— 它上面每个动作都是点一下立刻提交的。
+ *
+ * 「回到页面」（切回这个标签页 / 从别的应用切回浏览器）正好对应用户的心理时刻：他刚在手机
+ * 上做完一件事，转回电脑来看结果。`visibilitychange` 抓得到这个时刻，而且**不会**在他一直
+ * 盯着这一页时反复触发。
+ */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (!state.me || state.tab !== 'photos') return;
+  // 不显示骨架屏：这是一次背景刷新，把已经画好的表格换成一排灰条会让人以为出问题了。
+  loadPhotos();
+});
 
 document.querySelector('.tabs').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button[data-tab]');
@@ -1259,82 +1347,1415 @@ function showRestartBanner(keys) {
 
 // ============================== 照片 ==============================
 
+/**
+ * 「照片」页。
+ *
+ * 这一页原来是两个页签：「照片」（只读的库清单）和「映射」（照片↔视频）。合并了，
+ * 因为它们本来就是**同一份数据的两种看法** —— 分开的结果是同一行信息在两处各显示
+ * 一半：这边有质量分和贴合模式，那边有配的视频和被授权人数，而人想问的是
+ * 「这张照片现在到底怎么样」。
+ *
+ * 数据全部来自 `/v1/admin/mapping`（一次拿齐，含 fitMode / refStale / createdAt）
+ * 加 `/v1/admin/videos`（视频侧的反查）。不再拉 `/v1/photos` —— 那个接口留给授权页，
+ * 它需要的是「这个人能看到哪些」的口径。
+ */
 async function loadPhotos() {
   const box = $('photos-body');
-  skeleton(box, 4);
+  skeleton(box, 5);
   try {
-    const body = await api('GET', '/photos');
-    state.photos = body.photos;
+    // 两个方向一起取。分开按需取的话，切一次方向要等一次网络，而这两份数据加起来
+    // 就是同一批照片，来回切是这一页最常做的动作。
+    const [byPhoto, byVideo, inbox] = await Promise.all([
+      api('GET', '/admin/mapping'),
+      api('GET', '/admin/videos'),
+      // 传上来但还没入库的素材。一起取，因为「我传上去的东西在哪」和「库里有什么」
+      // 是同一个问题的两半 —— 分成两次点击去看，人就找不到自己刚传的那个文件。
+      api('GET', '/admin/inbox').catch(() => null),
+    ]);
+    state.mapping = {
+      photos: byPhoto.photos,
+      videos: byVideo.videos,
+      unmapped: byVideo.unmapped,
+    };
+    state.inbox = inbox;
     renderPhotos();
   } catch (e) {
     if (e.status !== 401) failbox(box, e, loadPhotos);
   }
 }
 
+document.querySelector('#p-photos .segbar').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-mapdir]');
+  if (!b) return;
+  state.mapDir = b.dataset.mapdir;
+  renderPhotos();
+});
+
 function renderPhotos() {
   const box = $('photos-body');
   clear(box);
-  if (!state.photos.length) {
-    emptyBox(box,
-      '库里还没有照片。',
-      '照片由手机 App 或批量入库脚本写入（要跑 arcoreimg 与转码），管理台只读、不做上传。');
+  for (const b of document.querySelectorAll('#p-photos [data-mapdir]')) {
+    b.setAttribute('aria-pressed', b.dataset.mapdir === state.mapDir ? 'true' : 'false');
+  }
+  if (!state.mapping) return;
+  if (state.mapDir === 'video') renderByVideo(box);
+  else renderByPhoto(box);
+}
+
+const EMPTY_HINT = '照片由手机 App（「素材」页传一组）或管理台的「批量」页导入。';
+
+function renderByPhoto(box) {
+  const photos = state.mapping.photos;
+  if (!photos.length) {
+    emptyBox(box, '库里还没有照片。', EMPTY_HINT);
     return;
   }
 
-  const rows = state.photos.map((p) => el('tr', { 'data-pid': p.photoId }, [
-    td('', thumb(p.photoId, p.title || p.photoId)),
-    td('标题', [
-      el('span', { text: p.title || '(无标题)' }),
-      el('span', { cls: 'sub mono', text: p.photoId }),
-    ], 'wide'),
-    // 打印物理宽度：接口给的是米，照片是用厘米量的。原值放 title 里。
-    td('打印宽度', el('span', { cls: 'mono', text: `${nf1(p.printWidthM * 100)} cm`, title: `${p.printWidthM} m` }), 'num'),
-    td('贴合模式', el('span', { cls: 'muted fit', text: '取中…' })),
-    td('质量分', el('span', { cls: 'mono', text: String(p.qualityScore) }), 'num'),
-    td('状态', el('span', { cls: 'acts', style: 'justify-content:flex-start' }, [
-      p.hasVideo ? el('span', { cls: 'tag ok', text: '有视频' }) : el('span', { cls: 'tag warn', text: '无视频' }),
-      p.refStale ? el('span', { cls: 'tag bad', text: '参考图已变' }) : null,
-    ])),
-    td('入库时间', el('span', { text: fmtTime(p.createdAt) })),
-  ]));
+  const rows = photos.map((p) => {
+    const change = el('button', {
+      cls: 'btn sm', type: 'button', text: p.videoPath ? '换视频' : '配视频',
+    });
+    change.addEventListener('click', () => attachVideoTo([p], change));
+    const detach = el('button', { cls: 'btn sm danger', type: 'button', text: '解除' });
+    detach.addEventListener('click', () => detachVideoFrom(p, detach));
+    const del = el('button', { cls: 'btn sm danger', type: 'button', text: '删除' });
+    del.addEventListener('click', () => deletePhoto(p, del));
 
+    return el('tr', {}, [
+      td('', thumb(p.photoId, p.title || p.photoId)),
+      td('照片', [
+        el('span', { text: p.title || '(无标题)' }),
+        el('span', { cls: 'sub mono', text: p.refPath || p.photoId }),
+        p.refMissing ? el('span', { cls: 'tag bad', text: '参考图读不到' }) : null,
+        p.refStale ? el('span', { cls: 'tag bad', text: '参考图已变' }) : null,
+      ], 'wide'),
+      td('视频', p.videoPath
+        ? [
+            el('span', { cls: 'mono sub', text: p.videoPath }),
+            p.videoMissing ? el('span', { cls: 'tag bad', text: '文件读不到' }) : null,
+          ]
+        : el('span', { cls: 'tag warn', text: '没配视频' }), 'wide'),
+      // 打印物理宽度：接口给的是米，照片是用厘米量的。0 = 未知（交给 ARCore 自己量）。
+      td('打印宽度', el('span', {
+        cls: 'mono',
+        text: p.printWidthM > 0 ? `${nf1(p.printWidthM * 100)} cm` : '未知',
+        title: p.printWidthM > 0 ? `${p.printWidthM} m` : '交给 ARCore 自己量',
+      }), 'num'),
+      td('贴合模式', el('span', {
+        cls: 'mono',
+        text: FIT_LABEL[p.fitMode] ? `${p.fitMode} · ${FIT_LABEL[p.fitMode]}` : String(p.fitMode),
+      })),
+      td('质量分', el('span', { cls: 'mono', text: String(p.qualityScore) }), 'num'),
+      td('被授权', el('span', { cls: 'mono', text: String(p.grantCount) }), 'num'),
+      td('入库时间', el('span', { text: fmtTime(p.createdAt) })),
+      td('操作', el('span', { cls: 'acts' }, [change, p.videoPath ? detach : null, del])),
+    ]);
+  });
+
+  const withVideo = photos.filter((p) => p.videoPath).length;
+  box.appendChild(el('p', { cls: 'note', text:
+    `共 ${photos.length} 张，${withVideo} 张配了视频，${photos.length - withVideo} 张还没配。` }));
   box.appendChild(table(
-    [{ sr: '缩略图' }, '标题', '打印宽度', '贴合模式', '质量分', '状态', '入库时间'],
+    [{ sr: '缩略图' }, '照片', '视频', '打印宽度', '贴合模式', '质量分', '被授权', '入库时间', '操作'],
     rows,
   ));
-
-  // 贴合模式只在 `GET /v1/photo/<id>` 里（列表接口没有这一项），所以逐张补。
-  // 限 4 个并发：家庭规模也就几十张，但一次甩出几十个请求会把单线程的服务端
-  // 排满，而识别请求可能正排在后面。
-  fillFitModes();
+  renderInbox(box);
 }
 
-async function fillFitModes() {
-  const gen = ++state.photosGen;
-  const queue = state.photos.map((p) => p.photoId);
-  const one = async (pid) => {
-    let text = '?';
-    let title = '';
-    try {
-      const d = state.photoDetail[pid] || (state.photoDetail[pid] = await api('GET', `/photo/${pid}`));
-      const mode = d.fitMode;
-      text = FIT_LABEL[mode] ? `${mode} · ${FIT_LABEL[mode]}` : String(mode);
-      if (d.refMissing) title = '参考图文件读不到';
-      if (d.videoMissing) title = (title ? title + '；' : '') + '视频文件读不到';
-    } catch (e) {
-      text = '取不到';
-      title = e.message;
+/**
+ * 从库里删掉一张照片。
+ *
+ * ## 为什么这个按钮必须存在
+ *
+ * 库里进了两张同一内容的照片时，比值检验会把**两张都**判成 ambiguous —— 两张都永久
+ * 扫不出来。这是真机上发生过的事：941 帧记录只命中 44 帧，内点数 160~229（门槛 40）。
+ * 入库闸门现在会拦住新的，但已经进去的那一对只能靠删掉一张解开，而在有这个按钮之前
+ * 唯一的出路是重建整个库。
+ *
+ * 确认框里如实写清「删了什么、没删什么」：参考图和视频文件都留在 NAS 上（同一段视频
+ * 可能配给了别的照片），所以这不是"删文件"，是"从识别库里拿掉"。
+ */
+async function deletePhoto(p, btn) {
+  const name = p.title || p.refPath || p.photoId;
+  const yes = await confirm2(
+    `从库里删掉「${name}」？`,
+    '这个操作不可撤销。',
+    [
+      '它不再参与识别，被授权过的人也看不到了。',
+      'NAS 上的参考图和视频文件**都留着** —— 同一段视频可能配给了别的照片。',
+      '之后想再入库的话，同一张图可以重新传（内容哈希会认出它，不用再传一遍字节）。',
+      '识别历史里那几条不动：删照片不该让「上周它扫得出来」这件事消失。',
+    ],
+    '删除',
+  );
+  if (!yes) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/photo/${p.photoId}`);
+    ok(`已删除「${name}」`);
+    state.mapping = null;
+    await loadPhotos();
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status !== 401) fail(e, '删除失败');
+  }
+}
+
+/**
+ * 「传上来但还没入库」那一段。
+ *
+ * 为什么要有：手机传上来的文件先落到落地目录，然后才入库。中间任何一步断了（入库超时、
+ * 质量分不过、近重复被拒、或者人挑完视频就退出了），那个文件就躺在那儿，而**管理台上
+ * 任何一处都看不到它**。用户看到的是「我传上去了，但哪儿都找不到」。
+ *
+ * 画在照片列表**下面**而不是单开一页：它回答的是同一个问题（「我的素材在哪」）的另一半。
+ */
+function renderInbox(box) {
+  const inbox = state.inbox;
+  if (!inbox || !inbox.files || !inbox.files.length) return;
+
+  const rows = inbox.files.map((f) => {
+    const use = el('button', { cls: 'btn sm primary', type: 'button',
+      text: f.kind === 'image' ? '入库' : '配给照片…' });
+    use.addEventListener('click', () => useInboxFile(f, use));
+    return el('tr', {}, [
+      td('文件', [
+        el('span', { text: f.name }),
+        el('span', { cls: 'sub mono', text: f.path }),
+      ], 'wide'),
+      td('类型', el('span', { cls: 'tag', text: f.kind === 'image' ? '图片' : '视频' })),
+      td('大小', el('span', { cls: 'mono', text: bytesText(f.bytes) }), 'num'),
+      td('上传时间', el('span', { text: fmtTime(f.mtime) })),
+      td('操作', el('span', { cls: 'acts' }, [use])),
+    ]);
+  });
+
+  box.appendChild(el('section', { cls: 'card warnish', style: 'margin-top:22px' }, [
+    el('div', { cls: 'head' }, [el('div', {}, [
+      el('h3', { text: `传上来但还没入库的 ${inbox.files.length} 个文件` }),
+      el('p', { cls: 'note', text:
+        '这些文件在服务端的落地目录里，但还没有被任何照片用起来 —— ' +
+        '多半是上一次入库中途断了。图片可以直接入库；视频要挑一张照片配给它。' }),
+    ])]),
+    table(['文件', '类型', '大小', '上传时间', '操作'], rows),
+  ]));
+}
+
+/** 把落地目录里的一个文件用起来：图片走入库，视频挑一张照片配上去。 */
+async function useInboxFile(f, btn) {
+  btn.disabled = true;
+  try {
+    if (f.kind === 'image') {
+      const video = await pickFromMounts('video', '给它挑一段视频（可以取消跳过）');
+      const body = { refPath: f.path };
+      if (video) body.videoPath = video;
+      const t = toast('ok', '正在入库…（要跑特征提取，几十秒）', null, true);
+      try {
+        const created = await api('POST', '/photo', body);
+        ok(`入库成功，质量分 ${created.qualityScore}。`);
+      } catch (e) {
+        await explainIngestFailure(e, f.path, video);
+      } finally {
+        t.remove();
+      }
+    } else {
+      // 视频：一段视频可以配给多张照片，所以这里挑的是「配给哪几张」。
+      const candidates = (state.mapping && state.mapping.photos) || [];
+      if (!candidates.length) {
+        toast('bad', '库里还没有照片，先入库一张再来配视频。');
+        return;
+      }
+      const chosen = await pickPhotos(candidates, '把这段视频配给哪些照片', f.path);
+      if (!chosen || !chosen.length) return;
+      let done = 0;
+      const failed = [];
+      for (const p of chosen) {
+        try {
+          await api('POST', `/photo/${p.photoId}/video`, { videoPath: f.path });
+          done++;
+        } catch (e) {
+          failed.push(`${p.title || p.photoId}：${e.message}`);
+        }
+      }
+      if (done) ok(`已把这段视频配给 ${done} 张照片。`);
+      for (const line of failed) toast('bad', line);
     }
-    if (gen !== state.photosGen) return;   // 列表已经被刷新过，别写进新表格
-    const row = document.querySelector(`#photos-body tr[data-pid="${pid}"] .fit`);
-    if (!row) return;
-    row.textContent = text;
-    row.classList.remove('muted');
-    row.classList.add('mono');
-    if (title) row.title = title;
+  } finally {
+    btn.disabled = false;
+  }
+  state.mapping = null;
+  state.photos = null;
+  await loadPhotos();
+}
+
+// ============================== NAS 文件选择器 ==============================
+
+/**
+ * 弹出目录浏览器，挑一个文件，返回它的容器内绝对路径（取消返回 null）。
+ *
+ * `wantKind` 是 `'video'` / `'image'`，不合类型的文件仍然**列出来但不可点** ——
+ * 直接过滤掉的话，人会以为自己那段视频不在这个目录里，然后去别处找。
+ *
+ * 走 `GET /v1/fs/list`，也就是 App 的目录浏览器在用的同一个接口。子目录里的条目
+ * 只有 `name`（没有 `path`），所以路径要自己拼；只有白名单根那一层的条目自带
+ * `path`，因为根的真实位置不能从名字推出来。
+ */
+function pickPath(wantKind, title) {
+  const d = $('dlg-pick');
+  $('dlg-pick-title').textContent = title || '挑一个文件';
+  const list = $('dlg-pick-list');
+  const crumbs = $('dlg-pick-crumbs');
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      $('dlg-pick').removeEventListener('cancel', onCancel);
+      closeDlg(d);
+      resolve(v);
+    };
+    const onCancel = () => finish(null);
+    d.addEventListener('cancel', onCancel);
+    // 「取消」按钮走的是全局 [data-close] 监听（它只 closeDlg，不 resolve），
+    // 所以这里还要盯一次 close 事件，否则点取消之后这个 Promise 永远悬着，
+    // 而调用方 `await` 在那儿不动 —— 界面看起来是「按钮没反应」。
+    d.addEventListener('close', onCancel, { once: true });
+
+    const go = async (path) => {
+      clear(list);
+      list.appendChild(el('div', { cls: 'skel' }));
+      let body;
+      try {
+        body = await api('GET', path ? `/fs/list?path=${encodeURIComponent(path)}` : '/fs/list');
+      } catch (e) {
+        clear(list);
+        list.appendChild(el('div', { cls: 'failbox' }, [
+          el('div', { cls: 'msg' }, [el('span', { text: e.message })]),
+        ]));
+        return;
+      }
+      // 面包屑。根那一层不显示（没有可回退的上级）。
+      clear(crumbs);
+      if (body.path) {
+        const root = el('button', { cls: 'crumb', type: 'button', text: '全部目录' });
+        root.addEventListener('click', () => go(null));
+        crumbs.appendChild(root);
+        crumbs.appendChild(el('span', { cls: 'sep', text: '/' }));
+        crumbs.appendChild(el('span', { cls: 'crumb cur mono', text: body.path }));
+      }
+
+      clear(list);
+      if (!body.entries.length) {
+        list.appendChild(el('div', { cls: 'empty' }, [el('p', { text: '这个目录是空的。' })]));
+        return;
+      }
+      for (const e of body.entries) {
+        // 根条目自带 path；子目录里的条目只有 name，得自己拼。
+        const full = e.path || `${body.path}/${e.name}`;
+        if (e.isDir) {
+          // 类名用 fpick 而不是 pick：`.pick` 在授权页已经是个**容器**类
+          // （`.pick .row` 是它的子项），复用它会让每一行都套上一层边框。
+          const b = el('button', { cls: 'fpick dir', type: 'button' }, [
+            el('span', { cls: 'ic', text: '📁' }),
+            el('span', { cls: 'nm', text: e.name }),
+          ]);
+          b.addEventListener('click', () => go(full));
+          list.appendChild(b);
+          continue;
+        }
+        const usable = e.kind === wantKind;
+        const b = el('button', {
+          cls: `fpick file${usable ? '' : ' off'}`,
+          type: 'button',
+          disabled: !usable,
+          title: usable ? full : `这里要挑${wantKind === 'video' ? '视频' : '图片'}，这个是${KIND_TEXT[e.kind] || '认不出的类型'}`,
+        }, [
+          el('span', { cls: 'ic', text: e.kind === 'video' ? '🎬' : (e.kind === 'image' ? '🖼' : '·') }),
+          el('span', { cls: 'nm', text: e.name }),
+          el('span', { cls: 'sz mono', text: bytesText(e.bytes) }),
+        ]);
+        if (usable) b.addEventListener('click', () => finish(full));
+        list.appendChild(b);
+      }
+    };
+
+    go(null);
+    openDlg(d);
+  });
+}
+
+const KIND_TEXT = { image: '图片', video: '视频' };
+
+function bytesText(n) {
+  if (typeof n !== 'number') return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${nf1(n / 1024)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${nf1(n / 1048576)} MB`;
+  return `${nf1(n / 1073741824)} GB`;
+}
+
+// ============================== 照片：按视频看 ==============================
+function renderByVideo(box) {
+  const { videos, unmapped } = state.mapping;
+  if (!videos.length && !unmapped.length) {
+    emptyBox(box, '库里还没有照片。', EMPTY_HINT);
+    return;
+  }
+
+  box.appendChild(el('p', { cls: 'note', text: `${videos.length} 段视频在用。改一段视频之前，这里能看到它影响哪几张照片。` }));
+
+  for (const v of videos) {
+    const assign = el('button', { cls: 'btn sm', type: 'button', text: '再配给别的照片…' });
+    assign.addEventListener('click', () => assignVideoToPhotos(v, assign));
+    const head = el('div', { cls: 'head' }, [
+      el('div', {}, [
+        el('h3', { cls: 'mono', text: v.path || '(路径读不到)' }),
+        el('p', { cls: 'note' }, [
+          el('span', { text: `${v.photos.length} 张照片在用` }),
+          v.missing ? el('span', { cls: 'tag bad', text: '文件读不到' }) : null,
+          typeof v.durationMs === 'number' ? el('span', { cls: 'muted', text: ` · ${nf1(v.durationMs / 1000)} 秒` }) : null,
+          typeof v.bytes === 'number' ? el('span', { cls: 'muted', text: ` · ${bytesText(v.bytes)}` }) : null,
+        ]),
+      ]),
+      el('div', { cls: 'right' }, [assign]),
+    ]);
+    const chips = el('div', { cls: 'chips' }, v.photos.map((p) => {
+      const x = el('button', { cls: 'x', type: 'button', 'aria-label': `不再给「${p.title || p.photoId}」用这段视频`, text: '×' });
+      x.addEventListener('click', () => detachVideoFrom(p, x));
+      return el('span', { cls: 'chip' }, [
+        thumb(p.photoId, ''),
+        el('span', { cls: 'nm', text: p.title || '(无标题)' }),
+        p.transcoded ? el('span', { cls: 'tag', text: '转码过', title: '这张照片播的是转码产物，不是源文件' }) : null,
+        x,
+      ]);
+    }));
+    box.appendChild(el('section', { cls: 'card' }, [head, chips]));
+  }
+
+  if (unmapped.length) {
+    const chips = el('div', { cls: 'chips' }, unmapped.map((p) => {
+      const b = el('button', { cls: 'chip act', type: 'button', title: '给这张配视频' }, [
+        thumb(p.photoId, ''),
+        el('span', { cls: 'nm', text: p.title || '(无标题)' }),
+        el('span', { cls: 'plus', text: '＋' }),
+      ]);
+      b.addEventListener('click', () => attachVideoTo([p], b));
+      return b;
+    }));
+    box.appendChild(el('section', { cls: 'card warnish' }, [
+      el('div', { cls: 'head' }, [el('div', {}, [
+        el('h3', { text: `还没配视频的 ${unmapped.length} 张` }),
+        el('p', { cls: 'note', text: '扫到这些照片时不会播任何东西。点一张来配。' }),
+      ])]),
+      chips,
+    ]));
+  }
+}
+
+/** 给一批照片配同一段视频。`photos` 里每项要有 photoId 与 title。 */
+async function attachVideoTo(photos, btn) {
+  const path = await pickPath('video', photos.length === 1
+    ? `给「${photos[0].title || photos[0].photoId}」挑视频`
+    : `给 ${photos.length} 张照片挑同一段视频`);
+  if (!path) return;
+  btn.disabled = true;
+  let done = 0;
+  const failed = [];
+  try {
+    for (const p of photos) {
+      try {
+        await api('POST', `/photo/${p.photoId}/video`, { videoPath: path });
+        done++;
+      } catch (e) {
+        // 一张失败不该中断整批 —— 剩下的照片和这一张没有关系。逐张记下来，
+        // 最后一次把「哪几张没成、为什么」说完。
+        failed.push(`${p.title || p.photoId}：${e.message}`);
+      }
+    }
+  } finally {
+    btn.disabled = false;
+  }
+  if (done) ok(`已给 ${done} 张照片配上视频。`);
+  for (const line of failed) toast('bad', line);
+  await loadPhotos();
+  // 照片页的「有视频/无视频」标记跟着变了，缓存作废。
+  state.photos = null;
+  state.photoDetail = {};
+}
+
+/** 把这段视频再配给别的照片（视频侧的操作方向）。 */
+async function assignVideoToPhotos(video, btn) {
+  if (!video.path) {
+    toast('bad', '这段视频的路径读不到，没法再配给别的照片。');
+    return;
+  }
+  const already = new Set(video.photos.map((p) => p.photoId));
+  const candidates = state.mapping.photos.filter((p) => !already.has(p.photoId));
+  if (!candidates.length) {
+    toast('ok', '库里每一张照片都已经在用这段视频了。');
+    return;
+  }
+  const chosen = await pickPhotos(candidates, `把这段视频配给哪些照片`, video.path);
+  if (!chosen || !chosen.length) return;
+  btn.disabled = true;
+  let done = 0;
+  const failed = [];
+  try {
+    for (const p of chosen) {
+      try {
+        await api('POST', `/photo/${p.photoId}/video`, { videoPath: video.path });
+        done++;
+      } catch (e) {
+        failed.push(`${p.title || p.photoId}：${e.message}`);
+      }
+    }
+  } finally {
+    btn.disabled = false;
+  }
+  if (done) ok(`已把这段视频配给 ${done} 张照片。`);
+  for (const line of failed) toast('bad', line);
+  await loadPhotos();
+  state.photos = null;
+  state.photoDetail = {};
+}
+
+/**
+ * 多选照片。复用文件选择器那个 dialog 的外壳，列的是照片而不是文件。
+ *
+ * 会把**已经配过视频的**照片单独标出来：给它配新视频等于替换，而替换是不可撤销的
+ * （旧的关联没了）—— 这一点在勾选之前就得看得见。
+ */
+function pickPhotos(photos, title, videoPath) {
+  const d = $('dlg-pick');
+  $('dlg-pick-title').textContent = title;
+  const crumbs = $('dlg-pick-crumbs');
+  const list = $('dlg-pick-list');
+  clear(crumbs);
+  crumbs.appendChild(el('span', { cls: 'crumb cur mono', text: videoPath }));
+
+  return new Promise((resolve) => {
+    let done = false;
+    const chosen = new Set();
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      d.removeEventListener('cancel', onCancel);
+      closeDlg(d);
+      resolve(v);
+    };
+    const onCancel = () => finish(null);
+    d.addEventListener('cancel', onCancel);
+    d.addEventListener('close', onCancel, { once: true });
+
+    clear(list);
+    const goBtn = el('button', { cls: 'btn primary', type: 'button', disabled: true, text: '配给 0 张' });
+    const paint = () => {
+      goBtn.disabled = chosen.size === 0;
+      goBtn.textContent = `配给 ${chosen.size} 张`;
+    };
+    for (const p of photos) {
+      const cb = el('input', { type: 'checkbox' });
+      cb.addEventListener('change', () => {
+        if (cb.checked) chosen.add(p.photoId); else chosen.delete(p.photoId);
+        paint();
+      });
+      list.appendChild(el('label', { cls: 'fpick sel' }, [
+        cb,
+        thumb(p.photoId, ''),
+        el('span', { cls: 'nm', text: p.title || '(无标题)' }),
+        p.videoPath
+          ? el('span', { cls: 'tag warn', text: '会替换现有视频', title: p.videoPath })
+          : null,
+      ]));
+    }
+    goBtn.addEventListener('click', () => finish(photos.filter((p) => chosen.has(p.photoId))));
+    list.appendChild(el('div', { cls: 'foot' }, [goBtn]));
+    paint();
+    openDlg(d);
+  });
+}
+
+async function detachVideoFrom(photo, btn) {
+  const yes = await confirm2(
+    '解除这张照片的视频关联',
+    `「${photo.title || photo.photoId}」以后扫到时不会播任何东西。`,
+    [
+      '视频文件本身不删，磁盘上的源文件与转码产物都留着。',
+      '别的照片如果也在用这段视频，它们不受影响。',
+      '想再配回来随时可以，不用重新入库。',
+    ],
+    '解除关联',
+  );
+  if (!yes) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/photo/${photo.photoId}/video`);
+    ok('已解除关联。');
+    state.photos = null;
+    state.photoDetail = {};
+    await loadPhotos();
+  } catch (e) {
+    fail(e, '解除关联失败');
+    btn.disabled = false;
+  }
+}
+
+// ============================== 批量 ==============================
+
+// 导出链接。用 <a download> 而不是 fetch + Blob：这三个接口都带
+// `Content-Disposition: attachment`，浏览器会直接下载而不导航走，而 fetch 那条路
+// 要自己造 Blob URL、自己起文件名、还要记得 revokeObjectURL。
+for (const [id, href] of [
+  ['dl-template-xlsx', '/v1/admin/export/template?format=xlsx'],
+  ['dl-template-csv', '/v1/admin/export/template?format=csv'],
+  ['dl-users-xlsx', '/v1/admin/export/users?format=xlsx'],
+  ['dl-users-csv', '/v1/admin/export/users?format=csv'],
+  ['dl-mapping-xlsx', '/v1/admin/export/mapping?format=xlsx'],
+]) {
+  $(id).href = href;
+}
+
+$('batch-file').addEventListener('change', async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  // 清掉 input 的值，这样同一个文件改完再选一次仍然会触发 change。
+  // 不清的话人会以为「改了表格但预览没变」是缓存问题。
+  ev.target.value = '';
+  state.batch.fileName = file.name;
+  state.batch.plan = null;
+  state.batch.run = null;
+  $('batch-filename').textContent = file.name;
+  renderBatch();
+  await parseBatchFile(file);
+});
+
+async function parseBatchFile(file) {
+  const box = $('batch-body');
+  skeleton(box, 3);
+  let resp;
+  try {
+    // 原始字节直接当请求体。服务端读的就是这个（不是 multipart）—— 只有一个文件，
+    // multipart 的多字段能力在这里没有用处。
+    resp = await fetch(`${API}/admin/import/parse`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Accept': 'application/json' },
+      body: file,
+    });
+  } catch (e) {
+    failbox(box, new ApiError(0, 'network', '连不上服务端：检查网络，或者容器是不是没在跑。'), () => {});
+    return;
+  }
+  let doc = null;
+  const text = await resp.text();
+  if (text) { try { doc = JSON.parse(text); } catch (e) { /* 下面按状态码处理 */ } }
+  if (!resp.ok) {
+    const e = new ApiError(resp.status, (doc && doc.error) || `http_${resp.status}`,
+      (doc && doc.message) || `HTTP ${resp.status}`, doc || {});
+    if (resp.status === 401 && state.me) { sessionLost(); return; }
+    failbox(box, e, () => {});
+    return;
+  }
+  state.batch.plan = doc;
+  renderBatch();
+}
+
+function renderBatch() {
+  const box = $('batch-body');
+  clear(box);
+  $('batch-filename').textContent = state.batch.fileName || '';
+  const plan = state.batch.plan;
+  if (!plan) {
+    if (!state.batch.run) return;   // 还没导过任何东西：三张卡片已经说明了流程
+  }
+
+  if (plan) {
+    if (plan.errors.length) {
+      // 整表级错误：所有行都不该执行。把服务端那几句原文列出来，它们已经指出了
+      // 最可能的原因（表头被删）与当前读到的表头。
+      const ul = el('ul', {}, plan.errors.map((m) => el('li', {}, [richText(m)])));
+      box.appendChild(el('div', { cls: 'failbox col' }, [
+        el('div', { cls: 'msg' }, [el('strong', { text: '这份表没法用：' })]),
+        ul,
+      ]));
+      return;
+    }
+    box.appendChild(batchSummary(plan));
+    box.appendChild(batchTable(plan));
+  }
+}
+
+function batchSummary(plan) {
+  const s = plan.summary;
+  const run = state.batch.run;
+  const goBtn = el('button', {
+    cls: 'btn primary', type: 'button',
+    disabled: state.batch.busy || s.okRows === 0 || (run && run.finished),
+    text: run && run.finished ? '已执行完' : `执行这 ${s.okRows} 行`,
+  });
+  goBtn.addEventListener('click', () => runBatch());
+
+  const stats = el('div', { cls: 'stats' }, [
+    stat('可执行', s.okRows, s.okRows ? 'ok' : 'warn'),
+    s.badRows ? stat('有错(跳过)', s.badRows, 'bad') : null,
+    s.warnRows ? stat('有提醒', s.warnRows, 'warn') : null,
+    stat('建/复用用户', s.users),
+    stat('入库照片', s.photos),
+    stat('配视频', s.videos),
+    stat('授权', s.grants),
+  ]);
+
+  const note = s.badRows
+    ? `有 ${s.badRows} 行有错，执行时会**跳过**它们，其余照做。改完那几行再导一次就行（重复的用户和照片不会建两遍）。`
+    : '照片入库要跑 arcoreimg 与特征提取，视频可能要转码，所以一行可能要几秒到几十秒。**别关这个页面**：逐行执行是这个浏览器在做的，关掉就停在半路（改完再导一遍是安全的）。';
+
+  return el('section', { cls: 'card' }, [
+    el('div', { cls: 'head' }, [
+      el('div', {}, [
+        el('h3', { text: `预览：${s.rows} 行` }),
+        el('p', { cls: 'note' }, [richText(note)]),
+      ]),
+      el('div', { cls: 'right' }, [goBtn]),
+    ]),
+    stats,
+    run ? batchProgress(run) : null,
+  ]);
+}
+
+function stat(label, value, kind) {
+  return el('div', { cls: `stat${kind ? ' ' + kind : ''}` }, [
+    el('span', { cls: 'v mono', text: String(value) }),
+    el('span', { cls: 'k', text: label }),
+  ]);
+}
+
+function batchProgress(run) {
+  const pct = run.total ? Math.round((run.done / run.total) * 100) : 0;
+  return el('div', { cls: 'progress' }, [
+    el('div', { cls: 'bar' }, [el('div', { cls: 'fill', style: `width:${pct}%` })]),
+    el('p', { cls: 'note', text: run.finished
+      ? `执行完毕：${run.okCount} 行成功，${run.failCount} 行失败。`
+      : `正在执行第 ${run.done + 1} / ${run.total} 行…` }),
+  ]);
+}
+
+const ACTION_TEXT = { user: '建用户', photo: '入库', video: '配视频', grant: '授权' };
+
+function batchTable(plan) {
+  const run = state.batch.run;
+  const rows = plan.rows.map((r) => {
+    const result = run && run.results[r.line];
+    return el('tr', { cls: r.errors.length ? 'bad' : (r.warnings.length ? 'warn' : '') }, [
+      td('行', el('span', { cls: 'mono', text: String(r.line) }), 'num'),
+      td('用户', [
+        el('span', { text: r.userName || '—' }),
+        r.userName ? el('span', { cls: 'sub', text: r.role === 'admin' ? '管理员' : '访客' }) : null,
+        r.hasPassword ? el('span', { cls: 'tag', text: '带口令' }) : null,
+      ]),
+      td('照片', el('span', { cls: 'mono sub', text: r.photoPath || '—' }), 'wide'),
+      td('视频', el('span', { cls: 'mono sub', text: r.videoPath || '—' }), 'wide'),
+      td('要做', el('span', { cls: 'acts' },
+        r.actions.length
+          ? r.actions.map((a) => el('span', { cls: 'tag', text: ACTION_TEXT[a] || a }))
+          : [el('span', { cls: 'muted', text: '无' })])),
+      td('检查', batchMessages(r), 'wide'),
+      td('结果', batchResult(result)),
+    ]);
+  });
+  return table(['行', '用户', '照片', '视频', '要做', '检查', '结果'], rows);
+}
+
+function batchMessages(r) {
+  if (!r.errors.length && !r.warnings.length) return el('span', { cls: 'tag ok', text: '没问题' });
+  const out = [];
+  for (const m of r.errors) out.push(el('p', { cls: 'msgline bad' }, [richText(m)]));
+  for (const m of r.warnings) out.push(el('p', { cls: 'msgline warn' }, [richText(m)]));
+  return out;
+}
+
+function batchResult(result) {
+  if (!result) return el('span', { cls: 'muted', text: '—' });
+  if (result.state === 'running') return el('span', { cls: 'tag', text: '进行中…' });
+  if (result.state === 'skipped') return el('span', { cls: 'tag warn', text: '已跳过' });
+  if (result.state === 'ok') {
+    return el('span', { cls: 'acts' }, [
+      el('span', { cls: 'tag ok', text: '成功' }),
+      ...(result.notes || []).map((n) => el('span', { cls: 'sub', text: n })),
+    ]);
+  }
+  return el('span', {}, [
+    el('span', { cls: 'tag bad', text: '失败' }),
+    el('p', { cls: 'msgline bad', text: result.error || '' }),
+  ]);
+}
+
+/**
+ * 逐行执行计划。
+ *
+ * 顺序是「建用户 → 入库照片 → 配视频 → 记下要授权的」，最后统一提交授权。
+ * 授权放到最后是因为 `PUT /admin/users/<id>/grants` 是**整体替换**：同一个人在表里
+ * 有三行时，每行提交一次会让后两次把前面的覆盖掉，最后只剩最后一张。
+ *
+ * 已存在的东西一律当成功：用户名重复回 409 `name_taken`，照片重复回 409
+ * `already_ingested`（**并带上 photoId**，所以还能接着给它配视频和授权）。这让
+ * 「改完出错的几行再导一遍」成为安全操作，而那正是这个界面最常见的用法。
+ */
+async function runBatch() {
+  const plan = state.batch.plan;
+  if (!plan || state.batch.busy) return;
+  const todo = plan.rows.filter((r) => r.errors.length === 0 && r.actions.length > 0);
+  if (!todo.length) return;
+
+  state.batch.busy = true;
+  const run = {
+    total: todo.length, done: 0, okCount: 0, failCount: 0,
+    finished: false, results: {},
   };
-  const worker = async () => { while (queue.length && gen === state.photosGen) await one(queue.shift()); };
-  await Promise.all([worker(), worker(), worker(), worker()]);
+  state.batch.run = run;
+  for (const r of plan.rows) {
+    if (r.errors.length) run.results[r.line] = { state: 'skipped' };
+  }
+  renderBatch();
+
+  // nameKey → userId。nameKey 由服务端算（见 app.py 的 `_user_json`），不在这里
+  // 自己实现一遍规范化。
+  const userIds = new Map();
+  for (const u of await safeUsers()) userIds.set(u.nameKey, u.id);
+  // refPath → photoId，跨行复用：同一张照片授权给三个人是三行，只该入库一次。
+  const photoIds = new Map();
+  // userId → Set(photoId)，最后统一 PUT。
+  const wantGrants = new Map();
+
+  for (const r of todo) {
+    run.results[r.line] = { state: 'running' };
+    renderBatch();
+    const notes = [];
+    try {
+      let userId = null;
+      if (r.userName) {
+        userId = userIds.get(r.nameKey) || null;
+        if (userId) {
+          notes.push('用户已存在，复用');
+        } else {
+          try {
+            const created = await api('POST', '/admin/users', {
+              name: r.userName, role: r.role, password: r.password || null,
+            });
+            userId = created.id;
+            userIds.set(created.nameKey, created.id);
+          } catch (e) {
+            if (e.code !== 'name_taken') throw e;
+            // 竞态或者规范化没对上：重取一次用户表再找。
+            for (const u of await safeUsers()) userIds.set(u.nameKey, u.id);
+            userId = userIds.get(r.nameKey) || null;
+            if (!userId) throw e;
+            notes.push('用户已存在，复用');
+          }
+        }
+      }
+
+      let photoId = null;
+      if (r.photoPath) {
+        photoId = photoIds.get(r.photoPath) || null;
+        if (!photoId) {
+          const doc = { refPath: r.photoPath };
+          if (r.videoPath) doc.videoPath = r.videoPath;
+          if (r.title) doc.title = r.title;
+          if (r.printWidthMm !== null && r.printWidthMm !== undefined) {
+            doc.printWidthMm = r.printWidthMm;
+          }
+          try {
+            const created = await api('POST', '/photo', doc);
+            photoId = created.photoId;
+            if (r.videoPath) notes.push('已配视频');
+          } catch (e) {
+            if (e.code !== 'already_ingested' || !e.detail.photoId) throw e;
+            photoId = e.detail.photoId;
+            notes.push('照片已入库，复用');
+            // 入库那一步没走，所以视频得单独配。这里**不判断**它是不是已经配着
+            // 同一段视频了：`POST /photo/<id>/video` 对同一个路径是幂等的，而
+            // 多问一次 `GET /photo/<id>` 只是为了省一次同样结果的调用。
+            if (r.videoPath) {
+              await api('POST', `/photo/${photoId}/video`, { videoPath: r.videoPath });
+              notes.push('已配视频');
+            }
+          }
+          photoIds.set(r.photoPath, photoId);
+        } else if (r.videoPath) {
+          // 同一张照片在前面的行已经处理过（含视频）。计划构建时已经拦掉了
+          // 「同一张照片配两段不同视频」，所以这里一定是同一段，不用再配。
+          notes.push('照片本轮已处理');
+        }
+      }
+
+      if (userId && photoId) {
+        if (!wantGrants.has(userId)) wantGrants.set(userId, new Set());
+        wantGrants.get(userId).add(photoId);
+      }
+
+      run.results[r.line] = { state: 'ok', notes };
+      run.okCount++;
+    } catch (e) {
+      run.results[r.line] = { state: 'fail', error: `${e.message}（${e.code}）` };
+      run.failCount++;
+    }
+    run.done++;
+    renderBatch();
+  }
+
+  // 授权统一提交。**与库里现有的取并集**，不是替换 —— PUT 是整体替换，直接提交
+  // 表里这几张会把这个人原有的其它授权全部抹掉，而那些授权跟这份表毫无关系。
+  for (const [userId, ids] of wantGrants) {
+    try {
+      const cur = await api('GET', `/admin/users/${userId}/grants`);
+      const merged = new Set(cur.photoIds || []);
+      for (const id of ids) merged.add(id);
+      if (merged.size !== (cur.photoIds || []).length) {
+        await api('PUT', `/admin/users/${userId}/grants`, { photoIds: [...merged] });
+      }
+    } catch (e) {
+      toast('bad', `授权提交失败（用户 ${userId}）：${e.message}`, e.code);
+      run.failCount++;
+    }
+  }
+
+  run.finished = true;
+  state.batch.busy = false;
+  renderBatch();
+  if (run.failCount === 0) ok(`${run.okCount} 行全部执行成功。`);
+  else toast('bad', `${run.okCount} 行成功，${run.failCount} 行失败。失败原因在表格的「结果」一列。`);
+
+  // 别的页签的缓存全作废了。
+  state.users = null;
+  state.photos = null;
+  state.photoDetail = {};
+  state.grants = null;
+  state.mapping = null;
+}
+
+/** 取用户表，失败时返回空数组（执行流程不该因为这一步整批中止）。 */
+async function safeUsers() {
+  try {
+    return await api('GET', '/admin/users');
+  } catch (e) {
+    return [];
+  }
+}
+
+// ============================== 素材挂载点 ==============================
+
+async function loadMounts() {
+  const box = $('mounts-body');
+  skeleton(box, 2);
+  try {
+    state.mounts = await api('GET', '/admin/mounts');
+    renderMounts();
+  } catch (e) {
+    if (e.status !== 401) failbox(box, e, loadMounts);
+  }
+}
+
+const MOUNT_KIND_LABEL = { local: '本机路径', webdav: 'WebDAV' };
+
+function renderMounts() {
+  const box = $('mounts-body');
+  clear(box);
+  if (!state.mounts) return;
+  const { mounts, envRoots } = state.mounts;
+
+  // 环境变量给的那几个根先列出来（只读）。不列的话会出现「我明明在 compose 里配了，
+  // 怎么这儿是空的」这种困惑 —— 那几个根确实在，只是不是在这里配的。
+  if (envRoots && envRoots.length) {
+    box.appendChild(el('p', { cls: 'note' }, [
+      el('span', { text: '来自 PHOTOAR_ROOTS（只读，要改就改 compose 再重启）：' }),
+      ...envRoots.map((r) => el('span', { cls: 'tag', text: `${r.name} · ${r.path}` })),
+    ]));
+  }
+
+  if (!mounts.length) {
+    box.appendChild(el('div', { cls: 'empty' }, [
+      el('p', { text: '还没有额外的挂载点。' }),
+      el('p', { cls: 'hint', text:
+        '上面那几个根已经能用了。加挂载点是为了把别的位置也纳进来 —— ' +
+        '比如另一个已经 mount 好的网络盘，或者一台 WebDAV 服务器。' }),
+    ]));
+    return;
+  }
+
+  const rows = mounts.map((m) => {
+    const edit = el('button', { cls: 'btn sm', type: 'button', text: '编辑' });
+    edit.addEventListener('click', () => openMountDialog(m));
+    const del = el('button', { cls: 'btn sm danger', type: 'button', text: '删除' });
+    del.addEventListener('click', () => deleteMount(m));
+    return el('tr', {}, [
+      td('名字', [
+        el('span', { text: m.name }),
+        m.enabled ? null : el('span', { cls: 'tag warn', text: '已停用' }),
+      ]),
+      td('类型', el('span', { cls: 'tag', text: MOUNT_KIND_LABEL[m.kind] || m.kind })),
+      td('位置', el('span', { cls: 'mono sub', text: m.location }), 'wide'),
+      td('凭证', m.username
+        ? el('span', {}, [
+            el('span', { text: m.username }),
+            m.hasPassword ? el('span', { cls: 'tag', text: '有口令' }) : null,
+          ])
+        : el('span', { cls: 'muted', text: '无' })),
+      td('操作', el('span', { cls: 'acts' }, [edit, del])),
+    ]);
+  });
+  box.appendChild(table(['名字', '类型', '位置', '凭证', '操作'], rows));
+}
+
+$('new-mount').addEventListener('click', () => openMountDialog(null));
+
+/** 新增 / 编辑共用。`m` 为 null 是新增。 */
+function openMountDialog(m) {
+  const d = $('dlg-mount');
+  const errBox = $('dlg-mount-err');
+  hideFormErr(errBox);
+  $('dlg-mount-title').textContent = m ? '编辑挂载点' : '新增挂载点';
+  $('dlg-mount-lead').textContent = m
+    ? '改完之后立刻生效，不用重启服务。'
+    : '本机路径填的是**服务端**上的绝对路径；WebDAV 填完整地址。';
+  $('m-name').value = m ? m.name : '';
+  $('m-kind').value = m ? m.kind : 'local';
+  $('m-location').value = m ? m.location : '';
+  $('m-user').value = m && m.username ? m.username : '';
+  $('m-pw').value = '';
+  $('m-enabled').checked = m ? m.enabled : true;
+  $('m-pw-help').textContent = m && m.hasPassword
+    ? '已设置口令。留空 = 不改；要清空就填一个空格再删掉（提交空字符串）。'
+    : '留空 = 不设口令。服务端从不把口令发回来。';
+  syncMountKind();
+
+  const form = $('dlg-mount-form');
+  const save = $('m-save');
+  const onSubmit = async (ev) => {
+    ev.preventDefault();
+    const kind = $('m-kind').value;
+    const body = {
+      name: $('m-name').value.trim(),
+      kind,
+      location: $('m-location').value.trim(),
+      // WebDAV 才有凭证。切成 local 时把它们清掉 —— 留着的话库里会有一组
+      // 用不上的凭证，而下次切回 webdav 时会以为它是新填的。
+      username: kind === 'webdav' ? $('m-user').value.trim() : '',
+      enabled: $('m-enabled').checked,
+    };
+    const pw = $('m-pw').value;
+    // 编辑时空口令 = 不改（不传这个字段）。新增时空口令 = 不设。
+    if (pw || !m) body.password = pw;
+    save.disabled = true;
+    try {
+      if (m) await api('PATCH', `/admin/mounts/${m.id}`, body);
+      else await api('POST', '/admin/mounts', body);
+      done();
+      ok(m ? '挂载点已更新。' : '挂载点已添加。');
+      await loadMounts();
+    } catch (e) {
+      showFormErr(errBox, e);
+    } finally {
+      save.disabled = false;
+    }
+  };
+  const done = () => {
+    form.removeEventListener('submit', onSubmit);
+    closeDlg(d);
+  };
+  form.addEventListener('submit', onSubmit);
+  d.addEventListener('close', () => form.removeEventListener('submit', onSubmit), { once: true });
+  openDlg(d);
+  $('m-name').focus();
+}
+
+$('m-kind').addEventListener('change', syncMountKind);
+
+/** 类型决定了「位置」那一栏的含义与提示，以及要不要显示凭证。 */
+function syncMountKind() {
+  const kind = $('m-kind').value;
+  const dav = kind === 'webdav';
+  $('m-creds').hidden = !dav;
+  $('m-location-label').textContent = dav ? '地址' : '绝对路径';
+  $('m-location').placeholder = dav
+    ? 'https://nas.example.com/remote.php/dav/files/me/'
+    : '/media/photos';
+  clear($('m-kind-help'));
+  $('m-kind-help').appendChild(richText(dav
+    ? '从一台 WebDAV 服务器取。添加时会先**下载到服务端**再入库。'
+    : '服务端文件系统上的目录。已经用 mount/cifs 挂好的网络盘就是这种 —— ' +
+      '在容器里它就是一个普通路径。**不拷贝**，直接读。'));
+  clear($('m-location-help'));
+  $('m-location-help').appendChild(richText(dav
+    ? '群晖是 `https://<host>:5006/`，Nextcloud 是 ' +
+      '`https://<host>/remote.php/dav/files/<用户名>/`。'
+    : '填的是**容器内**的路径。宿主机上的目录要先在 compose 里挂进容器，' +
+      '否则这里会报「路径不存在」。'));
+}
+
+async function deleteMount(m) {
+  const yes = await confirm2(
+    `删除挂载点「${m.name}」`,
+    '以后不再从这个位置找素材。',
+    [
+      '已经入库的照片**不受影响** —— 它们记的是文件的绝对路径，不是挂载点。',
+      '但如果那些文件只由这个挂载点覆盖着，它们会在下一次一致性检查里被标成「读不到」。',
+      '磁盘上的文件一个都不删。',
+    ],
+    '删除',
+  );
+  if (!yes) return;
+  try {
+    await api('DELETE', `/admin/mounts/${m.id}`);
+    ok('挂载点已删除。');
+    await loadMounts();
+  } catch (e) {
+    fail(e, '删除失败');
+  }
+}
+
+// ============================== 从挂载点添加照片 ==============================
+
+/**
+ * 「添加照片」：挑一张图 → 挑一段视频（可跳过）→ 入库并建立映射。
+ *
+ * 和 App 的「素材」页是同一件事的两条路，区别只在**素材从哪来**：那边是手机相册，
+ * 这边是服务端能看到的位置（挂载点 / PHOTOAR_ROOTS）。两边都落到同一个
+ * `POST /v1/photo {refPath, videoPath}`。
+ */
+/**
+ * 打印尺寸预设。与 App 侧 `PrintSize.kt` 是同一组数，改一边要改另一边。
+ *
+ * 为什么要问：物理尺寸未知时 ARCore 必须靠视差自己量出照片有多大，那需要用户扫的时候
+ * 挪动手机才收敛 —— 而那正是「认出来了，但没在画面里找到」最常见的成因。填了它，
+ * ARCore 一认出图案就能直接给位姿。
+ *
+ * 填错一点不影响贴合精度：四边形的大小取的是 ARCore 自己量的 `extentX`，申报宽度只是
+ * 给检测用的提示。
+ */
+const PRINT_SIZES = [
+  { label: '不知道', mm: 0 },
+  { label: '6寸 横', mm: 152 },
+  { label: '6寸 竖', mm: 102 },
+  { label: '5寸 横', mm: 127 },
+  { label: '5寸 竖', mm: 89 },
+  { label: 'A4 横', mm: 297 },
+  { label: 'A4 竖', mm: 210 },
+];
+
+/** 问一下打印尺寸。返回毫米数（0 = 不知道），取消返回 null。 */
+function askPrintSize() {
+  const d = $('dlg-pick');
+  $('dlg-pick-title').textContent = '这张照片印出来有多宽？';
+  const crumbs = $('dlg-pick-crumbs');
+  const list = $('dlg-pick-list');
+  clear(crumbs);
+  crumbs.appendChild(el('span', { cls: 'crumb cur', text:
+    '填了的话，扫的时候一认出来就能贴上；不填也行，但那时要用户轻轻晃动手机才量得出来。' }));
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      d.removeEventListener('cancel', onCancel);
+      closeDlg(d);
+      resolve(v);
+    };
+    const onCancel = () => finish(null);
+    d.addEventListener('cancel', onCancel);
+    d.addEventListener('close', onCancel, { once: true });
+    clear(list);
+    for (const s of PRINT_SIZES) {
+      const b = el('button', { cls: 'fpick', type: 'button' }, [
+        el('span', { cls: 'ic', text: s.mm ? '📐' : '?' }),
+        el('span', { cls: 'nm', text: s.label }),
+        el('span', { cls: 'sz mono', text: s.mm ? `${s.mm} mm` : 'ARCore 自己量' }),
+      ]);
+      b.addEventListener('click', () => finish(s.mm));
+      list.appendChild(b);
+    }
+    openDlg(d);
+  });
+}
+
+$('add-photo').addEventListener('click', async () => {
+  const ref = await pickFromMounts('image', '挑一张照片');
+  if (!ref) return;
+  const video = await pickFromMounts('video', '挑配它的那段视频（可以取消跳过）');
+  const widthMm = await askPrintSize();
+  if (widthMm === null) return;   // 取消 = 整个动作取消
+  const body = { refPath: ref };
+  if (widthMm > 0) body.printWidthMm = widthMm;
+  if (video) body.videoPath = video;
+  const t = toast('ok', video ? '正在入库并配视频…（要跑特征提取，几十秒）' : '正在入库…（要跑特征提取，几十秒）', null, true);
+  try {
+    const created = await api('POST', '/photo', body);
+    ok(`入库成功，质量分 ${created.qualityScore}。` +
+       (video ? '' : ' 还没配视频 —— 在下面那一行点「配视频」补上，否则扫到它不会播。'));
+  } catch (e) {
+    await explainIngestFailure(e, ref, video);
+  } finally {
+    if (t) t.remove();
+  }
+  state.mapping = null;
+  state.photos = null;
+  await loadPhotos();
+});
+
+/**
+ * 入库失败时，把「这个文件在库里已经是什么」查出来说清楚。
+ *
+ * 这是重复上传**不该是死胡同**的那一半：`already_ingested` 只告诉你「已经入库了」，
+ * 而人真正要知道的是「那张照片现在配的是哪段视频」，好接着决定要不要换。
+ */
+async function explainIngestFailure(e, refPath, videoPath) {
+  if (e.code !== 'already_ingested') {
+    fail(e, '入库失败');
+    return;
+  }
+  let info = null;
+  try {
+    info = await api('GET', `/admin/lookup?path=${encodeURIComponent(refPath)}`);
+  } catch (_) { /* 查不到就只报原错误 */ }
+  const existing = info && info.photo;
+  if (!existing) {
+    fail(e, '入库失败');
+    return;
+  }
+  const lines = [
+    `这张照片已经入库了：「${existing.title || '(无标题)'}」`,
+    existing.videoPath
+      ? `它现在配的视频是 ${existing.videoPath}`
+      : '它现在**没有**配视频',
+  ];
+  if (!videoPath) {
+    toast('bad', lines.join('；') + '。没什么要改的。');
+    return;
+  }
+  // 一张照片只能配一个视频，所以这里是「换」而不是「加」。
+  const yes = await confirm2(
+    '这张照片已经在库里了',
+    lines.join('；') + '。',
+    [
+      `要把它的视频换成刚挑的这段吗：${videoPath}`,
+      '一张照片只能配一段视频，所以这是**替换**，原来那段不再和它关联。',
+      '那段旧视频的文件不删，别的照片如果也在用它，不受影响。',
+    ],
+    '换成新的',
+  );
+  if (!yes) return;
+  try {
+    await api('POST', `/photo/${existing.photoId}/video`, { videoPath });
+    ok('已经把这张照片的视频换成新的了。');
+  } catch (err) {
+    fail(err, '换视频失败');
+  }
+}
+
+/**
+ * 从挂载点里挑一个文件，返回可以直接喂给 `POST /v1/photo` 的服务端路径。
+ *
+ * 第一层是挂载点列表（含 PHOTOAR_ROOTS 那几个根，它们走既有的 `/v1/fs/list`）。
+ * 选中文件之后调 `fetch` —— local 直接返回原路径不拷贝，webdav 会先下载到落地目录。
+ */
+function pickFromMounts(wantKind, title) {
+  const d = $('dlg-pick');
+  $('dlg-pick-title').textContent = title;
+  const crumbs = $('dlg-pick-crumbs');
+  const list = $('dlg-pick-list');
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      d.removeEventListener('cancel', onCancel);
+      closeDlg(d);
+      resolve(v);
+    };
+    const onCancel = () => finish(null);
+    d.addEventListener('cancel', onCancel);
+    d.addEventListener('close', onCancel, { once: true });
+
+    /** 第一层：挑一个来源。 */
+    const showSources = async () => {
+      clear(crumbs);
+      clear(list);
+      list.appendChild(el('div', { cls: 'skel' }));
+      let doc;
+      try {
+        doc = state.mounts || (state.mounts = await api('GET', '/admin/mounts'));
+      } catch (e) {
+        clear(list);
+        list.appendChild(el('div', { cls: 'failbox' }, [
+          el('div', { cls: 'msg' }, [el('span', { text: e.message })]),
+        ]));
+        return;
+      }
+      clear(list);
+      const sources = [
+        ...(doc.envRoots || []).map((r) => ({ kind: 'root', name: r.name, path: r.path })),
+        ...doc.mounts.filter((m) => m.enabled).map((m) => ({ kind: 'mount', mount: m, name: m.name })),
+      ];
+      if (!sources.length) {
+        list.appendChild(el('div', { cls: 'empty' }, [
+          el('p', { text: '没有可用的素材位置。' }),
+          el('p', { cls: 'hint', text: '去「配置」页加一个挂载点。' }),
+        ]));
+        return;
+      }
+      for (const s of sources) {
+        const b = el('button', { cls: 'fpick dir', type: 'button' }, [
+          el('span', { cls: 'ic', text: s.kind === 'mount' && s.mount.kind === 'webdav' ? '☁' : '📁' }),
+          el('span', { cls: 'nm', text: s.name }),
+          el('span', { cls: 'sz mono', text: s.kind === 'mount' ? MOUNT_KIND_LABEL[s.mount.kind] : '本机' }),
+        ]);
+        b.addEventListener('click', () => {
+          if (s.kind === 'root') browseRoot(s.path);
+          else browseMount(s.mount, '');
+        });
+        list.appendChild(b);
+      }
+    };
+
+    const crumbBar = (label, onRoot, cur) => {
+      clear(crumbs);
+      const home = el('button', { cls: 'crumb', type: 'button', text: '全部位置' });
+      home.addEventListener('click', showSources);
+      crumbs.appendChild(home);
+      crumbs.appendChild(el('span', { cls: 'sep', text: '/' }));
+      const up = el('button', { cls: 'crumb', type: 'button', text: label });
+      up.addEventListener('click', onRoot);
+      crumbs.appendChild(up);
+      if (cur) {
+        crumbs.appendChild(el('span', { cls: 'sep', text: '/' }));
+        crumbs.appendChild(el('span', { cls: 'crumb cur mono', text: cur }));
+      }
+    };
+
+    /** PHOTOAR_ROOTS 的根：走既有的 /v1/fs/list（它认绝对路径）。 */
+    const browseRoot = async (abs) => {
+      clear(list);
+      list.appendChild(el('div', { cls: 'skel' }));
+      let body;
+      try {
+        body = await api('GET', `/fs/list?path=${encodeURIComponent(abs)}`);
+      } catch (e) {
+        clear(list);
+        list.appendChild(el('div', { cls: 'failbox' }, [
+          el('div', { cls: 'msg' }, [el('span', { text: e.message })]),
+        ]));
+        return;
+      }
+      crumbBar('本机', () => showSources(), body.path);
+      clear(list);
+      paintEntries(body.entries, {
+        onDir: (e) => browseRoot(`${body.path}/${e.name}`),
+        onFile: (e) => finish(`${body.path}/${e.name}`),
+        parent: body.parent ? () => browseRoot(body.parent) : null,
+      });
+    };
+
+    /** 挂载点：走 /v1/admin/mounts/<id>/list，两种 kind 形状一样。 */
+    const browseMount = async (mount, rel) => {
+      clear(list);
+      list.appendChild(el('div', { cls: 'skel' }));
+      let body;
+      try {
+        const q = rel ? `?path=${encodeURIComponent(rel)}` : '';
+        body = await api('GET', `/admin/mounts/${mount.id}/list${q}`);
+      } catch (e) {
+        clear(list);
+        list.appendChild(el('div', { cls: 'failbox' }, [
+          el('div', { cls: 'msg' }, [
+            el('span', { text: e.message }),
+            el('span', { cls: 'code', text: e.code }),
+          ]),
+        ]));
+        return;
+      }
+      crumbBar(mount.name, () => browseMount(mount, ''), body.path);
+      clear(list);
+      paintEntries(body.entries, {
+        onDir: (e) => browseMount(mount, joinRel(body.path, e.href || e.name)),
+        onFile: async (e) => {
+          const chosen = await fetchFromMount(mount, joinRel(body.path, e.href || e.name));
+          if (chosen) finish(chosen);
+        },
+        parent: body.parent === null || body.parent === undefined
+          ? null
+          : () => browseMount(mount, body.parent),
+      });
+    };
+
+    /** 画一层条目。类型不对的文件列出来但点不动（理由同 pickPath）。 */
+    const paintEntries = (entries, { onDir, onFile, parent }) => {
+      if (parent) {
+        const up = el('button', { cls: 'fpick dir', type: 'button' }, [
+          el('span', { cls: 'ic', text: '↑' }),
+          el('span', { cls: 'nm', text: '上一级' }),
+        ]);
+        up.addEventListener('click', parent);
+        list.appendChild(up);
+      }
+      if (!entries.length) {
+        list.appendChild(el('div', { cls: 'empty' }, [el('p', { text: '这个目录是空的。' })]));
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDir) {
+          const b = el('button', { cls: 'fpick dir', type: 'button' }, [
+            el('span', { cls: 'ic', text: '📁' }),
+            el('span', { cls: 'nm', text: e.name }),
+          ]);
+          b.addEventListener('click', () => onDir(e));
+          list.appendChild(b);
+          continue;
+        }
+        const usable = e.kind === wantKind;
+        const b = el('button', {
+          cls: `fpick file${usable ? '' : ' off'}`,
+          type: 'button',
+          disabled: !usable,
+          title: usable ? e.name
+            : `这里要挑${wantKind === 'video' ? '视频' : '图片'}，这个是${KIND_TEXT[e.kind] || '认不出的类型'}`,
+        }, [
+          el('span', { cls: 'ic', text: e.kind === 'video' ? '🎬' : (e.kind === 'image' ? '🖼' : '·') }),
+          el('span', { cls: 'nm', text: e.name }),
+          el('span', { cls: 'sz mono', text: bytesText(e.bytes) }),
+        ]);
+        if (usable) b.addEventListener('click', () => onFile(e));
+        list.appendChild(b);
+      }
+    };
+
+    showSources();
+    openDlg(d);
+  });
+}
+
+function joinRel(base, name) {
+  // WebDAV 的条目带 href（绝对且已编码），那种直接用，不能再和 base 拼。
+  if (name.startsWith('/')) return name;
+  return base ? `${base}/${name}` : name;
+}
+
+/** 把挂载点里的一个文件变成服务端本地路径。webdav 会先下载。 */
+async function fetchFromMount(mount, rel) {
+  const t = mount.kind === 'webdav'
+    ? toast('ok', '正在从 WebDAV 下载…（大文件要等一会儿）', null, true)
+    : null;
+  try {
+    const doc = await api('POST', `/admin/mounts/${mount.id}/fetch`, { path: rel });
+    if (doc.copied) ok(`已下载到服务端：${doc.path}`);
+    return doc.path;
+  } catch (e) {
+    fail(e, '取文件失败');
+    return null;
+  } finally {
+    if (t) t.remove();
+  }
 }
 
 // ============================== 起飞 ==============================

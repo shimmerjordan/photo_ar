@@ -98,6 +98,8 @@
               aria-controls="p-config" aria-selected="false">配置</button>
       <button role="tab" type="button" data-tab="photos" id="tab-photos"
               aria-controls="p-photos" aria-selected="false">照片</button>
+      <button role="tab" type="button" data-tab="batch" id="tab-batch"
+              aria-controls="p-batch" aria-selected="false">批量</button>
     </nav>
   </div>
 
@@ -143,20 +145,96 @@
         </div>
       </div>
       <div id="config-body"></div>
+
+      <!-- 素材挂载点。放在配置页里，因为它回答的是「素材从哪来」这个部署问题，
+           和识别阈值一样属于「配一次就不动」的东西。 -->
+      <div class="head" style="margin-top:26px">
+        <div>
+          <h2>素材挂载点</h2>
+          <p class="note">
+            照片和视频从哪儿找。配好之后「照片」页就能直接从这些位置添加。
+          </p>
+        </div>
+        <div class="right">
+          <button class="btn sm" type="button" data-reload="mounts">刷新</button>
+          <button class="btn sm primary" type="button" id="new-mount">新增挂载点</button>
+        </div>
+      </div>
+      <div id="mounts-body"></div>
     </section>
 
-    <!-- 照片 -->
+    <!-- 照片（含映射：两者本来就是同一份数据的两种看法，见 app.js 的 renderPhotos） -->
     <section class="panel" id="p-photos" role="tabpanel" aria-labelledby="tab-photos" tabindex="-1" hidden>
       <div class="head">
         <div>
           <h2>照片</h2>
-          <p class="note">只读。入库走 App 与批量脚本，管理台不做上传。</p>
+          <p class="note">库里有什么、各自配了哪段视频。入库走 App 与批量导入。</p>
         </div>
         <div class="right">
           <button class="btn sm" type="button" data-reload="photos">刷新</button>
+          <button class="btn sm primary" type="button" id="add-photo">添加照片</button>
         </div>
       </div>
+      <!-- 方向切换。两个视图不是「详细/简略」，而是两个不同的问题：
+           按照片 = 「这张配了吗」，按视频 = 「这段视频影响谁」。 -->
+      <div class="segbar" role="group" aria-label="看的方向">
+        <button class="btn sm" type="button" data-mapdir="photo" aria-pressed="true">按照片</button>
+        <button class="btn sm" type="button" data-mapdir="video" aria-pressed="false">按视频</button>
+      </div>
       <div id="photos-body"></div>
+    </section>
+
+    <!-- 批量 -->
+    <section class="panel" id="p-batch" role="tabpanel" aria-labelledby="tab-batch" tabindex="-1" hidden>
+      <div class="head">
+        <div>
+          <h2>批量</h2>
+          <p class="note">一行 = 一个用户 + 一张照片 + 一段视频 + 一次授权。先预览，再执行。</p>
+        </div>
+      </div>
+
+      <div class="cards">
+        <div class="card">
+          <h3>1 · 下模板</h3>
+          <p class="note">
+            带两行例子。照片和视频填的是**容器内**的路径（和 PHOTOAR_ROOTS 一致），
+            不是你电脑上的路径。这是导入失败最常见的原因。
+          </p>
+          <div class="row">
+            <a class="btn sm primary" id="dl-template-xlsx" download>模板 .xlsx</a>
+            <a class="btn sm" id="dl-template-csv" download>模板 .csv</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>2 · 导出现状</h3>
+          <p class="note">
+            「用户」那份的表头和模板**一样**，可以导出、在 Excel 里改、再导回来。
+            「映射」那份是只读快照。
+          </p>
+          <div class="row">
+            <a class="btn sm" id="dl-users-xlsx" download>用户 .xlsx</a>
+            <a class="btn sm" id="dl-users-csv" download>用户 .csv</a>
+            <a class="btn sm" id="dl-mapping-xlsx" download>映射 .xlsx</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>3 · 导入</h3>
+          <p class="note">
+            选文件后**只是预览**，一行都还没写库。.xlsx 和 .csv 都收。
+          </p>
+          <div class="row">
+            <label class="btn sm primary" for="batch-file">选文件…</label>
+            <input id="batch-file" type="file"
+                   accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                   class="sr-file">
+            <span class="muted" id="batch-filename"></span>
+          </div>
+        </div>
+      </div>
+
+      <div id="batch-body"></div>
     </section>
   </main>
 </div>
@@ -208,6 +286,82 @@
       <button class="btn primary" type="submit" id="u-save">保存</button>
     </div>
   </form>
+</dialog>
+
+<!-- ---------- 挂载点（新增 / 编辑共用一个） ---------- -->
+<dialog id="dlg-mount" aria-labelledby="dlg-mount-title">
+  <form id="dlg-mount-form">
+    <h3 id="dlg-mount-title">新增挂载点</h3>
+    <p class="lead" id="dlg-mount-lead"></p>
+
+    <div class="formerr" id="dlg-mount-err" role="alert" hidden></div>
+
+    <div class="field">
+      <label for="m-name">名字</label>
+      <input id="m-name" type="text" required>
+      <span class="help">显示用。也是浏览时那一层的名字。</span>
+    </div>
+
+    <div class="field">
+      <label for="m-kind">类型</label>
+      <select id="m-kind">
+        <option value="local">本机绝对路径</option>
+        <option value="webdav">WebDAV</option>
+      </select>
+      <span class="help" id="m-kind-help"></span>
+    </div>
+
+    <div class="field">
+      <label for="m-location" id="m-location-label">路径</label>
+      <input id="m-location" type="text" spellcheck="false" required>
+      <span class="help" id="m-location-help"></span>
+    </div>
+
+    <!-- 凭证只有 WebDAV 用得上 -->
+    <div id="m-creds" hidden>
+      <div class="field">
+        <label for="m-user">用户名</label>
+        <input id="m-user" type="text" autocomplete="off" spellcheck="false">
+        <span class="help">不需要认证就留空。</span>
+      </div>
+      <div class="field">
+        <label for="m-pw">口令</label>
+        <input id="m-pw" type="password" autocomplete="new-password">
+        <span class="help" id="m-pw-help">留空 = 不改。服务端从不把口令发回来。</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="sw">
+        <input id="m-enabled" type="checkbox" checked>
+        <span class="track"></span>
+        <span class="txt">启用</span>
+      </label>
+      <span class="help">停用之后它下面的文件既不能浏览也不能添加，但已入库的照片不受影响。</span>
+    </div>
+
+    <div class="foot">
+      <button class="btn" type="button" data-close>取消</button>
+      <button class="btn primary" type="submit" id="m-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ---------- NAS 文件选择器 ---------- -->
+<!-- 「换视频」「配给照片」都要挑一个 NAS 上的文件。没有它的话这一页只能让人手打
+     路径，而手打路径正是批量导入里错得最多的那一项。
+     走 GET /v1/fs/list（admin only，本来就是 App 的目录浏览器在用的那个接口）。 -->
+<dialog id="dlg-pick" aria-labelledby="dlg-pick-title">
+  <div class="pad">
+    <h3 id="dlg-pick-title">挑一个文件</h3>
+    <!-- 面包屑：每一层可点，点了回到那一层。不做「上一级」按钮是因为白名单根
+         可能有多个，从某一层直接跳回根列表比一级一级退更常用。 -->
+    <nav class="crumbs" id="dlg-pick-crumbs" aria-label="当前位置"></nav>
+    <div class="picklist" id="dlg-pick-list"></div>
+    <div class="foot">
+      <button class="btn" type="button" data-close>取消</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- ---------- 危险操作二次确认 ---------- -->
