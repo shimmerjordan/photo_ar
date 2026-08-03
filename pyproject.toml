@@ -9,6 +9,23 @@ requires-python = ">=3.10"
 dependencies = [
     "opencv-python>=4.9",
     "numpy>=1.26",
+    # XFeat 后端的推理运行时。是**运行时**依赖而不是可选依赖：`recog.backend` 是一个
+    # 管理台上能改的下拉框，把它做成 extra 的后果是用户在界面上切到 xfeat、重启、
+    # 然后服务回退到 orb 并在日志里说"没有 onnxruntime"——一个从界面上完全看不出
+    # 原因的降级。
+    #
+    # 上界 1.23.2 是**两个**理由叠起来的，两个都要写：
+    #   1. 本地 venv 是 Python 3.10，而 onnxruntime 最后支持 3.10 的版本就是 1.23.2。
+    #      不加上界的话，`pip install -e .` 在开发机上会解不出任何版本（或者装到一个
+    #      3.10 装不上的 wheel 然后失败），而镜像里（3.11）一切正常 —— 于是"跑不起来
+    #      的只有开发机"。
+    #   2. 镜像基底是 python:3.11-slim，最新版在那边可用，所以上界对它不是必需的。
+    #      但**故意**也给它同一个上界：这样容器和开发机跑的是同一个 ORT 版本，
+    #      "本地测出来是这个数、容器里是另一个数" 就不可能是 ORT 版本差异造成的。
+    #      onnxruntime 的算子实现与线程行为在小版本间是真的会变的，而这个项目要量的
+    #      恰恰是识别延迟。
+    # 下界 1.17：早于它的版本在 ONNX opset 与 CPU EP 的线程选项上与这里的用法有出入。
+    "onnxruntime>=1.17,<=1.23.2",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +37,12 @@ photoar-server = "photoar.server.httpd:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# 管理台的静态页面。必须显式声明：Dockerfile 走的是 `pip install .`（不是
+# editable），而非 .py 文件默认不会被打进 wheel —— 漏了的话本地开发一切正常，
+# 容器里 GET /admin 直接 404，而没有任何构建步骤会报错。
+[tool.setuptools.package-data]
+"photoar.server" = ["webui/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

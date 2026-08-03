@@ -1,0 +1,76 @@
+# 在**开发机**上起服务端，给同一个 Tailnet 里的手机连。
+#
+#   cd photo-ar
+#   docker compose -f docker-compose.yml -f deploy/compose.local.yml up -d --build
+#   docker compose -f docker-compose.yml -f deploy/compose.local.yml logs -f
+#
+# 每次都打两个 -f 很烦，所以更常用的是把它接成一个变量：
+#   export PHOTOAR_LOCAL="-f docker-compose.yml -f deploy/compose.local.yml"
+#   docker compose $PHOTOAR_LOCAL up -d --build
+#
+# 为什么是覆盖层而不是另写一份完整的 compose：主文件里那些注释（为什么限 3 核、
+# 为什么 arcoreimg 得从宿主机送进去、为什么 PHOTOAR_BACKEND 只是初始值）是真正的
+# 部署知识，抄第二份迟早分叉。这里只写「开发机和 NAS 到底哪里不一样」。
+#
+# 和 NAS 的差别就三样：
+#   1. 照片/视频目录 —— NAS 上是 /share/Photo，开发机上没这个东西；
+#   2. 镜像 —— 本地构建，不去 GHCR 拉（那个 tag 未必推过）；
+#   3. 不试着下 xfeat 模型 —— 那个 release 还没发布，每次启动白等一次 404。
+services:
+  photo-ar-server:
+    # 本地构建的 tag。主文件里 `build: .` 已经在，加 --build 就会重新构建。
+    # 不复用 GHCR 那个名字是为了避免 `docker images` 里分不清哪个是自己编的。
+    image: photo-ar-server:local
+    # 换个名字，免得哪天真去 NAS 部署时和这个开发容器撞在一起
+    container_name: photo-ar-local
+
+    # volumes 必须 !override。compose 对 volumes 的默认行为是**合并**而不是替换 ——
+    # 不写这个标签，主文件里的 `/share/Photo:/share/Photo:ro` 会留下来，而 dockerd
+    # 会以 root 身份把宿主机的 /share/Photo 悄悄建成空目录。不报错，只是在开发机的
+    # 根目录下留一堆垃圾，而且服务还真会去索引那个空目录。
+    #
+    # !override 需要 compose ≥ 2.24（本机 2.27.1）。
+    volumes: !override
+      - ./data:/data
+      - ./deploy:/config:ro
+      # arcoreimg 是 ARCore SDK 里的闭源二进制，不可再分发（所以 .gitignore 里有它）。
+      # 镜像里没有，由宿主机送进去。缺了不会崩，只是入库时拿不到目标图质量分。
+      - ./tools/arcoreimg:/opt/photoar/tools/arcoreimg:ro
+      # 开发机上的素材。第一次跑之前先建出来：
+      #   mkdir -p local/photos/_inbox local/videos
+      # 想直接用现成的相册，把左半边换成真实路径即可（右半边别动，
+      # PHOTOAR_ROOTS 是按容器内路径写的）：
+      #   - /home/xyz/图片:/media/photos:ro
+      - ./local/photos:/media/photos
+      - ./local/videos:/media/videos:ro
+
+    environment:
+      # 容器内路径，与上面挂载的右半边一一对应
+      PHOTOAR_ROOTS: 照片=/media/photos,视频=/media/videos
+      # 必须落在 ROOTS 之内，且那条挂载得可写（photos 那条故意没加 :ro）
+      PHOTOAR_UPLOAD_DIR: /media/photos/_inbox
+      # 0 = 启动时不碰网络找模型。orb 后端不需要任何模型文件，而 xfeat.onnx 的
+      # 默认下载地址目前是 404 —— 开着只会让每次启动多等一次超时。
+      PHOTOAR_FETCH_MODELS: "0"
+      # 引导管理员。开发机上想用固定口令（省得每次重建容器去翻日志找那个只打印一次
+      # 的随机口令），就在**仓库根目录的 `.env`** 里写：
+      #
+      #     PHOTOAR_ADMIN_NAME=admin
+      #     PHOTOAR_ADMIN_PASSWORD=admin
+      #
+      # `.env` 在 .gitignore 里。**口令绝不能写在这个文件里** —— 这个仓库是公开的，
+      # 而 `app.Server._bootstrap_admin` 的注释里论证过为什么固定默认口令等于没有口令：
+      # 「那个默认值就印在这份源码里」。写在这里就正好犯了那一条，哪怕文件名带 .local。
+      #
+      # 不设 = 启动时生成随机口令并打印一次（那才是安全的默认）。
+      #
+      # 只影响**引导**（库里一个 admin 都没有时）。已存在的 admin 不会被它改写，所以
+      # 改过口令之后，这里设什么都不会把它顶回来。
+      PHOTOAR_ADMIN_NAME: ${PHOTOAR_ADMIN_NAME:-admin}
+      PHOTOAR_ADMIN_PASSWORD: ${PHOTOAR_ADMIN_PASSWORD:-}
+
+    # cpus/mem 刻意**不放宽**：这个项目的验收条件之一就是「在 NAS 的资源预算内
+    # 跑得动」（N5095 四核，留一核给别的）。开发机有 16 核，放开了本地怎么测都
+    # 快，然后到 NAS 上才发现撞超时 —— 那就白测了。
+    #
+    # 只有在专门要压测「上限能到多少」时才临时放宽，改完记得改回来。

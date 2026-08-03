@@ -17,6 +17,9 @@ local.properties
 *.aab
 captures/
 .cxx/
+# 内置 ARCore 运行时的下载缓存。上面的 *.apk 其实已经盖住了里面的文件，
+# 这一行是为了写清意图：72 MiB 的二进制永远不进版本库，构建时按 sha256 取。
+android/.arcore/
 
 # superpowers 的 spec/plan 是过程产物，留在本地不进仓库
 docs/superpowers/
@@ -24,3 +27,6 @@ docs/superpowers/
 
 # compose 读的环境变量文件，含 token
 .env
+
+# 开发机上的测试素材（deploy/compose.local.yml 挂它）
+local/

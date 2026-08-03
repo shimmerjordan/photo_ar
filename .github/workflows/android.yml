@@ -1,0 +1,100 @@
+# 出安卓包。跟 publish-image.yml 同一个规矩：**打 tag 或手动点一下**才跑 ——
+# 发版是个决定，不是提交的副作用。日常的把关靠本地那一行
+#   cd android && ./gradlew :arview:testDebugUnitTest
+# （20 个纯 JVM 用例，不碰网络也不碰那 75 MiB 运行时，几秒钟出结果）。
+# PR 上会自动跑一遍，免得靠记性。
+#
+# 这里和本地构建**唯一**的差别是 `-Pphotoar.deviceAbiOnly`：
+#
+#   模拟器要用的 x86 / x86_64 两套原生库，真机一个也用不到，而它们不便宜 ——
+#   每个 ABI 里 libonnxruntime.so 单独就 19.4 MiB，两套加起来实测 39.3 MiB
+#   （155,713,877 → 114,533,262 字节）。CI 出的包是给真机装的，砍掉。
+#   本地默认全带：跑 emulator 验兜底路径是日常调试手段，不能为了发版把它废掉。
+#
+# ⚠️ CI 出的包和你本地出的包**签名不同**。release 沿用 debug key（见
+# app/build.gradle.kts），而 runner 上没有 ~/.android/debug.keystore，AGP 每次
+# 会现生成一个新的。所以真机上从本地包换成 CI 包（或反过来）必须先卸载，
+# 直接覆盖装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。要长期两边混用，就得把
+# 一个固定的 keystore 放进 secrets 再配 signingConfig —— 目前没这个需要。
+name: android
+
+on:
+  push:
+    tags: ["v*"]
+  # PR 只跑测试，不出包（下面的 if 管着）。加 paths 是因为改服务端的 PR
+  # 不该顺手拉起一次安卓构建；tag 那条**故意不加** paths —— tag 指向的那次
+  # 提交要是只改了 docs/，带 paths 的过滤会把整个发版跳掉。
+  pull_request:
+    paths:
+      - "android/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+jobs:
+  # 测试和出包放在同一个 job 里：拆开的话两边都要各付一次 checkout + JDK +
+  # 缓存恢复，而这里没有 publish-image 那种「第二步需要完全不同的工具链」的理由。
+  # 顺序即依赖 —— 测试不过，后面的步骤不会跑。
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 顺带管掉 gradle 的下载缓存和 configuration cache
+      - uses: gradle/actions/setup-gradle@v4
+
+      # 内置的 ARCore 运行时是从 GitHub Releases 下的 75 MiB APK，缓存住免得
+      # 每次发版都重下。key 挂在 arview/build.gradle.kts 上：版本号和 sha256
+      # 都写在那个文件里，换版本自然换 key，缓存不会串味。
+      #
+      # 缓存丢了也只是慢一点：那个任务的命中判据是**内容哈希**而不是「文件在不在」，
+      # 半个包、旧版本、手塞进来的都会被重下（见 ArcoreDownloadTask）。
+      - uses: actions/cache@v4
+        with:
+          path: android/.arcore
+          key: arcore-runtime-${{ hashFiles('android/arview/build.gradle.kts') }}
+
+      # 纯 JVM 单测：AR 安装决策的状态机、几何、清单解析。--dry-run 确认过它
+      # 不会拉起 arcore 下载任务，所以这一步就算缓存全空也是几十秒。
+      - name: 单元测试
+        run: ./gradlew :arview:testDebugUnitTest
+
+      - name: 出真机 APK（不带模拟器 ABI）
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: ./gradlew :app:assembleRelease -Pphotoar.deviceAbiOnly=true
+
+      # 守两个「构建成功但包是坏的」的失败模式，两个都真实存在过：
+      #
+      # 1. assets 里没有 ARCore。noCompress / addGeneratedSourceDirectory 任何一
+      #    环脱钩，包里就没有那份运行时 —— 而构建不会报错，要装到手机上、走到
+      #    「首次使用要装一个 AR 组件」那一步才发现。
+      # 2. ABI 过滤没生效。上面那个 -P 拼错、或者哪天 defaultConfig 被改动，
+      #    结果就是悄悄胖回 39 MiB，没人会盯着体积看。
+      - name: 校验包内容
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: |
+          apk=app/build/outputs/apk/release/app-release.apk
+          ls -l "$apk"
+          unzip -l "$apk" | grep -q 'assets/arcore.apk' \
+            || { echo "::error::包里没有内置的 ARCore 运行时"; exit 1; }
+          if unzip -l "$apk" | grep -qE 'lib/x86'; then
+            echo "::error::模拟器 ABI 没被过滤掉，-Pphotoar.deviceAbiOnly 没生效"
+            unzip -l "$apk" | grep -E 'lib/x86'
+            exit 1
+          fi
+          echo "内置运行时在包里，模拟器 ABI 已剔除"
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        with:
+          name: photo-ar-${{ github.ref_name }}
+          path: android/app/build/outputs/apk/release/app-release.apk
+          # 装一次就够了，不必长期占额度
+          retention-days: 30

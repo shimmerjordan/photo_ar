@@ -1,12 +1,16 @@
-# photo-ar-server。照着 docs/deploy.md 走一遍即可，这份文件只需要改三处：
+# photo-ar-server —— 一键部署。
 #
-#   1. `.env` 里的 PHOTOAR_TOKEN（`cp .env.example .env` 后填）
-#   2. 下面 volumes 里照片/视频所在的共享文件夹
-#   3. deploy/config.json 里的 roots 要和这里挂进去的【容器内】路径一致
+#   cp .env.example .env && ${EDITOR} .env      # 只有 PHOTOAR_ROOTS 必须看一眼
+#   docker compose up -d
+#   docker compose logs -f photo-ar-server      # 抄走里面那行随机管理员口令
 #
-# 两种起法，二选一：
-#   拉现成镜像（推荐）：docker compose pull && docker compose up -d
-#   本地构建：        docker compose build && docker compose up -d
+# 这份文件里已经带上了"启动前必须定下来的"每一样东西，所以**不需要 config.json**。
+# 想用配置文件（更细的参数：media 策略、self_score_samples、ffprobe 路径……）就把
+# deploy/config.json 准备好，下面 `./deploy:/config:ro` 那条挂载已经留着了 ——
+# entrypoint 检测到 /config/config.json 存在就用它，环境变量仍然对 token 和口令生效。
+#
+# 起来之后要改的东西（阈值、闸门、贴图方式、识别后端）都在管理台 `/admin` 里，
+# 不用改这份文件（那些是热配置，见 src/photoar/server/appconfig.py）。
 services:
   photo-ar-server:
     # 默认拉 GHCR 上由 CI 构建的镜像。想用别的 tag 就在 .env 里设 PHOTOAR_IMAGE，
@@ -17,8 +21,10 @@ services:
     build: .
     container_name: photo-ar-server
     restart: unless-stopped
-    # 识别是 CPU 密集的（ORB + RANSAC）。N5095 只有 4 核，留一核给
-    # cloudflared / CloudDrive2 / QTS 自己，不然扫描时整台 NAS 都发木。
+    # 识别是 CPU 密集的（ORB + RANSAC，XFeat 还多一次 ONNX 推理）。N5095 只有 4 核，
+    # 留一核给 cloudflared / CloudDrive2 / QTS 自己，不然扫描时整台 NAS 都发木。
+    # xfeat.py 的 `_default_threads()` 会读 cgroup 的 cpu.max 拿到这个 3，
+    # 按它设 ORT 的线程数 —— 所以改这个值会真的改变推理的并行度。
     cpus: "3.0"
     mem_limit: 3g
     # 核显透进容器，转码走 h264_vaapi 而不是软编。没挂或节点不存在都不会报错，
@@ -31,16 +37,72 @@ services:
     #   - "44"
     ports:
       # 只监听 LAN/Tailscale。外网走已有的 cloudflared，不在这里暴露。
-      - "8964:8964"
+      - "${PHOTOAR_PORT:-8964}:8964"
     environment:
-      # 没设就直接报错退出，而不是拿空 token 起一个谁都能访问的服务
-      PHOTOAR_TOKEN: ${PHOTOAR_TOKEN:?先 cp .env.example .env 并填 PHOTOAR_TOKEN}
+      # ---- 必填 ----
+      #
+      # 白名单根目录，**容器内**的路径。服务只允许访问这些目录以下的文件。
+      # 两种写法：`名字=路径,名字=路径`（名字会显示在 App 的目录浏览器里），
+      # 或者纯路径逗号列表（自动拿目录名当名字）。
+      # 必须与下面 volumes 里的挂载点一致 —— 冒号两边写成一样就不用换算。
+      PHOTOAR_ROOTS: ${PHOTOAR_ROOTS:-照片=/share/Photo,视频=/share/Video,网盘=/share/CloudDrive}
+
+      # ---- 目录 ----
+      #
+      # 索引、SQLite、.imgdb、缩略图、转码产物。必须是持久卷。
+      PHOTOAR_DATA: /data
+      # 模型与词表（xfeat.onnx / vocab.npz / vocab_xfeat.npz）。默认在 /data/models
+      # 下面，单独一个变量是为了它能挂成几个部署共享的卷。
+      PHOTOAR_MODELS: /data/models
+      # /v1/upload 的落地目录。必须在 PHOTOAR_ROOTS 之内，且那条挂载要可写。
+      # 不设则上传整体关闭（503）—— 正常用法是关联 NAS 上已有的文件。
+      PHOTOAR_UPLOAD_DIR: ${PHOTOAR_UPLOAD_DIR:-/share/Photo/_arphoto_inbox}
+
+      # ---- 识别 ----
+      #
+      # orb 或 xfeat。⚠️ 只作为**初始值**写进库，之后以管理台里的设置为准 ——
+      # 否则在管理台改完、重启一次容器就被这里改回去了（见 Server._seed_backend）。
+      PHOTOAR_BACKEND: ${PHOTOAR_BACKEND:-orb}
+      # XFeat 的 onnx 从哪儿下。⚠️ 默认那个 GitHub release **还没发布**，所以默认会
+      # 404 —— 那不影响启动（自动回退 orb，`/v1/ping` 的 backendDegraded 会说明）。
+      # 要用 xfeat：自己 `python tools/export_models.py --out ./data/models` 导出一份
+      # 放进卷里，或者把它发到那个 release 上，或者在这里填一个可信的地址。
+      PHOTOAR_MODEL_URL: ${PHOTOAR_MODEL_URL:-}
+      # 设 0 = 启动时完全不尝试下载模型（离线部署，或模型是手工放进卷里的）。
+      PHOTOAR_FETCH_MODELS: ${PHOTOAR_FETCH_MODELS:-1}
+
+      # ---- 身份 ----
+      #
+      # 运维凭证，给**机器**用（tools/batch_ingest.py）。**可以留空**：人走 /admin
+      # 各自一个账号登录，鉴权不依赖它（留空时那条 legacy 分支整体禁用，不是"谁都
+      # 通过"）。留空的唯一代价是批量入库脚本用不了。生成：openssl rand -hex 24
+      PHOTOAR_TOKEN: ${PHOTOAR_TOKEN:-}
+      # 引导管理员。库里一个 admin 都没有时（= 第一次启动）按这两个值建一个。
+      # 口令留空 = 生成随机口令并在启动日志里**打印一次**，登进去立刻改掉。
+      PHOTOAR_ADMIN_NAME: ${PHOTOAR_ADMIN_NAME:-admin}
+      PHOTOAR_ADMIN_PASSWORD: ${PHOTOAR_ADMIN_PASSWORD:-}
+      # 上面那条 ports 是 LAN 直连（http），所以默认 0。全程 https 才设 1，
+      # 理由见 .env.example。
+      PHOTOAR_COOKIE_SECURE: ${PHOTOAR_COOKIE_SECURE:-0}
+
+      # ---- 转码 ----
+      #
+      # auto = 探测到核显就 h264_vaapi，否则**静默**回退 libx264。确认硬编真生效之后
+      # 改成 h264_vaapi，那样核显哪天不可用会直接报错而不是悄悄软编（软编在 N5095 上
+      # 慢一个量级，会撞上隧道的 125 秒超时）。见 docs/deploy.md 第 4 步。
+      PHOTOAR_VIDEO_ENCODER: ${PHOTOAR_VIDEO_ENCODER:-auto}
+
+      # 监听地址。0.0.0.0 = 容器内全部接口（对外仍然只有上面 ports 那一条）。
+      PHOTOAR_BIND: 0.0.0.0
       # 词汇树用 UTF-8 路径，容器里 locale 默认是 POSIX，显式设一下省事
       LANG: C.UTF-8
     volumes:
-      # 索引、SQLite、转码产物、缩略图，以及你训好的 vocab.npz。必须是持久卷 ——
+      # 索引、SQLite、转码产物、缩略图、模型与词表。必须是持久卷 ——
       # 丢了要全库重新入库（每张约 5s，一万张十几小时）。
       - ./data:/data
+      # 可选：放了 deploy/config.json 就会用它代替环境变量（见文件头的说明）。
+      # 目录不存在时 compose 会自动建一个空目录，里面没有 config.json，
+      # entrypoint 于是走环境变量 —— 所以这条挂载留着是无害的。
       - ./deploy:/config:ro
       # arcoreimg：ARCore SDK 里的闭源二进制，不可再分发，所以镜像里没有它，
       # 由宿主机送进去（记得 chmod +x）。本地构建的镜像里已经有一份，这条挂载
@@ -55,15 +117,9 @@ services:
       # /v1/upload 的落地目录，是整份配置里唯一可写的用户目录
       - /share/Photo/_arphoto_inbox:/share/Photo/_arphoto_inbox
     healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - |
-          import os,urllib.request as u
-          t=os.environ.get('PHOTOAR_TOKEN','')
-          r=u.Request('http://127.0.0.1:8964/v1/ping',headers={'Authorization':'Bearer '+t})
-          u.urlopen(r,timeout=4).read()
+      # 与 Dockerfile 里的 HEALTHCHECK 同一个脚本，不再抄一份 `python -c`
+      # （抄两份迟早分叉）。没配 token 时它把 401 也算健康 —— 理由写在那个文件里。
+      test: ["CMD", "python", "/opt/photoar/docker/healthcheck.py"]
       interval: 30s
       timeout: 5s
       retries: 3

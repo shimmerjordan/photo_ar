@@ -1,6 +1,8 @@
 {
   "_comment": "复制成 deploy/config.json 后按注释改。token 建议不写在这里，用环境变量 PHOTOAR_TOKEN 注入。",
 
+  "_optional": "⚠️ 这个文件整体是【可选】的。docker-compose.yml 里已经把启动前必须定下来的东西全部作为环境变量给出了，不放这个文件也能一键起（entrypoint 检测不到 /config/config.json 就走环境变量）。放它的理由只有一个：下面那些环境变量里没有的细参数（media 策略、self_score_samples、ffprobe 路径）。放了它之后，除 token / 引导管理员口令 / cookie_secure / 端口之外的环境变量就不再生效了 —— 两套配置里以这个文件为准。",
+
   "bind": "0.0.0.0",
   "port": 8964,
 
@@ -14,8 +16,11 @@
   "_data_dir": "索引、SQLite、.imgdb、缩略图、转码产物。必须是持久卷。",
   "data_dir": "/data",
 
-  "_vocab_path": "词汇树。由 `photoar build --photos <目录>` 预先训练好后拷进 /data。服务端不训练：换 vocab 等于全库重建索引。",
-  "vocab_path": "/data/vocab.npz",
+  "_models_dir": "模型与词表（xfeat.onnx / vocab.npz / vocab_xfeat.npz）。省略则用 <data_dir>/models。单独一个键是为了它能挂成几个部署共享的卷。",
+  "models_dir": "/data/models",
+
+  "_vocab_path": "⚠️【可选，而且一般应该省略】。省略时按后端取 <models_dir>/vocab.npz（orb）或 vocab_xfeat.npz（xfeat）；那个文件不存在时服务用空词表启动（识别结果正确，但每次全量扫描），入库之后用 `photoar-server build-vocab` 训一份就落到那个默认路径上。显式写这个键只有一种用途：指向一份历史遗留的 ORB 词表 —— 它【只对 orb 后端生效】，因为已有部署里它指向的一定是二进制词表，交给 XFeat 去 load 会读出一棵毫无意义的树（或 KeyError）。",
+  "vocab_path": null,
 
   "_arcoreimg": "ARCore SDK 里的二进制，镜像里在 /opt/photoar/tools/arcoreimg（已在 PATH 里）。",
   "arcoreimg": "arcoreimg",
