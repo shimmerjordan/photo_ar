@@ -23,7 +23,13 @@ def corpus(tmp_path, textured_image):
         for f in feats:
             w.append(f)
 
-    voc = V.train(np.vstack([f.desc for f in feats]), branching=6, depth=3, seed=0)
+    # 词表参数必须是**生产默认值**（16/4 → 这 40 张能训出 6433 个词），不能为了跑快
+    # 缩小成 6/3。缩小版只有 216 个词，而查询侧提 4000 个描述子（见
+    # `backend.QUERY_N_FEATURES`）：4000 个描述子摊到 216 个词上，每个词平均命中十几
+    # 次，词频直方图饱和、tf-idf 的区分度整体崩塌。表现出来是这条粗排召回测试变红，
+    # 而生产词表下同一份代码召回是满分 —— 也就是说缩小版词表测出来的是它自己的
+    # 假象。实测这一步只花几秒，省不出什么。
+    voc = V.train(np.vstack([f.desc for f in feats]), seed=0)
     builder = InvertedIndexBuilder(voc.n_words)
     for f in feats:
         builder.add(voc.words_of(f.desc))

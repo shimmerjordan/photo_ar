@@ -9,9 +9,8 @@
 import numpy as np
 
 from .descstore import DescStore
-from .features import extract
 from .index import InvertedIndex
-from .verify import Decision, PairResult, decide, verify_pair
+from .verify import Decision, PairResult, decide
 from .vocab import Vocab
 
 TOP_K = 20
@@ -25,7 +24,12 @@ class TwoStageRecognizer:
         store: DescStore,
         photo_ids: list[str],
         top_k: int = TOP_K,
+        recog_backend=None,
     ) -> None:
+        """`recog_backend` 决定提特征与配对（见 photoar.backend），默认 ORB ——
+        与本文件此前的行为逐字节相同。阈值扫描要用另一套特征重跑时传它进来，
+        而不是另抄一份两阶段流程：抄一份就意味着"扫描用的管线"会和产品管线各自
+        漂移，而扫出来的阈值本来就是要直接写回产品的。"""
         if not (len(photo_ids) == len(store) == index.n_docs):
             raise ValueError(
                 f"三者数量必须一致：photo_ids={len(photo_ids)}、"
@@ -36,9 +40,14 @@ class TwoStageRecognizer:
         self._store = store
         self._ids = list(photo_ids)
         self._top_k = int(top_k)
+        if recog_backend is None:
+            from .backend import orb_backend
+
+            recog_backend = orb_backend()
+        self._backend = recog_backend
 
     def _coarse(self, img_bgr: np.ndarray) -> list[int]:
-        words = self._vocab.words_of(extract(img_bgr).desc)
+        words = self._vocab.words_of(self._backend.extract_query(img_bgr).desc)
         return [doc for doc, _ in self._index.query(words, self._top_k)]
 
     def candidates(self, img_bgr: np.ndarray) -> list[str]:
@@ -62,11 +71,12 @@ class TwoStageRecognizer:
         # 调一次 extract(img_bgr)，就会在识别热路径上把最贵的一步
         # （ORB 特征提取，见 features.extract）跑两遍。DRY clean-up 的
         # 直觉在这里是错的，动之前先看这条注释。
-        query = extract(img_bgr)
+        query = self._backend.extract_query(img_bgr)
         words = self._vocab.words_of(query.desc)
         docs = [doc for doc, _ in self._index.query(words, self._top_k)]
         return [
-            verify_pair(query, self._store.read(doc), self._ids[doc]) for doc in docs
+            self._backend.verify(query, self._store.read(doc), self._ids[doc])
+            for doc in docs
         ]
 
     def recognize(self, img_bgr: np.ndarray) -> Decision:

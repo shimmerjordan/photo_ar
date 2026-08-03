@@ -57,6 +57,45 @@ MIN_INLIERS = 40
 # 保持 25 不变还有一层好处：语料判定不变，不需要重跑 dedup + build。
 DEDUP_MIN_INLIERS = 25
 
+# ---- XFeat 后端的内点数下限 ----
+#
+# **不能沿用上面那个 40。** 两个后端的内点数分布是两个完全不同的量：ORB 提 300 个二值
+# 描述子、用 Hamming + crossCheck 匹配；XFeat 提 512 个 64 维浮点描述子、用余弦互近邻
+# 匹配（还先过了一道 0.82 的余弦闸门）。关键点更多、匹配更准，真阳性的内点数系统性
+# 更高，把 ORB 的阈值搬过来会让判定实际上变松。
+#
+# 60 的依据（`bench/xfeat_inlier_dist.py`，Oxford5k 抽 250 张 × 6 个扰动查询 = 1500 次，
+# 每次与 25 张别人的图对比取最强者，与当年定 40 时同一份语料、同一个口径）：
+#
+#                真阳性 p1   真阳性 p5   误识别 p95   误识别 p99   误识别最大
+#   ORB   (300点)      9         53           8          11         213
+#   XFeat (512点)     71         97          13          66         163
+#
+# 取 60 的两条理由都是直接读出来的：
+#   1. **真阳性 p1 = 71 > 60** —— 门槛卡在 60，真阳性损失不到 1%。对比 ORB 的 40：它的
+#      p1 只有 9、p5 是 53，也就是 40 这个门槛会吃掉 1%~5% 的真阳性。XFeat 在漏检这一侧
+#      反而更安全，这正是换特征最实在的收益。
+#   2. **误识别 p95 = 13**，远在 60 之下。
+#
+# ⚠️ p99=66 与最大值 163 超过了 60，但这是**语料属性而不是缺陷**：Oxford5k 里有大量
+# 「同一建筑的不同照片」，它们在几何上本来就对得上。当年定 40 时遇到的是同一件事
+# （原始记录：库外总误识 3.963%，"剩下的是 Oxford5k 的语料属性，不该拿来定阈值"）。
+# 真实误识别率要用 `bench/threshold_scan.py` 走完整两阶段管线在留出集上量。
+#
+# ⚠️ **这仍是一个待复核的值。** 上面量的只有精排那一步（不含词表与倒排粗排），样本
+# 1500 次而当年 ORB 那轮是 29740 次。语料换了、`xfeat.TOP_K` 或 `match.MIN_COSSIM`
+# 动了，都必须重新量。
+XFEAT_MIN_INLIERS = 60
+
+# 去重侧同样比识别侧低，理由与 DEDUP_MIN_INLIERS 完全一样（见上面那段）：去重量的是
+# 「两张原图之间」，系统性低于「扰动查询图 vs 原图」；漏放一对近重复的代价是两张照片
+# 都永久漏检，而用户无从追查。
+#
+# 38 是**按 ORB 那一对的比例推的**（25/40 = 0.625，0.625 × 60 = 37.5），**没有独立量过**。
+# 直接量它需要「两张真实近重复原图」的内点数分布，而这份语料里没有标注过的近重复对。
+# 保守方向是往低调（宁可多剔几张照片，也不要让两张永久漏检），所以真要动，往下动。
+XFEAT_DEDUP_MIN_INLIERS = 38
+
 DET_MIN = 0.05
 DET_MAX = 20.0
 
@@ -110,7 +149,36 @@ def _passes(
     return inliers >= min_inliers and det_min <= det <= det_max
 
 
+def ransac_pair(
+    src: np.ndarray,
+    dst: np.ndarray,
+    photo_id: str,
+    *,
+    min_inliers: int,
+) -> PairResult:
+    """已配好的点对 → 单应矩阵 → 内点数与行列式。
+
+    从 `verify_pair` 里抽出来共用：两个识别后端（ORB 的 Hamming crossCheck、XFeat 的
+    余弦互近邻）产出点对的方式不同，但**点对之后的每一步必须完全一样** —— RANSAC 的
+    重投影阈值、迭代上限、行列式区间、以及 `_passes` 的判定顺序。抄两份的话，改一边
+    忘一边不会报错，只会让两个后端的判定口径悄悄分叉，而阈值标定是分别做的，没人会
+    发现口径本身变了。
+    """
+    if len(src) < MIN_MATCHES_FOR_HOMOGRAPHY:
+        return _fail(photo_id)
+    H, mask = cv2.findHomography(
+        src, dst, cv2.RANSAC, RANSAC_REPROJ, maxIters=RANSAC_MAX_ITERS
+    )
+    if H is None or mask is None:
+        return _fail(photo_id)
+    inliers = int(mask.sum())
+    det = float(np.linalg.det(H))
+    ok = _passes(inliers, det, min_inliers, DET_MIN, DET_MAX)
+    return PairResult(photo_id=photo_id, inliers=inliers, det=det, ok=ok)
+
+
 def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
+    """ORB 后端：Hamming + crossCheck 配对，再走 `ransac_pair`。"""
     if len(query) < MIN_MATCHES_FOR_HOMOGRAPHY or len(ref) < MIN_MATCHES_FOR_HOMOGRAPHY:
         return _fail(photo_id)
 
@@ -121,14 +189,29 @@ def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:
 
     src = query.pts[[m.queryIdx for m in matches]]
     dst = ref.pts[[m.trainIdx for m in matches]]
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_REPROJ, maxIters=RANSAC_MAX_ITERS)
-    if H is None or mask is None:
-        return _fail(photo_id)
+    return ransac_pair(src, dst, photo_id, min_inliers=MIN_INLIERS)
 
-    inliers = int(mask.sum())
-    det = float(np.linalg.det(H))
-    ok = _passes(inliers, det, MIN_INLIERS, DET_MIN, DET_MAX)
-    return PairResult(photo_id=photo_id, inliers=inliers, det=det, ok=ok)
+
+def verify_pair_xfeat(
+    query: Features,
+    ref: Features,
+    photo_id: str,
+    *,
+    min_inliers: int = XFEAT_MIN_INLIERS,
+) -> PairResult:
+    """XFeat 后端：余弦互近邻配对，再走同一个 `ransac_pair`。
+
+    描述子必须是已 L2 归一化的 float32（`xfeat.XFeatExtractor` 的输出就是），否则
+    `match.mnn_matches` 里那道余弦闸门会静默失效。
+    """
+    from .match import mnn_matches
+
+    if len(query) < MIN_MATCHES_FOR_HOMOGRAPHY or len(ref) < MIN_MATCHES_FOR_HOMOGRAPHY:
+        return _fail(photo_id)
+    qi, ri = mnn_matches(query.desc, ref.desc)
+    if len(qi) < MIN_MATCHES_FOR_HOMOGRAPHY:
+        return _fail(photo_id)
+    return ransac_pair(query.pts[qi], ref.pts[ri], photo_id, min_inliers=min_inliers)
 
 
 def decide_with(
