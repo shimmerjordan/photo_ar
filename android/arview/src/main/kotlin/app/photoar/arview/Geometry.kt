@@ -3,14 +3,43 @@ package app.photoar.arview
 /**
  * 视频四边形的几何：多大、纹理怎么贴、淡入到第几帧。纯函数，JVM 可测。
  *
- * 「多大」这件事是本项目的物理尺寸红利（§11）：流程是「原图 → 打印」，打印
- * 尺寸入库时就知道，所以能把准确的物理宽度交给 ARCore，而不是让它自己估。
+ * ## 「多大」这件事改过一次，改的理由要留着
+ *
+ * 原来的设计假设是「流程是原图 → 打印，打印尺寸入库时就知道」，于是把入库申报的
+ * `print_width_m` 直接当四边形宽度。**这个假设不成立** —— 实际用起来照片尺寸不定，
+ * 而入库时那个数经常只是个估的。
+ *
+ * 而它错了不只是「尺寸不准」，是**贴不上**：四边形的大小用申报值、位置用 ARCore 给的
+ * `centerPose`，这是两个不同的尺度混在一起。ARCore 的位姿是从 SLAM 来的、量纲真实，
+ * 所以申报宽度偏大 N% 的直接后果就是视频比照片大 N%，边缘对不齐。这个现象和「跟踪
+ * 算得不准」在画面上一模一样，很容易归错因。
+ *
+ * 现在的做法见 [quadSize]：**尺度取 ARCore 自己量的 extentX，形状取参考图的比例**。
+ * 唯一的前提是照片是矩形 —— 这个前提总成立。
  */
 object Geometry {
 
-    /** 打印出来的照片不会比 2cm 窄、也不会比 2m 宽。超出即为数据错误。 */
+    /**
+     * **人填的**打印宽度的可信区间：2cm 到 2m。超出即为录入错误。
+     *
+     * 这一档窄，是因为它防的是打字错误（毫米当厘米填、多打一个 0）。
+     */
     const val MIN_WIDTH_M = 0.02f
     const val MAX_WIDTH_M = 2.0f
+
+    /**
+     * **ARCore 量出来的**宽度的可信区间：1cm 到 5m。
+     *
+     * 比人填的那一档宽，两个方向的理由都不一样：
+     *
+     * - 上限放到 5m，因为照片尺寸不定，婚礼现场挂一张两米以上的大幅喷绘完全正常，
+     *   而这是**测量值**不是录入值，没有打字错误这个失效模式。用 2m 卡它等于把一张
+     *   真实存在的大照片判成数据错误，然后视频不显示、日志里什么都没有。
+     * - 下限降到 1cm，因为 ARCore 估算尺寸的收敛期数值会偏小，卡在 2cm 会让开头
+     *   几帧被丢掉，表现为视频闪一下才出来。
+     */
+    const val MIN_MEASURED_WIDTH_M = 0.01f
+    const val MAX_MEASURED_WIDTH_M = 5.0f
 
     /** 长宽比的可信区间。全景照片能到 3:1，再离谱就是数据错了。 */
     const val MIN_ASPECT = 0.2f
@@ -30,28 +59,53 @@ object Geometry {
         val aspect: Float get() = widthM / heightM
     }
 
-    /**
-     * 视频四边形的物理尺寸。
-     *
-     * @param printWidthM 入库时记下的打印宽度（§6 的 `print_width_m NOT NULL`）
-     * @param refAspect 服务端给的参考图宽高比，可能缺（参考图没有宽高记录时）
-     * @param arcoreAspect ARCore 自己量出来的 `extentX / extentZ`，可能还没准
-     */
-    fun printedSize(
-        printWidthM: Float,
-        refAspect: Float?,
-        arcoreAspect: Float? = null,
-    ): QuadSize {
-        require(printWidthM.isFinite() && printWidthM > 0f) {
-            "printWidthM 必须是正数，收到 $printWidthM"
-        }
-        val w = printWidthM.coerceIn(MIN_WIDTH_M, MAX_WIDTH_M)
-        val aspect = plausible(refAspect) ?: plausible(arcoreAspect) ?: FALLBACK_ASPECT
-        return QuadSize(widthM = w, heightM = w / aspect)
-    }
-
     private fun plausible(a: Float?): Float? =
         a?.takeIf { it.isFinite() && it in MIN_ASPECT..MAX_ASPECT }
+
+    private fun inBand(w: Float, min: Float, max: Float): Float? =
+        w.takeIf { it.isFinite() && it in min..max }
+
+    /**
+     * 视频四边形该做多大。**这是贴合的关键函数。**
+     *
+     * @param extentX ARCore 量的物理宽度（`AugmentedImage.getExtentX`）。库里烘了宽度
+     *   时它原样回显那个值；没烘时它是 ARCore 自己估出来的**真实测量**，会随着用户
+     *   移动手机逐渐收敛。0 = 还没有。
+     * @param extentZ 同上的高度。只用来兜底。
+     * @param printWidthM 入库申报的打印宽度。**0 或非正 = 未知**，这是合法输入。
+     * @param refAspect 服务端给的参考图宽高比（宽/高）。
+     * @return null 表示这一帧没有任何可信尺寸，调用方应跳过绘制。
+     *
+     * ## 尺度：为什么优先 extentX，而不是申报的宽度
+     *
+     * 位姿（`centerPose`）是 ARCore 给的。四边形要和位姿**同一个尺度**，否则投影到屏幕
+     * 上就是大小不匹配。`extentX` 按定义就和 `centerPose` 自洽 —— 它们出自同一次估计。
+     * 申报宽度是另一个来源，一旦和 ARCore 的不一致，误差百分比会一比一变成屏幕上的
+     * 错位。所以申报值只在 ARCore 还没给出 extent 的那几帧里当垫脚石。
+     *
+     * ## 形状：为什么优先 refAspect，而不是 extentZ
+     *
+     * 这里用上「照片一定是矩形」这个前提。矩形 + 已知宽高比 = 形状完全确定，而这个
+     * 比例从参考图的像素尺寸算出来是**精确的**。extentZ 在 ARCore 估算尺寸的收敛期
+     * 可能偏，此时若照抄 extentZ，视频会被拉长或压扁 —— 而形变比「稍大稍小」难看
+     * 得多，因为人眼对人脸的比例极其敏感。
+     *
+     * 拆开取值的净效果：收敛期最坏情况是视频比照片略大或略小一点，**永远不会变形**。
+     */
+    fun quadSize(
+        extentX: Float,
+        extentZ: Float,
+        printWidthM: Float,
+        refAspect: Float?,
+    ): QuadSize? {
+        val w = inBand(extentX, MIN_MEASURED_WIDTH_M, MAX_MEASURED_WIDTH_M)
+            ?: inBand(printWidthM, MIN_WIDTH_M, MAX_WIDTH_M)
+            ?: return null
+        val aspect = plausible(refAspect)
+            ?: plausible(if (extentZ > 0f) extentX / extentZ else null)
+            ?: FALLBACK_ASPECT
+        return QuadSize(widthM = w, heightM = w / aspect)
+    }
 
     /** 纹理坐标的缩放与偏移，(0,0)-(1,1) 之内。 */
     data class UvRect(

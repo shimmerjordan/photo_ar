@@ -19,8 +19,11 @@ import java.io.ByteArrayOutputStream
  * 让 GC 有规律地抖动，而抖动正好落在渲染线程上。
  *
  * **不做缩放。** `YuvImage` 只能裁不能缩，而裁会改变视场角、把照片裁出画面。
- * 尺寸在源头定：ARCore 的 CPU 图像默认就是 640x480，Camera2 兜底路径显式挑
- * 最接近 640 的档位。真拿到超大帧只是包大一点，识别照样能过，所以只记一条日志。
+ * 所以尺寸只能在源头定，而且两条路都必须显式定：ARCore 默认给的 CPU 图像是
+ * 640x480（[app.photoar.arview.ar.ArSessionHolder.applyCameraConfig] 把它挑到
+ * ≥ `Frames.LONG_EDGE`），Camera2 兜底路径则是 `Frames.pickCameraSize`。
+ * 这里不缩放意味着**源头挑错了这里救不回来** —— 识别率的上限就是相机给的像素。
+ * 真拿到超大帧只是包大一点，识别照样能过，所以只记一条日志。
  *
  * 不做旋转：服务端用的是旋转不变的局部特征 + 单应性估计（见 recognizer.py），
  * 帧转不转对命中率没有影响，转一次反而白花 CPU。

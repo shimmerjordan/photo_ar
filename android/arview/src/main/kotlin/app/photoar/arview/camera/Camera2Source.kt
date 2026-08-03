@@ -7,7 +7,6 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -72,7 +71,10 @@ class Camera2Source(
             host.onCameraError("找不到后置摄像头")
             return
         }
-        val size = pickSize(mgr, id)
+        val size = pickSize(mgr, id) ?: run {
+            host.onCameraError("这台设备没有可用的相机输出档位")
+            return
+        }
         previewSize = size
         val r = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
         r.setOnImageAvailableListener({ onImage(it) }, handler)
@@ -175,16 +177,20 @@ class Camera2Source(
         return mgr.cameraIdList.firstOrNull()
     }
 
-    /** 挑最接近「长边 640」的档位：再大只是把上行流量做大，识别不会更准。 */
-    private fun pickSize(mgr: CameraManager, id: String): Size {
+    /**
+     * 挑相机输出档位。挑不到就返回 null 让 [start] 去报错 —— 这里原来有两处
+     * `Size(640, 480)` 的回退，那是静默降级：`Frames.targetSize` 绝不放大，相机
+     * 出 480p 就封死了识别能看到的像素，而服务端仍按 1280/4000 特征算，表现为
+     * 「一直扫不出来」且日志里什么都看不到。规则本身在 [Frames.pickCameraSize]，
+     * 那边是纯函数、有测试覆盖。
+     */
+    private fun pickSize(mgr: CameraManager, id: String): Size? {
         val map = mgr.getCameraCharacteristics(id)
             .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: return Size(640, 480)
-        return bestSize(map) ?: Size(640, 480)
+            ?: return null
+        val candidates = map.getOutputSizes(ImageFormat.YUV_420_888)
+            ?.map { Frames.Size(it.width, it.height) }
+            ?: return null
+        return Frames.pickCameraSize(candidates)?.let { Size(it.width, it.height) }
     }
-
-    private fun bestSize(map: StreamConfigurationMap): Size? =
-        map.getOutputSizes(ImageFormat.YUV_420_888)
-            ?.filter { it.width >= 320 && it.height >= 240 }
-            ?.minByOrNull { kotlin.math.abs(maxOf(it.width, it.height) - Frames.LONG_EDGE) }
 }

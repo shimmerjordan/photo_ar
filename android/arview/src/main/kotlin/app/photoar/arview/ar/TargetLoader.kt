@@ -39,7 +39,12 @@ class TargetLoader(
         data class Thumb(val bitmap: Bitmap) : Target
     }
 
-    class LoadFailed(message: String) : Exception(message)
+    /**
+     * @param cause 原始失败。**必须传**：`ScanRuntime` 靠它认出「其实是 401」——
+     *   token 过期时两条下载都会失败，而只有一句拼好的字符串的话，那种情况会被报成
+     *   「这张照片的目标装不上」，用户于是去查照片和 .imgdb 文件。
+     */
+    class LoadFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
 
     /**
      * @param onFallback imgdb 走不通、改用缩略图时回调一次（界面上要提示，
@@ -66,7 +71,7 @@ class TargetLoader(
         val thumbBytes = readCached(thumbFile) ?: try {
             client.download(hit.refThumbUrl).also { writeCached(thumbFile, it) }
         } catch (e: Exception) {
-            throw LoadFailed("imgdb 与缩略图都取不到（$imgdbError / ${e.message}）")
+            throw LoadFailed("imgdb 与缩略图都取不到（$imgdbError / ${e.message}）", e)
         }
         val bitmap = decode(thumbBytes) ?: run {
             // 缓存里那份可能是上次写坏的，删掉让下次重下

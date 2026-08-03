@@ -20,7 +20,13 @@ enum class NoticeKind {
     /** 连续 3 次识别请求失败（§13），已请求重新探活。 */
     NETWORK_SLOW,
 
-    /** token 不对。这个不是瞬时故障，重试无意义，扫描直接停。 */
+    /**
+     * 凭证不被接受：没登录、登录过期（访客 30 天 / 管理员 12 小时）、或者被停用。
+     *
+     * 这个不是瞬时故障，重试无意义，扫描直接停 —— 并且要把用户**送回登录界面**
+     * （[ScanEffects.requestLogin]）。只提示不导航的话，用户看到一句「凭证不对」而
+     * 手机还举在照片前面，没有任何下一步可做。
+     */
     UNAUTHORIZED,
 
     /** imgdb 与 thumb 兜底都失败，这张照片被短期拉黑。 */
@@ -48,12 +54,44 @@ enum class NoticeKind {
     TRACKING_LOST,
 
     /**
-     * 离线命中：ARCore 从本地多图库认出来的，没走网络（Phase 4 / §11.3）。
+     * 认出来了、框也画上了，但超过 [ScanController.HIT_TO_PLAY_BUDGET_MS] 还没出画。
      *
-     * 要提示，因为这条路的跟踪质量比服务端预建的 `.imgdb` 低一档 —— 本地库是用
-     * 640px 缩略图现建的。用户看到框抖得比平时厉害时，这条提示能解释为什么。
+     * **只提示，不放弃**，两个理由：
+     *
+     * 1. 识别是对的、跟踪是好的，此刻放弃等于扔掉一次正确的命中；
+     * 2. 放弃会回到 SCANNING，而照片还在镜头前 —— 下一帧立刻又命中同一张，
+     *    变成「命中→放弃→命中」的循环，比一直等更糟。
+     *
+     * 所以这条提示的作用是**把无声的等待变成有声的等待**：在它之前，播放器卡在缓冲
+     * 时界面上一个字都不说，用户只能猜是不是自己没对准。
+     *
+     * 与 [VIDEO_NOT_CACHED] / [VIDEO_UNPLAYABLE] / [ASSET_MISSING] 互斥：那三条已经
+     * 说清了视频侧出了什么事，再叠一句「有点慢」会把更具体的信息盖掉。
+     */
+    VIDEO_SLOW,
+
+    /**
+     * 离线命中：ARCore 从装在 session 里的多图库认出来的，没走网络（Phase 4 / §11.3）。
+     *
+     * 要提示，因为跟踪质量取决于**装的是哪一份库**：服务端预建那份（原图建的）和联网
+     * 命中完全一样，端上现建那份（640px 缩略图）低一档。用户看到框抖得比平时厉害时，
+     * 这条提示能解释为什么 —— 所以具体是哪一份由 `detail` 带出来（`ScanRuntime` 填，
+     * 只有它知道此刻装的是谁）。
      */
     LOCAL_HIT,
+
+    /**
+     * 服务端预建的整库目标装不上，已退回端上现建那份（Phase 6）。
+     *
+     * 最可能的原因是服务端的 `arcoreimg` 比这台手机上的 ARCore 新（见
+     * `ar.ArSessionHolder.deserializeDb`）。必须提示而不是只记日志：离线识别还在，
+     * 但降了一档 —— 而这件事在界面上唯一的表现就是「框比以前抖」。不说的话，一个
+     * 运维层面的版本问题会被当成「这个 App 越来越不准了」。
+     *
+     * 与 [IMGDB_FALLBACK] 分开：那条是**某一张照片**的单目标库取不到（每次命中都可能
+     * 发生、下一次就好了），这条是**整台手机**的离线识别降档（要运维去处理）。
+     */
+    TARGETS_DB_FALLBACK,
 
     /**
      * 认出来了，但视频既没缓存、此刻又没网（Phase 4）。
@@ -62,6 +100,14 @@ enum class NoticeKind {
      * 一次），「坏了」不能。归成一句会让人去查 NAS 上那个文件。
      */
     VIDEO_NOT_CACHED,
+
+    /**
+     * 端上提特征没走通，已静默回退到上传整帧（`feat.FeaturePathPolicy`）。
+     *
+     * 要提示，但措辞不能像报错：功能一点没丢，只是走了慢一点的那条路。不提示的话，
+     * 用户打开了那个开关却完全不知道它其实没生效 —— 而这条路的全部意义就是更快。
+     */
+    FEATURES_FALLBACK,
 
     /** 清掉当前提示。 */
     CLEARED,
@@ -120,6 +166,19 @@ interface ScanEffects {
     /** §13：连续失败要触发 endpoint 重新探活（Phase 3 的 EndpointResolver）。 */
     fun requestEndpointRefresh()
 
+    /**
+     * 把用户送回登录界面。
+     *
+     * 与 [NoticeKind.UNAUTHORIZED] 那条提示是**两件事**：提示是「告诉他发生了什么」，
+     * 这个是「带他去能解决的地方」。只有前者的话，扫描界面上会出现一句解释加一个死
+     * 胡同 —— 而这条路径在 token 过期时是必然会走到的（管理员会话只有 12 小时）。
+     *
+     * 实现必须**幂等**：几条并发的请求可能同时拿到 401。状态机自己也做了一次去重
+     * （见 [ScanController.onUnauthorized]），两层都有是因为去重那一层依赖
+     * 「[ScanController.start] 之后才会再报一次」，而实现方可能在别处也调它。
+     */
+    fun requestLogin()
+
     fun emit(event: ScanEvent)
 }
 
@@ -155,20 +214,79 @@ class ScanController(
         /** §13：连续 3 次识别失败 → 提示 + 重新探活。 */
         const val NET_FAIL_LIMIT = 3
 
-        /** §11.6：持续丢失跟踪超过 10 秒视为已转向另一张照片，回到扫描。 */
+        /**
+         * **命中到出画的总预算。**
+         *
+         * 需求给的容忍度是「从对准照片到视频开始播放 10 秒」。离线那条路（服务端预建
+         * 库已装上）不成问题：ARCore 一认出来就是命中，视频又在本地，通常 1 秒内出画。
+         * 有风险的是**服务端兜底那条路**（超 1000 张、或预建库装不上），它由若干段
+         * 串起来 —— 而单段超时无论怎么调都不会自动加起来小于 10 秒，所以这里立一条
+         * 总预算当**兜底闸门**，让各段的数只负责「诊断得准」，不负责「加起来够」。
+         *
+         * 兜底路最坏情况的账（都是本文件与 `net.PhotoArClient` 里的常量）：
+         *
+         * | 段 | 上限 | 说明 |
+         * |---|---|---|
+         * | 抽帧 | 1.5s | [CAPTURE_WATCHDOG_MS]，GL 线程偶发失败 |
+         * | 识别一次 | 2.5s | [RECOGNIZE_WATCHDOG_MS]，HTTP 层是 2s |
+         * | 装单张目标 | 4s | [TARGET_LOAD_TIMEOUT_MS]，imgdb 4.3KB + configure |
+         * | 取视频地址 | 2.5s | `MEDIA_TIMEOUT_MS`，与上一段**并行** |
+         * | ARCore 找到图 | 4s | [TARGET_FIND_TIMEOUT_MS] |
+         * | 播放器就绪 | 剩下的 | 没有单独的超时，全靠这条总预算 |
+         *
+         * 抽帧与识别（4s）在命中**之前**，所以预算 6s 留给命中之后，总计 10s 打平。
+         *
+         * **它只在一个地方是唯一的闸门**：`everTracked && 播放器一直不就绪`。那种情况
+         * `notTrackingSince` 是 null，[tickWaitingForTracking] 第一行就返回了 —— 在这条
+         * 预算之前，那是一个**一个超时都没有的无限等待**：框画在照片上、视频永远不来、
+         * 界面上一个字都不说。其余情况都有更准的单段超时先触发。
+         *
+         * 超预算的动作是**只提示、不放弃**（见 [NoticeKind.VIDEO_SLOW]）。
+         */
+        const val HIT_TO_PLAY_BUDGET_MS = 6_000L
+
+        /**
+         * 目标装好之后，多久没在画面里找到就放弃、回到扫描。
+         *
+         * **与 [LOST_GIVEUP_MS] 分开**（原来共用 10s）。两者的正确答案本来就不同：
+         *
+         * - 这一条是「还没找到」：屏幕上什么都没有，纯死等，而且整段都算在命中到出画
+         *   的 10 秒里 —— 应该短。放弃的代价也很低：回到扫描后 400ms 就再试一次。
+         * - [LOST_GIVEUP_MS] 是「播过之后丢了」：用户很可能只是在挪手机，放弃要连播放
+         *   位置一起丢 —— 应该长。
+         *
+         * 共用一个数的结果是「还没找到」白占 10 秒，直接把总预算吃穿。
+         */
+        const val TARGET_FIND_TIMEOUT_MS = 4_000L
+
+        /** §11.6：**播过之后**持续丢失跟踪超过 10 秒，视为已转向另一张照片，回到扫描。 */
         const val LOST_GIVEUP_MS = 10_000L
 
         /** 抓帧请求多久没回就当它丢了。抓帧在 GL 线程上，偶发失败是正常的。 */
         const val CAPTURE_WATCHDOG_MS = 1_500L
 
         /**
-         * 识别请求多久没回就当它超时。§13 说的是 2s，这里留到 4s：真正的
-         * 超时由 HTTP 层报（那条更准），这个只是兜住「回调根本没来」。
+         * 识别请求多久没回就当它超时。
+         *
+         * §13 说的门限是 2s，真正的超时由 HTTP 层报（那条更准，还带得上错误类型），
+         * 这个只兜住「回调根本没来」。所以它只需要比 HTTP 那 2s 多一点余量 ——
+         * **原来是 4s，收到 2.5s**：多出来的 1.5 秒不换任何东西，只是在超时那一路上
+         * 让下一次尝试晚 1.5 秒开始。
          */
-        const val RECOGNIZE_WATCHDOG_MS = 4_000L
+        const val RECOGNIZE_WATCHDOG_MS = 2_500L
 
-        /** 装载目标（下 imgdb + configure）的上限。 */
-        const val TARGET_LOAD_TIMEOUT_MS = 8_000L
+        /**
+         * 装载目标（下 imgdb + `session.configure()`）的上限。**原来是 8s，收到 4s。**
+         *
+         * 够做什么：一次 imgdb 下载（`DOWNLOAD_TIMEOUT_MS` 3s）+ GL 线程上 deserialize
+         * 与 configure（毫秒级）。
+         *
+         * 不够做什么：**imgdb 与缩略图两次都从零下载**（3s + 3s）。这是刻意的取舍 ——
+         * 那条双失败的路要花 6 秒以上，而它换来的只是一次「跟踪质量低一档」的降级命中。
+         * 与其占掉大半个预算，不如放弃、回扫描，400ms 后再试一次（`TargetLoader` 会把
+         * 已下到的那份写进磁盘缓存，重试通常就不再走网络了）。
+         */
+        const val TARGET_LOAD_TIMEOUT_MS = 4_000L
 
         /** 装载失败的照片拉黑多久。不拉黑会「命中→失败→立刻又命中」死循环。 */
         const val BLOCKLIST_MS = 30_000L
@@ -192,12 +310,32 @@ class ScanController(
     private var aimNoticeShown = false
     private var netFailures = 0
 
+    /** 这一轮扫描已经请求过重新登录。见 [onUnauthorized]。 */
+    private var loginRequested = false
+
     private var loadingSince = 0L
     private var everTracked = false
     private var tracking = false
     private var notTrackingSince: Long? = null
     private var playerReady = false
     private var media: MediaInfo? = null
+
+    /** 本次命中的起点，[HIT_TO_PLAY_BUDGET_MS] 从这里算。 */
+    private var hitAt = 0L
+
+    /** 本次命中有没有真的出过画。出过之后总预算就不再有意义（承诺已经兑现）。 */
+    private var everPlayed = false
+
+    /**
+     * 已经就视频侧报过一句更具体的提示（没缓存 / 文件不在 / 播不了）。
+     *
+     * 用来压掉 [NoticeKind.VIDEO_SLOW]：那三条都已经解释了为什么没出画，再补一句
+     * 「有点慢」只会盖掉更有用的信息。
+     */
+    private var videoProblemReported = false
+
+    /** [NoticeKind.VIDEO_SLOW] 每次命中只报一次。 */
+    private var slowNoticeShown = false
 
     private val blocked = HashMap<String, Long>()
 
@@ -206,6 +344,10 @@ class ScanController(
     fun start() {
         if (state != ScanState.IDLE) return
         netFailures = 0
+        // 重新开扫 = 用户已经处理过上一次的凭证问题（重新登录了，或者干脆没登录就
+        // 又点了开始）。所以这个闸门在这里放开，而不是在 stop() 里 —— stop() 也会被
+        // onUnauthorized 自己调，在那里清掉就等于每条 401 都报一次。
+        loginRequested = false
         setState(ScanState.SCANNING)
     }
 
@@ -231,9 +373,31 @@ class ScanController(
                 if (now - loadingSince > TARGET_LOAD_TIMEOUT_MS) {
                     current?.let { onTargetFailed(it.photoId, "装载超时") }
                 }
-            ScanState.TRACKING, ScanState.PAUSED -> tickWaitingForTracking(now)
+            ScanState.TRACKING -> {
+                // 顺序要紧：先查预算再查跟踪。反过来的话，「找不到图」那一路会先被
+                // resetTarget 清掉 current，预算这边就再也拿不到 photoId 了。
+                tickPlayBudget(now)
+                tickWaitingForTracking(now)
+            }
+            ScanState.PAUSED -> tickWaitingForTracking(now)
             ScanState.PLAYING, ScanState.IDLE -> Unit
         }
+    }
+
+    /**
+     * 命中到出画的总预算（[HIT_TO_PLAY_BUDGET_MS]）。
+     *
+     * 只在**框已经画上、视频还没来**这一种情况下是唯一的闸门 —— 其余情况都有更准的
+     * 单段超时先触发（见 [HIT_TO_PLAY_BUDGET_MS] 的注释里那张表）。所以这里不放弃、
+     * 不改状态，只报一句 [NoticeKind.VIDEO_SLOW]。
+     */
+    private fun tickPlayBudget(now: Long) {
+        if (everPlayed || slowNoticeShown) return
+        if (!everTracked) return // 还没找到图：交给 TARGET_FIND_TIMEOUT_MS，那条的提示更准
+        if (videoProblemReported) return // 已经说过更具体的原因了
+        if (now - hitAt <= HIT_TO_PLAY_BUDGET_MS) return
+        slowNoticeShown = true
+        notice(NoticeKind.VIDEO_SLOW)
     }
 
     private fun tickScanning(now: Long) {
@@ -263,9 +427,11 @@ class ScanController(
 
     private fun tickWaitingForTracking(now: Long) {
         val since = notTrackingSince ?: return
-        if (now - since <= LOST_GIVEUP_MS) return
+        // 「还没找到过」与「播过之后丢了」用不同的上限，理由见 TARGET_FIND_TIMEOUT_MS。
+        val limit = if (everTracked) LOST_GIVEUP_MS else TARGET_FIND_TIMEOUT_MS
+        if (now - since <= limit) return
         // §11.6：只有两个恢复抽帧的条件 —— 用户主动退出，或持续丢失跟踪
-        // 超过 10 秒（视为已转向另一张照片）。
+        // 超过上限（视为已转向另一张照片）。
         if (!everTracked) notice(NoticeKind.TARGET_NOT_FOUND)
         resetTarget()
         setState(ScanState.SCANNING)
@@ -303,9 +469,7 @@ class ScanController(
         if (seq != inFlightSeq) return
         inFlightSeq = null
         if (kind == NetErrorKind.UNAUTHORIZED) {
-            // token 错了，每 400ms 重试一次只会刷日志。停下来让人去改设置。
-            notice(NoticeKind.UNAUTHORIZED, detail)
-            stop()
+            onUnauthorized(detail)
             return
         }
         netFailures++
@@ -315,6 +479,57 @@ class ScanController(
             fx.requestEndpointRefresh()
         }
         // 其余情况静默重试：§13 明确「不阻塞相机预览」。
+    }
+
+    /**
+     * 端上提特征回退到传 JPEG（Phase 5）。
+     *
+     * 只报一句提示，**不动状态机的任何状态**：这条路回退之后功能完全一样（只是慢一点），
+     * 把它算进 `netFailures` 会触发一次没必要的重新探活（1.5 秒），而网络根本没问题。
+     * 报几遍由 `feat.FeaturePathPolicy` 决定（每个进程一次），这里不去重。
+     */
+    fun onFeatureFallback(detail: String? = null) {
+        notice(NoticeKind.FEATURES_FALLBACK, detail)
+    }
+
+    /**
+     * 服务端预建的整库目标装不上，已退回端上现建那份（Phase 6）。
+     *
+     * 和 [onFeatureFallback] 一样：**只报一句提示，不动状态机的任何状态**。离线识别
+     * 还在（只是降一档），把它算进 `netFailures` 会触发一次没必要的重新探活，而网络
+     * 根本没问题 —— 这件事发生在装库那一步，一个字节都没走网。
+     *
+     * 报几遍由调用方控制（每次会话起来时装一次库，所以自然就是每次进扫描页一次）。
+     */
+    fun onTargetsDbFallback(detail: String? = null) {
+        notice(NoticeKind.TARGETS_DB_FALLBACK, detail)
+    }
+
+    /**
+     * 任何一条请求拿到 401（或 403）：凭证不被接受。
+     *
+     * **单独一个入口**，不是只在 [onRecognizeFailed] 里判：401 还会从 imgdb 下载和
+     * media 元数据那两条路上来（它们与识别用的是同一个 token）。而那两条现在分别报
+     * [NoticeKind.TARGET_LOAD_FAILED] 与 [NoticeKind.VIDEO_UNPLAYABLE] —— 那两句提示
+     * 会让人去查这张照片和 NAS 上那个视频文件，而真正的原因是登录过期了。
+     * 服务端把管理员会话定成 12 小时，所以这不是边角情况，是每天都会发生一次的事。
+     *
+     * 每次 [start] 之后只报一次：扫描时每 400ms 一个请求，几条并发的请求会同时拿到
+     * 401，逐条报就是一串重复提示加一串导航请求。
+     */
+    fun onUnauthorized(detail: String? = null) {
+        if (loginRequested) {
+            // 已经报过了，但仍然要保证扫描是停着的 —— 万一是在 stop() 之后又有一条
+            // 迟到的请求回来，而此时状态机已经被重新 start 过。
+            if (state != ScanState.IDLE) stop()
+            return
+        }
+        loginRequested = true
+        // 顺序：先提示（说明为什么），再停（别再发请求了），最后导航。
+        // 反过来的话 stop() 里的 setState 会先发一次 CLEARED，把提示擦掉。
+        notice(NoticeKind.UNAUTHORIZED, detail)
+        stop()
+        fx.requestLogin()
     }
 
     /**
@@ -353,6 +568,7 @@ class ScanController(
         if (!info.playable) {
             // §13：提示文件已不在 NAS 上，但**继续跟踪** —— 用户还能看到框，
             // 也才有地方放「重新指定」的入口。
+            videoProblemReported = true
             notice(NoticeKind.ASSET_MISSING, info.nasPath ?: info.reason)
             return
         }
@@ -362,6 +578,7 @@ class ScanController(
 
     fun onMediaFailed(photoId: String, detail: String? = null) {
         if (photoId != current?.photoId) return
+        videoProblemReported = true
         notice(NoticeKind.VIDEO_UNPLAYABLE, detail)
     }
 
@@ -372,6 +589,7 @@ class ScanController(
      */
     fun onMediaNotCached(photoId: String) {
         if (photoId != current?.photoId) return
+        videoProblemReported = true
         notice(NoticeKind.VIDEO_NOT_CACHED)
     }
 
@@ -382,6 +600,7 @@ class ScanController(
 
     fun onPlayerError(detail: String? = null) {
         playerReady = false
+        videoProblemReported = true
         notice(NoticeKind.VIDEO_UNPLAYABLE, detail)
         // §13：显示提示叠加层，保留 AR 跟踪框，不崩。退回 TRACKING 而不是
         // 退出目标 —— 视频坏了不代表这张照片认错了。
@@ -477,6 +696,10 @@ class ScanController(
         tracking = false
         notTrackingSince = null
         loadingSince = clock.nowMs()
+        hitAt = loadingSince
+        everPlayed = false
+        videoProblemReported = false
+        slowNoticeShown = false
         // §11.6：命中后立即停止抽帧与识别请求。靠 state 不再是 SCANNING 实现。
         pendingCaptureSeq = null
         inFlightSeq = null
@@ -509,12 +732,17 @@ class ScanController(
         tracking = false
         everTracked = false
         notTrackingSince = null
+        // hitAt / everPlayed / videoProblemReported / slowNoticeShown 不在这里清：
+        // 它们都是「本次命中」的属性，由 acceptHit 统一置位。这里清了没坏处，但
+        // 会让「哪里负责初始化」变成两个地方 —— 而漏一个字段就是一次静默的错判。
     }
 
     private fun setState(next: ScanState) {
         if (next == state) return
         val prev = state
         state = next
+        // 出过画就说明承诺已经兑现，总预算不再有意义（此后是 TRACKING_LOST 那套）。
+        if (next == ScanState.PLAYING) everPlayed = true
         if (next == ScanState.SCANNING) {
             scanningSince = clock.nowMs()
             aimNoticeShown = false

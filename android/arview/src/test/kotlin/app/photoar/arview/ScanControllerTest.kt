@@ -229,19 +229,19 @@ class ScanControllerTest {
     }
 
     @Test
-    fun `丢失跟踪不到 10 秒不放弃`() {
+    fun `丢失跟踪不到上限不放弃`() {
         playing()
         c.onTracking(hit().photoId, false)
-        clock.advance(10_000)
+        clock.advance(ScanController.LOST_GIVEUP_MS)
         c.tick()
         assertEquals(ScanState.PAUSED, c.state)
     }
 
     @Test
-    fun `丢失跟踪超过 10 秒回到扫描`() {
+    fun `丢失跟踪超过上限回到扫描`() {
         playing()
         c.onTracking(hit().photoId, false)
-        clock.advance(10_001)
+        clock.advance(ScanController.LOST_GIVEUP_MS + 1)
         c.tick()
         assertEquals(ScanState.SCANNING, c.state)
         assertEquals(1, fx.count("releaseTarget"))
@@ -250,13 +250,105 @@ class ScanControllerTest {
     }
 
     @Test
-    fun `目标装好但一直没找到图 10 秒后回到扫描`() {
+    fun `目标装好但一直没找到图会回到扫描`() {
         matchOnce()
         c.onTargetLoaded(hit().photoId)
-        clock.advance(10_001)
+        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
         c.tick()
         assertEquals(ScanState.SCANNING, c.state)
         assertTrue(fx.notices().contains(NoticeKind.TARGET_NOT_FOUND))
+    }
+
+    @Test
+    fun `没找到图的上限比播过之后丢失的短`() {
+        // 两个上限故意不一样：还没找到图时用户在「对准」，等久了不如早点放他重来；
+        // 播过之后是「手挪开了」，放弃等于扔掉进度。这条测试把这层语义钉住 ——
+        // 合成一个常量的话，两边必然有一边是错的。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS)
+        c.tick()
+        assertEquals("到上限那一刻还不放弃", ScanState.TRACKING, c.state)
+
+        val other = controllerWith(null)
+        other.start()
+        other.tick()
+        val seq = fx.lastCaptureSeq!!
+        other.onFrame(seq, ByteArray(1))
+        other.onRecognized(seq, RecognizeOutcome.Matched(hit()))
+        other.onTargetLoaded(hit().photoId)
+        other.onTracking(hit().photoId, true)
+        other.onMedia(hit().photoId, media())
+        other.onPlayerReady()
+        other.onTracking(hit().photoId, false)
+        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
+        other.tick()
+        assertEquals("播过之后用的是更长的那个上限", ScanState.PAUSED, other.state)
+    }
+
+    // ---- 命中到出画的总预算 ----
+
+    @Test
+    fun `框在画面上但播放器一直不就绪会提示慢`() {
+        // 这条是唯一由总预算兜住的洞：everTracked 之后 notTrackingSince 是 null，
+        // tickWaitingForTracking 第一行就返回 —— 在它之前用户会对着一个空框无限等。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        c.onTracking(hit().photoId, true)
+        fx.clear()
+        clock.advance(ScanController.HIT_TO_PLAY_BUDGET_MS + 1)
+        c.tick()
+        assertTrue(NoticeKind.VIDEO_SLOW in fx.notices())
+        assertEquals("提示而不放弃：照片还在镜头前，放弃只会立刻又命中", ScanState.TRACKING, c.state)
+    }
+
+    @Test
+    fun `提示慢只说一次`() {
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        c.onTracking(hit().photoId, true)
+        clock.advance(ScanController.HIT_TO_PLAY_BUDGET_MS + 1)
+        c.tick()
+        fx.clear()
+        clock.advance(ScanController.HIT_TO_PLAY_BUDGET_MS)
+        c.tick()
+        assertFalse(NoticeKind.VIDEO_SLOW in fx.notices())
+    }
+
+    @Test
+    fun `已经报过更具体的视频问题就不再提示慢`() {
+        // 「视频播不了」已经说清了原因，再叠一句「有点慢」会把它盖掉。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        c.onTracking(hit().photoId, true)
+        c.onMediaNotCached(hit().photoId)
+        fx.clear()
+        clock.advance(ScanController.HIT_TO_PLAY_BUDGET_MS + 1)
+        c.tick()
+        assertFalse(NoticeKind.VIDEO_SLOW in fx.notices())
+    }
+
+    @Test
+    fun `播过之后暂停久了不提示慢`() {
+        // PAUSED 是用户把手挪开了，不是加载慢。
+        playing()
+        c.onTracking(hit().photoId, false)
+        fx.clear()
+        clock.advance(ScanController.HIT_TO_PLAY_BUDGET_MS + 1)
+        c.tick()
+        assertFalse(NoticeKind.VIDEO_SLOW in fx.notices())
+    }
+
+    @Test
+    fun `还没找到图时不提示慢`() {
+        // 这一路有 TARGET_NOT_FOUND，那句话更准（说的是「再对准一下」）。
+        matchOnce()
+        c.onTargetLoaded(hit().photoId)
+        fx.clear()
+        clock.advance(ScanController.TARGET_FIND_TIMEOUT_MS + 1)
+        c.tick()
+        assertFalse(NoticeKind.VIDEO_SLOW in fx.notices())
+        assertTrue(NoticeKind.TARGET_NOT_FOUND in fx.notices())
     }
 
     @Test
@@ -676,5 +768,186 @@ class ScanControllerTest {
         val seq = fx.lastCaptureSeq!!
         c.onFrame(seq, ByteArray(1))
         c.onRecognizeFailed(seq, NetErrorKind.TIMEOUT, "超时")
+    }
+
+    // ---- 凭证失效 → 回登录界面（Phase 5）----
+
+    /**
+     * 服务端从「一个预共享 token」换成用户体系之后，401 的最常见原因是**登录过期**
+     * （管理员会话 12 小时、访客 30 天）。所以这条路不再是边角情况，是每天都会走到
+     * 一次的事 —— 而它必须把用户送到能解决的地方，不能只提示一句。
+     */
+    @Test
+    fun `识别拿到 401 时停止扫描并请求重新登录`() {
+        c.start()
+        c.tick()
+        val seq = fx.lastCaptureSeq!!
+        c.onFrame(seq, ByteArray(1))
+        c.onRecognizeFailed(seq, NetErrorKind.UNAUTHORIZED, "会话过期")
+
+        assertEquals(ScanState.IDLE, c.state)
+        assertTrue(fx.notices().contains(NoticeKind.UNAUTHORIZED))
+        assertEquals(1, fx.count("requestLogin"))
+    }
+
+    @Test
+    fun `401 之后不再抽帧`() {
+        c.start()
+        c.tick()
+        val seq = fx.lastCaptureSeq!!
+        c.onFrame(seq, ByteArray(1))
+        c.onRecognizeFailed(seq, NetErrorKind.UNAUTHORIZED)
+        val before = fx.count("captureFrame")
+        repeat(10) {
+            clock.advance(400)
+            c.tick()
+        }
+        assertEquals("停了就是停了，每 400ms 重试一次只会刷日志", before, fx.count("captureFrame"))
+    }
+
+    @Test
+    fun `401 不会触发重新探活`() {
+        // 探活要 1.5 秒，而这次失败与网络毫无关系。
+        c.start()
+        c.tick()
+        val seq = fx.lastCaptureSeq!!
+        c.onFrame(seq, ByteArray(1))
+        c.onRecognizeFailed(seq, NetErrorKind.UNAUTHORIZED)
+        assertEquals(0, fx.count("requestEndpointRefresh"))
+    }
+
+    @Test
+    fun `提示排在 stop 之前所以不会被 CLEARED 擦掉`() {
+        // stop() 里的 setState 会在离开 SCANNING 时发一次 CLEARED（当提示已显示过）。
+        // 反过来的顺序下，UNAUTHORIZED 会先被清掉再显示，或者干脆看不到。
+        c.start()
+        clock.advance(ScanController.AIM_HINT_MS)
+        c.tick() // 先触发一次 AIM_AT_PHOTO，让 aimNoticeShown 成立
+        assertTrue(fx.notices().contains(NoticeKind.AIM_AT_PHOTO))
+        fx.clear()
+
+        c.onUnauthorized("过期了")
+        val notices = fx.notices()
+        assertEquals(
+            "UNAUTHORIZED 必须排在 CLEARED 前面",
+            listOf(NoticeKind.UNAUTHORIZED, NoticeKind.CLEARED),
+            notices,
+        )
+    }
+
+    @Test
+    fun `并发的几条 401 只报一次`() {
+        // 扫描时每 400ms 一个请求，几条在飞的请求会同时拿到 401。逐条报就是一串重复
+        // 提示加一串导航请求。
+        c.start()
+        repeat(5) { c.onUnauthorized("过期了") }
+        assertEquals(1, fx.notices().count { it == NoticeKind.UNAUTHORIZED })
+        assertEquals(1, fx.count("requestLogin"))
+    }
+
+    @Test
+    fun `重新登录后再开扫，下一次 401 会重新报`() {
+        c.start()
+        c.onUnauthorized()
+        fx.clear()
+        c.start() // 用户重新登录了，回来继续扫
+        c.onUnauthorized()
+        assertEquals(1, fx.notices().count { it == NoticeKind.UNAUTHORIZED })
+        assertEquals(1, fx.count("requestLogin"))
+    }
+
+    @Test
+    fun `已经停了之后迟到的 401 不会把状态弄乱`() {
+        c.start()
+        c.onUnauthorized()
+        assertEquals(ScanState.IDLE, c.state)
+        c.onUnauthorized() // 一条迟到的请求回来
+        assertEquals(ScanState.IDLE, c.state)
+    }
+
+    @Test
+    fun `锁住某张照片时拿到 401 也要退出并请求登录`() {
+        // imgdb 与 media 那两条路和识别用同一个 token，所以 401 会在 TRACKING /
+        // PLAYING 期间冒出来。此前它们分别报「目标装不上」「视频播不了」—— 那两句
+        // 提示会让人去查照片和 NAS 上的视频文件。
+        playing()
+        fx.clear()
+        c.onUnauthorized("imgdb 401")
+        assertEquals(ScanState.IDLE, c.state)
+        assertTrue(fx.notices().contains(NoticeKind.UNAUTHORIZED))
+        assertEquals(1, fx.count("requestLogin"))
+        // 退出时该释放的东西照样释放
+        assertTrue(fx.calls.contains("releasePlayer"))
+        assertTrue(fx.calls.contains("releaseTarget"))
+        assertNull(c.current)
+    }
+
+    // ---- 端上提特征回退（Phase 5）----
+
+    @Test
+    fun `端上提特征回退只提示一句，不动状态机`() {
+        // 回退之后功能完全一样（只是慢一点）。把它算进 netFailures 会触发一次没必要
+        // 的重新探活（1.5 秒），而网络根本没问题。
+        c.start()
+        c.tick()
+        val before = c.state
+        c.onFeatureFallback("取不到端上模型，已改回上传整帧识别。")
+
+        assertEquals(before, c.state)
+        assertEquals(0, fx.count("requestEndpointRefresh"))
+        assertEquals(0, fx.count("requestLogin"))
+        val notice = fx.events.filterIsInstance<ScanEvent.Notice>()
+            .last { it.kind == NoticeKind.FEATURES_FALLBACK }
+        assertTrue(notice.detail!!.contains("改回上传整帧"))
+    }
+
+    @Test
+    fun `回退之后扫描继续`() {
+        c.start()
+        c.tick()
+        // 走完一轮（抽帧 → 识别 → 未命中），状态机才回到「可以抽下一帧」
+        val seq = fx.lastCaptureSeq!!
+        c.onFrame(seq, ByteArray(1))
+        c.onRecognized(seq, RecognizeOutcome.NoMatch(null, 5))
+
+        c.onFeatureFallback("推理出错")
+        val before = fx.count("captureFrame")
+        clock.advance(400)
+        c.tick()
+        assertEquals("扫描不能因为回退而停", before + 1, fx.count("captureFrame"))
+    }
+
+    // ---- 预建离线库装不上（Phase 6）----
+
+    @Test
+    fun `预建库装不上只报一句提示，不动状态机`() {
+        // 离线识别还在（退回端上现建那份），只是降了一档。把它算进 netFailures 会触发
+        // 一次没必要的重新探活，而这件事发生在装库那一步 —— 一个字节都没走网。
+        c.start()
+        c.tick()
+        val before = c.state
+        val captures = fx.count("captureFrame")
+
+        c.onTargetsDbFallback("版本不匹配")
+
+        assertEquals(before, c.state)
+        assertEquals(0, fx.count("requestEndpointRefresh"))
+        assertEquals(0, fx.count("requestLogin"))
+        assertEquals("不该影响抽帧节奏", captures, fx.count("captureFrame"))
+        val notice = fx.events.filterIsInstance<ScanEvent.Notice>()
+            .last { it.kind == NoticeKind.TARGETS_DB_FALLBACK }
+        assertEquals("版本不匹配", notice.detail)
+    }
+
+    @Test
+    fun `预建库装不上之后离线命中照样成立`() {
+        // 退回端上现建那份之后，那份库里的照片仍然要能离线认出来 —— 否则这条回退
+        // 路径等于「离线识别没了」，而它的全部意义就是不让那件事发生。
+        val local = controllerWith(hit())
+        local.start()
+        local.onTargetsDbFallback("版本不匹配")
+        local.onTracking(hit().photoId, true)
+        assertEquals(ScanState.TRACKING, local.state)
+        assertTrue(NoticeKind.LOCAL_HIT in fx.notices())
     }
 }

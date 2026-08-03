@@ -4,6 +4,24 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 装我们包里带的那份 ARCore 运行时（见 arview/build.gradle.kts 的说明）。
+         宾客手机大多没有 Play 商店，所以 ArCoreApk 的 market:// 深链走不通。
+         这只是「允许申请」，真正的开关是用户在设置里给的 canRequestPackageInstalls。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 「保存到相册」在 Android 10（API 29）起走 MediaStore + RELATIVE_PATH，
+         **不需要任何权限**。这条只给 API 24-28 的老机器用，所以带 maxSdkVersion。
+         不写 maxSdkVersion 的话，Android 10+ 的用户会在应用信息里看到一个"存储"
+         权限，而 App 实际上从不使用它 —— 这种多余权限既招怀疑，也过不了商店审核。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- API 30 起包可见性默认收紧：不声明的话查不到 ARCore 装没装，
+         checkAvailability() 会一直给不出 SUPPORTED_INSTALLED。 -->
+    <queries>
+        <package android:name="com.google.ar.core" />
+    </queries>
 
     <!-- required="false"：§13 要求不支持 ARCore 的机型退化成「识别后全屏播放」，
          功能不丢。写成 true 会让 Play 商店直接把这些机型过滤掉。 -->
@@ -24,5 +42,30 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density"
             android:screenOrientation="portrait"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- 老式安装那条退路要把 APK 交给系统安装器，只能用 content:// URI
+             （见 ArCoreInstaller.installLegacy）。authority 跟着 applicationId 走，
+             这样 :arview 被塞进任何外壳都不会和别的 FileProvider 撞车。
+             grantUriPermissions 配合 FLAG_GRANT_READ_URI_PERMISSION：只有被我们
+             显式授权的那一个 URI 能被读，一次性。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.arcore.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/arcore_paths" />
+        </provider>
+
+        <!-- PackageInstaller 的状态回执。exported="false" + 发送时限定包名，
+             只有系统能投递到它。 -->
+        <receiver
+            android:name="app.photoar.arview.ar.ArCoreInstallReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="app.photoar.arview.ARCORE_INSTALL_STATUS" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
