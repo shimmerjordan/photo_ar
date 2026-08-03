@@ -247,6 +247,19 @@ abstract class ArcoreUnpackTask : DefaultTask() {
                 if (entry.isDirectory) continue
                 val name = entry.name
                 when {
+                    // 运行时 APK 自己的 `assets/dexopt/baseline.prof` 必须丢掉。
+                    //
+                    // 那是 ARCore 给**它自己那个应用**的 ART 预编译画像，而 AGP 在
+                    // release 变体里会往**同一个路径**生成我们自己的那一份 —— 于是
+                    // `packageRelease` 直接失败：
+                    //   Zip file ... already contains entry 'assets/dexopt/baseline.prof'
+                    // debug 变体不生成，所以这个冲突到出第一个 release 包才炸出来。
+                    //
+                    // 丢掉它没有代价：这份画像描述的是 ARCore 自己 dex 里的热方法，而
+                    // 我们是用 DexClassLoader 在运行期加载那个 dex 的（见
+                    // ArCoreEmbeddedRuntime），assets/dexopt 那条路对它本来就不适用。
+                    name == "assets/dexopt/baseline.prof" ||
+                        name == "assets/dexopt/baseline.profm" -> Unit
                     name.startsWith("assets/") -> {
                         val out = File(assets, name.removePrefix("assets/"))
                         out.parentFile.mkdirs()

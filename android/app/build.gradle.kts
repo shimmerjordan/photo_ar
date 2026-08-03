@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -38,11 +40,75 @@ android {
         }
     }
 
+    // ---- 签名：一台机器上、以及 CI 上，所有变体都用**同一个**密钥 ----
+    //
+    // 解决的是一个具体的坑：Android 拒绝用不同签名的 APK 覆盖已装的那个
+    // （`INSTALL_FAILED_UPDATE_INCOMPATIBLE`），而 release 原来沿用 `debug` key ——
+    // 那把钥匙是 AGP 在 `~/.android/debug.keystore` 里**每台机器各自生成**的。于是：
+    //
+    //   · CI runner 上没有那个文件，AGP 每次现生成一把新的 → 每次 CI 出的包签名都不同
+    //   · 本地包与 CI 包签名不同 → 真机上两边换着装必须先卸载（数据全丢）
+    //
+    // 所以把一把**固定的密钥连同口令一起提交进仓库**（keystore/photoar-release.jks）。
+    // 口令写在源码里不是疏忽：这把钥匙的用途就是「让任何人构建出的包能互相覆盖安装」，
+    // 它保护的东西是零 —— 上应用市场要另配一把（见下面 `upload`），那把才需要保密。
+    //
+    // 优先级：`android/key.properties` 里的上架密钥 > 提交进仓库的固定密钥 > debug。
+    // 最后那一档只在「checkout 里没有那个 jks」时才会走到，而它是不能覆盖安装的那一档，
+    // 所以要留一行警告 —— 静默降级回去的话，症状是「装不上」而原因在几层之外。
+    val uploadProps = rootProject.file("key.properties")
+    val hasUploadKey = uploadProps.isFile
+    val stableKeystore = rootProject.file("keystore/photoar-release.jks")
+    val hasStableKey = stableKeystore.isFile
+    if (!hasUploadKey && !hasStableKey) {
+        logger.warn(
+            "[photoar] ⚠️ 找不到 keystore/photoar-release.jks，退回 debug 密钥 —— " +
+                "这台机器出的包与别处出的包**不能互相覆盖安装**。"
+        )
+    }
+
+    signingConfigs {
+        if (hasUploadKey) {
+            // 顶部的 import 由下面那一行提供 —— `java.util.Properties` 在
+            // build.gradle.kts 里必须显式 import（脚本的默认 import 集不含 java.util）。
+            val props = Properties()
+            uploadProps.inputStream().use { props.load(it) }
+            create("upload") {
+                storeFile = rootProject.file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+            }
+        }
+        if (hasStableKey) {
+            create("stable") {
+                storeFile = stableKeystore
+                storePassword = "photoarsideload"
+                keyAlias = "photoar"
+                keyPassword = "photoarsideload"
+            }
+        }
+    }
+
+    val sharedSigningConfig = when {
+        hasUploadKey -> signingConfigs.getByName("upload")
+        hasStableKey -> signingConfigs.getByName("stable")
+        else -> signingConfigs.getByName("debug")
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // 沿用 debug key：这个包只装自己的机器，不上应用市场。
-            signingConfig = signingConfigs.getByName("debug")
+        }
+        // **每个变体都用同一把钥匙**，debug 也不例外。
+        //
+        // 用 configureEach 而不是逐个点名：将来加一个 buildType 会自动跟上，
+        // 而漏掉一个的后果正是这段注释要防的那件事 —— 而且它不报错，只在真机上
+        // 表现成「装不上，要先卸载」。验证方式：
+        //   cd android && ./gradlew :app:signingReport
+        // 所有变体的 SHA1 必须一样。
+        configureEach {
+            signingConfig = sharedSigningConfig
         }
     }
 

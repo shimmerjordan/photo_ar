@@ -11,11 +11,14 @@
 #   （155,713,877 → 114,533,262 字节）。CI 出的包是给真机装的，砍掉。
 #   本地默认全带：跑 emulator 验兜底路径是日常调试手段，不能为了发版把它废掉。
 #
-# ⚠️ CI 出的包和你本地出的包**签名不同**。release 沿用 debug key（见
-# app/build.gradle.kts），而 runner 上没有 ~/.android/debug.keystore，AGP 每次
-# 会现生成一个新的。所以真机上从本地包换成 CI 包（或反过来）必须先卸载，
-# 直接覆盖装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。要长期两边混用，就得把
-# 一个固定的 keystore 放进 secrets 再配 signingConfig —— 目前没这个需要。
+# 签名：CI 包与本地包**已经一致**，可以直接覆盖安装。
+#
+# 以前不行 —— release 沿用 debug key，而 runner 上没有 ~/.android/debug.keystore，
+# AGP 每次现生成一把新的，于是每次 CI 出的包签名都不同，真机上两边换着装必须先卸载
+# （`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。现在仓库里提交了一把固定的 sideload
+# 密钥（android/keystore/photoar-release.jks），**所有变体、所有机器、CI 一律用它**，
+# 详见 app/build.gradle.kts 里那段注释。下面「校验签名」那一步盯着这件事，
+# 因为它一旦回退就只在真机上表现成「装不上」，而 CI 全绿。
 name: android
 
 on:
@@ -36,6 +39,10 @@ jobs:
   # 顺序即依赖 —— 测试不过，后面的步骤不会跑。
   build:
     runs-on: ubuntu-latest
+    # 发 Release 要写权限。默认的 GITHUB_TOKEN 是只读的，缺这一段的表现是
+    # 「构建全绿，最后一步 403」—— 而那一步正是把包交到人手上的那一步。
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: android
@@ -82,14 +89,49 @@ jobs:
         run: |
           apk=app/build/outputs/apk/release/app-release.apk
           ls -l "$apk"
-          unzip -l "$apk" | grep -q 'assets/arcore.apk' \
-            || { echo "::error::包里没有内置的 ARCore 运行时"; exit 1; }
+          # 查的是**拆开之后**那几样，不是整包的 assets/arcore.apk。
+          #
+          # 这一行以前查的正是 `assets/arcore.apk`，而那条路（整包塞进 assets、
+          # 运行期再解）早就换掉了：现在 `ArcoreUnpackTask` 把运行时拆成
+          # assets/arcore_rt/dex.jar + assets/packed_profiles/ + lib/<abi>/*.so。
+          # 于是这个检查恒定失败 —— 而它是「守着构建成功但包是坏的」的那一步，
+          # 恒假和恒真一样没用。
+          unzip -l "$apk" | grep -q 'assets/arcore_rt/dex.jar' \
+            || { echo "::error::包里没有 ARCore 运行时的 dex（ArcoreUnpackTask 脱钩了）"; exit 1; }
+          unzip -l "$apk" | grep -q 'assets/packed_profiles/profiles.toc' \
+            || { echo "::error::包里没有 packed_profiles（设备标定库，缺了它 ARCore 在任何机器上都起不来）"; exit 1; }
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libarcore_c.so' \
+            || { echo "::error::包里没有 ARCore 的原生库"; exit 1; }
           if unzip -l "$apk" | grep -qE 'lib/x86'; then
             echo "::error::模拟器 ABI 没被过滤掉，-Pphotoar.deviceAbiOnly 没生效"
             unzip -l "$apk" | grep -E 'lib/x86'
             exit 1
           fi
           echo "内置运行时在包里，模拟器 ABI 已剔除"
+
+      # 签名必须是那把提交进仓库的固定密钥，而不是 runner 现生成的 debug key。
+      #
+      # 这一步存在的理由：签名回退**不会让构建失败**，只会让真机上「覆盖安装」变成
+      # 「必须先卸载」，而那时候数据（登录、离线缓存）已经没了。所以在 CI 里就把它钉住。
+      - name: 校验签名（覆盖安装的前提）
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/release/app-release.apk
+          # apksigner 在 build-tools 里，路径随版本变，所以现找一个。
+          signer=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$signer" verify --print-certs "$apk" | tee /tmp/certs.txt
+          want=$(keytool -list -v -keystore keystore/photoar-release.jks \
+                   -storepass photoarsideload 2>/dev/null \
+                 | grep -oE 'SHA1: [0-9A-F:]+' | head -1 | cut -d' ' -f2 | tr -d ':')
+          got=$(grep -oiE 'SHA-1 digest: [0-9a-f]+' /tmp/certs.txt | head -1 | awk '{print $NF}')
+          echo "期望 $want"
+          echo "实得 $got"
+          if [ "$(echo "$want" | tr 'A-Z' 'a-z')" != "$(echo "$got" | tr 'A-Z' 'a-z')" ]; then
+            echo "::error::APK 不是用 keystore/photoar-release.jks 签的 —— 这个包不能覆盖安装"
+            exit 1
+          fi
+          echo "签名正确，可以覆盖安装"
 
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -98,3 +140,23 @@ jobs:
           path: android/app/build/outputs/apk/release/app-release.apk
           # 装一次就够了，不必长期占额度
           retention-days: 30
+
+      # 打了 tag 才发 Release。artifact 只有登录 GitHub 的人能下，而这个包是要
+      # 发给宾客装的 —— Release 的下载链接不需要登录。
+      - name: 发 Release（只在 tag 上）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: android/app/build/outputs/apk/release/app-release.apk
+          fail_on_unmatched_files: true
+          body: |
+            真机 APK（arm64 + armv7，不含模拟器 ABI）。
+
+            **可以直接覆盖安装** —— 所有构建（CI 与本地）都用仓库里那把固定的
+            sideload 密钥签名（`android/keystore/photoar-release.jks`）。
+
+            > **仅有一次例外**：如果手机上装的还是这次改动**之前**的包（那时候用的是
+            > 每台机器各自生成的 debug 密钥），这一次要先 `adb uninstall app.photoar`
+            > 再装；之后历次升级都不用再卸载了。

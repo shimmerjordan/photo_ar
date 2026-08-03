@@ -1,0 +1,165 @@
+# 后端把关：单元测试 + 用**线上那一份** Dockerfile 编镜像 + 把镜像当生产环境跑一遍。
+#
+# ════════════════════════════════════════════════════════════════════════
+# 为什么要有这条流水线
+#
+# 在它之前，仓库里 1000 多个 Python 用例**一次都没在 CI 上跑过** —— 只有安卓那条
+# （`android.yml`）和发镜像那条（`publish-image.yml`）。发镜像那条是 tag 触发的，
+# 而且它只 `docker build`，不跑测试、也不把镜像起来看一眼。也就是说服务端的把关
+# 完全靠「记得在本机跑一遍」。
+#
+# 这条流水线补的正是那一段，分三层，每层守的失效模式都不一样：
+#
+#   1. **单元测试**（1000+ 用例，纯 CPU、不碰网络）—— 逻辑回归
+#   2. **编镜像**，用与 NAS 上完全同一份 Dockerfile —— 「本机能跑、镜像里缺个包」
+#   3. **把镜像跑起来打 API** —— 「镜像编出来了但起不来」（非 root 写不了 /data、
+#      healthcheck 脚本路径错、EXPOSE 的端口和实际监听的不一致）
+#
+# 第 3 层是这里唯一能覆盖到的东西：`docker build` 成功和「容器能对外服务」是两件事，
+# 而后者出问题的时候，症状是在 NAS 上 `docker compose up` 之后一直 restarting。
+#
+# ⚠️ `arcoreimg` 不在仓库里（ARCore SDK 里的闭源二进制、不可再分发），所以镜像里
+# 没有它，入库那条路在 CI 上会回 503。这是**预期**的：E2E 只打不需要它的接口。
+# 入库那一整条的覆盖在单元测试里（`fake_arcoreimg` fixture）。
+# ════════════════════════════════════════════════════════════════════════
+
+name: server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "docker/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".github/workflows/server.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "docker/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".github/workflows/server.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # 1000+ 个用例里有一批要跑真的 ORB + RANSAC，比纯逻辑测试慢；本机整套约 6 分钟。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # 与 Dockerfile 里的 python:3.11-slim 同版本
+          cache: pip
+
+      # 依赖清单不在 requirements.txt 里，而是写在 Dockerfile 的 pip install 那一行
+      # （零依赖是这个项目的原则，运行期只要 numpy + opencv）。这里照抄那三样，
+      # 而不是新开一个清单文件 —— 两份清单迟早会不一致，而不一致的表现是「CI 绿、
+      # 镜像里缺个包」。
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "numpy>=1.26" "opencv-python-headless>=4.9" pytest
+
+      - name: 单元测试
+        env:
+          PYTHONPATH: src
+        run: python -m pytest tests -q
+
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用线上那一份 Dockerfile，不另写一个「CI 专用」的。
+      - name: 编镜像
+        run: docker build -t photo-ar-server:ci .
+
+      # 把它当生产环境跑：非 root、/data 是 volume、healthcheck 由镜像自己带。
+      #
+      # 这一步守的是 `docker build` 覆盖不到的那一半。历史上真实发生过的两类：
+      # 非 root 用户写不了挂载进来的 /data（起来就崩），以及 healthcheck 脚本
+      # 的路径在镜像里对不上（容器永远 unhealthy，compose 一直重启它）。
+      #
+      # 不设 PHOTOAR_TOKEN 是**刻意**的：`docker/healthcheck.py` 在没配 token 时
+      # 把 401 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署
+      # 走的那条 —— 顺手把它验一遍。配了 token 的那条由那份 docstring 说明。
+      - name: 起容器并打接口
+        run: |
+          set -euo pipefail
+          docker volume create photoar-ci-data
+          # PHOTOAR_ROOTS 是**必填**的：不给的话 entrypoint 直接拒绝启动
+          # （「必须设 PHOTOAR_ROOTS（白名单根目录）」）。这一条是照着一次本地
+          # 实跑加上的 —— 第一版这个 workflow 少了它，容器 2 秒就 unhealthy。
+          # 名字用 ASCII：真实部署里是「照片=/share/Photo」这样的中文名，而在
+          # CI 的 shell → docker → python 这条链上省掉一层编码变量。
+          docker run -d --name photoar-ci \
+            -e PHOTOAR_ADMIN_NAME=admin \
+            -e PHOTOAR_ADMIN_PASSWORD=admin \
+            -e PHOTOAR_BIND=0.0.0.0 \
+            -e PHOTOAR_ROOTS=photos=/data/photos,videos=/data/videos \
+            -v photoar-ci-data:/data \
+            -p 8964:8964 \
+            photo-ar-server:ci
+
+          # 等 healthcheck 变 healthy，而不是 sleep 一个固定秒数：镜像自己带
+          # HEALTHCHECK，用它就等于顺手验证了那条命令是对的。
+          for i in $(seq 1 60); do
+            st=$(docker inspect -f '{{.State.Health.Status}}' photoar-ci 2>/dev/null || echo starting)
+            echo "[$i] $st"
+            [ "$st" = "healthy" ] && break
+            if [ "$st" = "unhealthy" ] || [ "$i" = "60" ]; then
+              echo "::error::容器没能变 healthy"
+              docker logs photoar-ci
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # 未登录必须被拒（401），不是 200 也不是 500。
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/v1/ping)
+          echo "未登录 /v1/ping -> $code"
+          [ "$code" = "401" ] || { echo "::error::未登录的请求本该 401"; docker logs photoar-ci; exit 1; }
+
+          # 登录 → 拿 token → 打 ping。这三步串起来就覆盖了「路由表装上了、
+          # 鉴权链通了、SQLite 能写」。
+          tok=$(curl -s -X POST http://127.0.0.1:8964/v1/auth/login \
+                  -H 'Content-Type: application/json' \
+                  -d '{"name":"admin","password":"admin"}' \
+                | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+          test -n "$tok" || { echo "::error::登录没拿到 token"; docker logs photoar-ci; exit 1; }
+          curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping | tee /tmp/ping.json
+          # 用 python3 -c 而不是 heredoc：YAML 的字面块会把整段一起缩进，于是
+          # 结束标记 `PY` 前面带着空格，bash 认不出来（`<<-` 只吃 tab 不吃空格），
+          # heredoc 永不终止、这一步挂到超时。这个坑不会在本地 shell 里复现。
+          python3 -c "import json;d=json.load(open('/tmp/ping.json'));assert d['ok'] is True,d;assert d.get('backendDegraded') is not True,d;print('ping ok:',d)"
+
+          # 重启一次，验证 /data 上的东西是持久的（登录还在、库还在）。
+          docker restart photoar-ci
+          for i in $(seq 1 60); do
+            st=$(docker inspect -f '{{.State.Health.Status}}' photoar-ci 2>/dev/null || echo starting)
+            [ "$st" = "healthy" ] && break
+            [ "$i" = "60" ] && { echo "::error::重启后没能变 healthy"; docker logs photoar-ci; exit 1; }
+            sleep 2
+          done
+          curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping >/dev/null \
+            || { echo "::error::重启之后原来的会话失效了 —— /data 没持久化"; exit 1; }
+          echo "重启后会话仍然有效，/data 持久化正常"
+
+      - name: 容器日志（失败时看这里）
+        if: always()
+        run: docker logs photoar-ci || true
+
+      - name: 收摊
+        if: always()
+        run: |
+          docker rm -f photoar-ci || true
+          docker volume rm photoar-ci-data || true
