@@ -24,6 +24,7 @@ dtype（不带 '<'/'>' 前缀）就是本机序，这里从来没有显式要求
 文档过度承诺成"小端"的真实前提条件。
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -153,6 +154,66 @@ def append_slot(
         fh.write(encode_slot(features, layout))
         fh.flush()
     return existing // layout.stride
+
+
+def copy_replacing_slot(
+    src: str | Path,
+    dst: str | Path,
+    slot: int,
+    features: Features,
+    layout: SlotLayout = ORB_LAYOUT,
+) -> None:
+    """把 `src` 整份复制到 `dst`，其中第 [slot] 个槽换成 [features]。
+
+    ## 为什么是「复制到新文件」而不是原地覆盖
+
+    原地覆盖看起来更省事（`seek(slot * stride)` 然后写 12 KB），但它会**损害正在进行
+    的识别请求**：[DescStore] 用的是 `np.memmap(mode="r")`，而 Linux 上那是
+    `MAP_SHARED` —— 另开一个句柄写同一个文件，这些字节会**透过已有的 mmap 被看到**。
+    于是一次并发的精排可能读到半新半旧的槽：pts 来自旧图、desc 来自新图。不崩，
+    只是匹配结果静默错，而且无从追查。
+
+    追加（[append_slot]）没有这个问题，是因为它写在旧快照 `count` 之外，老读者永远
+    不看那里。原地替换没有这个便利，所以只能走「写新文件 + 原子替换」：老快照继续
+    持有旧 inode（已 unlink 但句柄还开着），把手上的请求跑完；新读者才看到新数据。
+
+    代价是重写整个 desc.bin。实测每槽 12008 字节，2000 张照片 = 23 MiB，一次
+    「换照片」重写它是可以忽略的。
+
+    调用方负责把 [dst] 原子地 `os.replace` 到位 —— 这里只管产出内容，因为**words.bin
+    必须和它一起落地**（两份文件的 slot 是一一对应的，只换一份就是错位）。
+    """
+    src = Path(src)
+    dst = Path(dst)
+    size = src.stat().st_size
+    if size % layout.stride:
+        raise ValueError(
+            f"{src} 大小 {size} 不是 slot 步长 {layout.stride} 的整数倍"
+        )
+    count = size // layout.stride
+    if slot < 0 or slot >= count:
+        raise IndexError(f"slot {slot} 超出范围 [0, {count})")
+
+    blob = encode_slot(features, layout)
+    if len(blob) != layout.stride:
+        # 到不了（`encode_slot` 产出的就是一个整槽），但错位的后果是整个库从这一槽
+        # 之后全错，所以宁可在这里当场炸。
+        raise ValueError(f"编码出来 {len(blob)} 字节，不是一个整槽 {layout.stride}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        # 分块拷，别把整个库读进内存。
+        for i in range(count):
+            if i == slot:
+                fin.seek(layout.stride, 1)  # 跳过旧的那一槽
+                fout.write(blob)
+                continue
+            chunk = fin.read(layout.stride)
+            if len(chunk) != layout.stride:
+                raise ValueError(f"{src} 在 slot {i} 处读短了")
+            fout.write(chunk)
+        fout.flush()
+        os.fsync(fout.fileno())
 
 
 class IncompleteWrite(RuntimeError):

@@ -21,7 +21,7 @@
 （见 decide_with 的文档与 bench/threshold_scan.py）。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -117,10 +117,27 @@ MIN_MATCHES_FOR_HOMOGRAPHY = 4
 
 @dataclass(frozen=True)
 class PairResult:
+    """一次精排的结果。
+
+    `homography` 是 RANSAC 拟合出来的那个 3×3 单应矩阵，方向 **query → ref**。
+
+    以前它算完就丢掉了，只留下 `inliers`。但它正是「照片在画面里的四个角」的来源：
+    取逆之后作用到参考图的四角，就得到照片此刻在查询帧里的四边形 —— 而 RANSAC 的内点
+    筛选本身就是「用一堆点拟合出这个平面、并把手指遮挡那些点当离群值剔掉」。也就是说
+    这个几何拟合一直在做，只是产物被扔了。
+
+    `compare=False` 是必须的：numpy 数组的 `==` 返回的是数组而不是布尔，带着它做
+    dataclass 的相等比较会抛「truth value of an array is ambiguous」—— 而
+    `PairResult` 在测试里是要比较的（`decide_with` 的重放用例）。矩阵是附加产物，
+    不参与「这次精排结果是否相同」的语义，所以排除在比较之外正好。
+    `repr=False` 同理：一个 3×3 数组打进 repr 只会让失败信息难读。
+    """
+
     photo_id: str
     inliers: int
     det: float
     ok: bool  # 是否通过前两条判定（比值检验是 decide 的职责）
+    homography: "np.ndarray | None" = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -174,7 +191,9 @@ def ransac_pair(
     inliers = int(mask.sum())
     det = float(np.linalg.det(H))
     ok = _passes(inliers, det, min_inliers, DET_MIN, DET_MAX)
-    return PairResult(photo_id=photo_id, inliers=inliers, det=det, ok=ok)
+    return PairResult(
+        photo_id=photo_id, inliers=inliers, det=det, ok=ok, homography=H
+    )
 
 
 def verify_pair(query: Features, ref: Features, photo_id: str) -> PairResult:

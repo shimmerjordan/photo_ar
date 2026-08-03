@@ -44,6 +44,7 @@ Phase 0 的实测数字直接适用。`tests/server/test_library.py` 钉住了�
 """
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -68,6 +69,22 @@ from ..verify import (
 )
 
 SLOTS_VERSION = 1
+
+#: 退役槽位的占位。空串，而不是 null 或删掉这一项。
+#:
+#: 删除一张照片**不能**把它从 `slots.json` 里摘掉：slot 是 `desc.bin` / `words.bin`
+#: 里的下标，摘一项就要把后面每一条往前挪，而那要重写两个几十 MB 的文件、还要在
+#: 中途保证并发的精排读不到半新半旧的映射（`replace` 那段 docstring 论证过这个
+#: mmap 陷阱）。更糟的是 photo_id ↔ slot 的对应关系会整体平移，而错位不报错 ——
+#: 命中之后播的是别人的视频。
+#:
+#: 所以删除 = 把这一格换成墓碑。三份记录的**条数不变**（`_assert_aligned` 照旧
+#: 成立），后面所有 slot 的下标一个都不动，读侧只要多一句「墓碑跳过」。
+#: 代价是磁盘不回收 —— 一格 ORB 描述子约 10KB，删一千张才 10MB，不值得为它换设计。
+#:
+#: 用空串而不是 JSON null：`_read_slots` 会 `str(p)`，null 会变成字符串 "None"，
+#: 那是一个**看起来像 photo_id** 的值。空串在任何 photo_id 格式下都不可能是真值。
+RETIRED = ""
 
 # 词序列文件的定长布局：uint32 count + uint32[N_FEATURES] words（本机字节序，
 # 与 descstore 同一前提，理由见那个模块的 Minor #8 说明）。
@@ -344,8 +361,14 @@ class PhotoLibrary:
         return snap.n_docs if snap else 0
 
     def photo_ids(self) -> list[str]:
+        """库里**还活着**的 photo_id，墓碑（[RETIRED]）不算。
+
+        过滤在这里而不是让调用方各自处理：现有三个调用方（一致性检查、换参考图的
+        前置判断、测试）问的都是「这个 id 还在库里吗」，而墓碑的语义是「不在了」。
+        要按 slot 定位仍然用 [slot_of]，它查的是原始快照。
+        """
         snap = self._snapshot
-        return list(snap.photo_ids) if snap else []
+        return [p for p in snap.photo_ids if p != RETIRED] if snap else []
 
     def slot_of(self, photo_id: str) -> int | None:
         snap = self._snapshot
@@ -397,8 +420,11 @@ class PhotoLibrary:
             return []
         out = []
         for slot in self._candidate_slots(snap, query, top_k):
+            pid = snap.photo_ids[slot]
+            if pid == RETIRED:
+                continue  # 已删除的照片：描述子还在盘上，但不再参与识别
             ref = snap.store.read(slot)
-            out.append(self._backend.verify(query, ref, snap.photo_ids[slot]))
+            out.append(self._backend.verify(query, ref, pid))
         return out
 
     def recognize(self, img: np.ndarray, top_k: int = TOP_K) -> Decision:
@@ -412,6 +438,8 @@ class PhotoLibrary:
         self_score: int,
         known_self_scores: dict[str, int],
         *,
+        query_features: Features | None = None,
+        exclude: str | None = None,
         min_inliers: int | None = None,
         ratio: float = RATIO,
         top_k: int = DEDUP_TOP_K,
@@ -433,6 +461,44 @@ class PhotoLibrary:
         `known_self_scores` 由调用方从 catalog 取（自匹配分要跑 20 次扰动查询
         才能算出，入库时算一次存库）。缺了某张的分数就当它极低 —— 宁可多报一次
         冲突让用户确认，也不要因为查不到分数就放行。
+
+        `exclude` 是「换参考图」用的：那时库里那张**就是要被换掉的自己**，拿新图和
+        自己的旧特征比必然判成近重复，于是 `replace_ref` 对它最主要的用法（同一张
+        照片重新扫一遍换上去）会恒定失败。
+
+        ⚠️ 排除必须走这个参数，**不能靠把它从 `known_self_scores` 里删掉** ——
+        上一段说了缺分数当极低，于是删掉它反而让 `min(s_new, 0) < ratio * m` 恒成立，
+        也就是把「可能冲突」变成了「必然冲突」。（这条注释是照着一次真实的错写的。）
+
+        ## `query_features`：`m` 必须用**查询侧**的特征预算量
+
+        这是一次真实漏网之后加的。同一张海报被拍了两次入库，两张都进来了，然后真机
+        941 帧里只命中 44 帧 —— 内点数 160~229（远超门槛 40），但 top1/top2 恒定落在
+        1.13~1.56，比值检验判 ambiguous。也就是这个方法的 docstring 上面那段预言的
+        「两份都永久漏检，用户看到的现象是识别器坏了」，一字不差地发生了。
+
+        闸门为什么没拦住：`m` 是拿两张**入库侧**特征（300 个 / 640px）互相配对算的，
+        而识别时的 `i2`（查询帧对错的那张参考图的内点数）是**查询侧**预算
+        （`backend.QUERY_N_FEATURES` 4000 个 / 1280px）对同一份参考图算的。同一对图：
+
+            入库口径 m =  63     ← 闸门原来用的
+            查询口径 m = 123     ← 识别时真正发生的
+            两张的 min(self_score) = 149
+            原判据：149 >= 1.5×63  = 94.5  → 放行（就是这次放进来的原因）
+            改后：  149 <  1.5×123 = 184.5 → 拦下
+
+        所以这不是「把闸门调紧」，是**让 `m` 量它名字所指的那个东西**：识别永远是
+        「查询侧特征 vs 库里存的入库侧参考图」，那才是 `m` 该复现的方向。
+
+        `self_score` 保持入库口径不变（理由在 `ingest.py` 那段注释里：它是存进 catalog
+        的历史值，换口径要连全库一起重算，那是数据迁移）。它因此是 `i1` 的**低估**，
+        而低估分子只会让闸门更严 —— 对一个失效方式是「两张永久扫不出来」的闸门，
+        这是安全的方向。
+
+        库外误拦的风险有多大：同一批实测里 5 对**内容无关**的照片，`m` 从 5~7 只涨到
+        7~8（本来就是噪声量级），而 `1.5×8 = 12` 远低于它们的 self_score（104~107）——
+        真负样本这边有 15 倍以上的余量。⚠️ 但那 5058 张的语料已经不在盘上了，所以这条
+        余量只在 5 对负样本上复核过，不是原来那个规模。
         """
         # 默认阈值跟后端走（ORB 25 / XFeat 38）：两个后端的内点数分布是两个不同的
         # 量，沿用另一边的数会让去重闸门实际变松或变紧，而这不会报错。
@@ -444,9 +510,19 @@ class PhotoLibrary:
         out: list[Conflict] = []
         for slot in self._candidate_slots(snap, features, top_k):
             pid = snap.photo_ids[slot]
+            if pid == RETIRED:
+                continue  # 已删除的照片不再参与去重判定
+            if exclude is not None and pid == exclude:
+                continue
             ref = snap.store.read(slot)
+            # 三个方向取最大。前两个是入库口径的对称配对（`verify` 不对称，见上面
+            # docstring）；第三个是**识别时真正发生的那个方向** —— 查询侧特征对库里
+            # 的参考图，它通常比前两个大一倍，也正是这个闸门要防的量。
+            pairs = [(features, ref), (ref, features)]
+            if query_features is not None and len(query_features) > 0:
+                pairs.append((query_features, ref))
             m = 0
-            for a, b in ((features, ref), (ref, features)):
+            for a, b in pairs:
                 r = self._backend.verify(a, b, pid)
                 score = r.inliers if DET_MIN <= r.det <= DET_MAX else 0
                 m = max(m, score)
@@ -495,6 +571,83 @@ class PhotoLibrary:
             self._reindex_locked(photo_ids)
             return slot
 
+    def replace(self, photo_id: str, features: Features) -> int:
+        """把库里这张照片的描述子换成新的，**slot 不变**，返回那个 slot。
+
+        用途是「换参考图」：同一张照片换一张更清楚的打印件重新拍/重新扫。slot 不变
+        意味着 `photo_id` 不变，于是**授权、配的视频、识别历史全都留着** —— 这是它
+        比「删掉重建」好得多的地方（删除还要把后面所有 slot 往前挪，而那会让每一个
+        photo_id 与 slot 的对应关系重算）。
+
+        ## 为什么要写临时文件再原子替换
+
+        不能原地覆盖。`DescStore` 用 `np.memmap(mode="r")`，Linux 上那是 `MAP_SHARED`
+        —— 另开句柄写同一个文件，字节会**透过已有的 mmap 被看到**，于是一次并发的精排
+        会读到半新半旧的槽（pts 来自旧图、desc 来自新图）。不崩，只是匹配结果静默错。
+        详细论证在 `descstore.copy_replacing_slot` 的 docstring 里。
+
+        **desc.bin 与 words.bin 必须一起落地**：两份文件的 slot 一一对应，只换一份就是
+        错位，而错位的后果是「照片 A 的描述子挂在照片 B 的 id 上」—— 识别命中后播的是
+        别人的视频，没有任何一步会报错（`_assert_aligned` 也查不出来，它只比条数，
+        而条数没变）。所以两个临时文件都写完了才开始 replace。
+        """
+        with self._write_lock:
+            photo_ids = self._read_slots()
+            try:
+                slot = photo_ids.index(photo_id)
+            except ValueError:
+                raise ValueError(f"photo_id 不在库中：{photo_id}") from None
+            self._assert_aligned(photo_ids)
+
+            desc_tmp = self.desc_path.with_suffix(".bin.tmp")
+            words_tmp = self.words_path.with_suffix(".bin.tmp")
+            try:
+                descstore.copy_replacing_slot(
+                    self.desc_path, desc_tmp, slot, features, self._backend.layout
+                )
+                self._copy_words_replacing_slot(
+                    words_tmp, slot, self._vocab.words_of(features.desc)
+                )
+                # 两份都写成了才开始换。中途进程被杀的话，留下的是两个 .tmp，
+                # 而库本身一个字节都没动。
+                desc_tmp.replace(self.desc_path)
+                words_tmp.replace(self.words_path)
+            finally:
+                desc_tmp.unlink(missing_ok=True)
+                words_tmp.unlink(missing_ok=True)
+
+            # slots.json 不用动（photo_id 与顺序都没变），但索引要重建：这张照片的
+            # 词序列变了，倒排表里它的 postings 是旧的。
+            self._reindex_locked(photo_ids)
+            return slot
+
+    def _copy_words_replacing_slot(
+        self, dst: Path, slot: int, words: np.ndarray
+    ) -> None:
+        """把 words.bin 复制到 `dst`，其中第 `slot` 条换成 `words`。"""
+        stride = self._words_slots * 4
+        size = self.words_path.stat().st_size
+        if size % stride:
+            raise LibraryCorrupt(
+                f"{self.words_path} 大小 {size} 不是词序列步长 {stride} 的整数倍"
+            )
+        count = size // stride
+        if slot < 0 or slot >= count:
+            raise IndexError(f"slot {slot} 超出 words.bin 的范围 [0, {count})")
+        blob = _encode_words(words, self._words_slots)
+        with open(self.words_path, "rb") as fin, open(dst, "wb") as fout:
+            for i in range(count):
+                if i == slot:
+                    fin.seek(stride, 1)
+                    fout.write(blob)
+                    continue
+                chunk = fin.read(stride)
+                if len(chunk) != stride:
+                    raise LibraryCorrupt(f"{self.words_path} 在第 {i} 条处读短了")
+                fout.write(chunk)
+            fout.flush()
+            os.fsync(fout.fileno())
+
     def reindex(self, *, rebuild_words: bool = False) -> None:
         """重建倒排索引。`rebuild_words=True` 时先用当前 vocab 重新量化全库描述子。
 
@@ -517,6 +670,34 @@ class PhotoLibrary:
                 finally:
                     store.close()
             self._reindex_locked(photo_ids)
+
+    def retire(self, photo_id: str) -> int:
+        """把这张照片从识别库里退役，返回它原来的 slot。
+
+        **不腾出槽位**，只把 `slots.json` 里那一格换成 [RETIRED]。为什么必须这样、
+        以及代价是什么，写在那个常量上面。
+
+        为什么需要「删除」这件事本身：库里进了两张同一内容的照片时，比值检验
+        （`verify.RATIO`）会把**两张都**判成 ambiguous，于是两张都永久扫不出来。
+        去重闸门现在会拦住新的（见 [conflicts]），但已经进去的那一对只能靠删掉一张
+        解开 —— 在有这个方法之前，那种库是个死局：唯一的出路是把整个库重建。
+
+        幂等：已经退役、或压根不在库里，都返回 -1 而不是抛。调用方（HTTP 层）会先
+        查 catalog，所以这里再抛一次只会把一次「重复点了删除」变成 500。
+        """
+        with self._write_lock:
+            photo_ids = self._read_slots()
+            try:
+                slot = photo_ids.index(photo_id)
+            except ValueError:
+                return -1
+            self._assert_aligned(photo_ids)
+            photo_ids[slot] = RETIRED
+            self._write_slots(photo_ids)
+            # 必须重建倒排索引，`_reindex_locked` 会把墓碑那一格的词序列清空 ——
+            # 理由在那个方法里。
+            self._reindex_locked(photo_ids)
+            return slot
 
     # ---- 训词表 ----
 
@@ -624,7 +805,18 @@ class PhotoLibrary:
         return np.vstack(chunks)
 
     def _reindex_locked(self, photo_ids: list[str]) -> None:
-        index = self._build_index(_read_words(self.words_path, self._words_slots))
+        words = _read_words(self.words_path, self._words_slots)
+        # 退役槽位的词序列清空，**不是**只在读侧跳过它。
+        #
+        # idf = log(n_docs/df)：留着它的词，一张已经不存在的照片会继续压低所有它
+        # 含有的词的区分度，而这不报错、只让粗排排序静默偏一点。清空之后它的 df
+        # 贡献归零、`InvertedIndex` 也不会再把这个 slot 排进候选 —— 读侧那句
+        # 「墓碑跳过」于是变成第二道保险，而不是唯一一道。
+        empty = np.empty(0, np.int32)
+        for slot, pid in enumerate(photo_ids):
+            if pid == RETIRED and slot < len(words):
+                words[slot] = empty
+        index = self._build_index(words)
         index.save(self.index_path)
         # 整体替换快照。旧快照被读侧的局部变量持有着，它的 mmap 不会在读到
         # 一半时失效——这是这里不显式 close() 旧 store 的原因。

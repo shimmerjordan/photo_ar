@@ -120,6 +120,18 @@ def fake_arcoreimg(tmp_path):
                 # 每次整库构建都失败，离线识别整条路一直是坏的，全套测试却是绿的。
                 real_out = out if out.endswith(".imgdb") else out + ".imgdb"
                 pathlib.Path(real_out).write_bytes(b"X" * {db_bytes})
+                # 把每次 build-db 的清单原文追加进日志。
+                #
+                # 需要它是因为这个 fake 产出的 .imgdb 内容与**输入图无关**（固定
+                # {db_bytes} 个 X），所以「换参考图之后 imgdb 变了没有」这种断言在这里
+                # 根本验不出来 —— 前后字节必然相同。而唯一的真实证据就是「这次 build-db
+                # 拿到的清单里写的是哪张图」，所以把它记下来。
+                #
+                # 日志放在脚本旁边（tmp_path 下），一个测试一份，不会互相污染。
+                log = pathlib.Path(__file__).with_name("arcoreimg-calls.log")
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(pathlib.Path(listing).read_text(encoding="utf-8"))
+                    fh.write("\\n--\\n")
                 print(f"Image database generated at: {{real_out}}")
                 sys.exit(0)
 

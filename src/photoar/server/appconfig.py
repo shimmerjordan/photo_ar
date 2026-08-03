@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .. import backend as recog_backend
-from .. import quality, recognizer, verify
+from .. import quality, recognizer, synth, verify
 from . import auth, db, framedump
 
 # 进程内缓存的默认 TTL（秒）。
@@ -175,6 +175,24 @@ FIELDS: tuple[Field, ...] = (
             "开启时与库内已有照片过于相似的新照片会被拒（409，并列出冲突的是哪几张）。"
             "关掉它两张近重复照片都能入库，代价是它们会互相判成「分不清」，"
             "**两张都永久扫不出来**，而现象是「识别器坏了」。"
+        ),
+    ),
+    Field(
+        key="ingest.synth_long_edge",
+        kind=KIND_INT,
+        default=synth.SYNTH_LONG_EDGE,
+        minimum=480,
+        maximum=4000,
+        label="入库时自匹配分的计算分辨率",
+        help=(
+            "入库要把照片扭曲几次再和自己比，用这个分数判断「这张照片好不好认」。"
+            "扭曲是在这个长边上做的。\n\n"
+            "**这是入库速度的主要开关。** 实测一张 3000×4000 的手机照片："
+            "全分辨率要 111 秒（客户端会超时），1280 是 1.4 秒，960 是 0.35 秒。"
+            "而下游提特征本来就会把图缩到 640，所以高分辨率那些像素大部分是白算的。\n\n"
+            "调低更快，代价是分数会略微偏低（= 去重更容易报冲突，方向是安全的）："
+            "1280 比全分辨率低约 6%，640 低约 16%。"
+            "默认 1280 是端上喂给 ARCore 的 CPU 图像长边，也就是相机真正给出的尺度。"
         ),
     ),
     Field(

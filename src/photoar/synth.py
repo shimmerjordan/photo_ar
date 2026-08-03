@@ -19,12 +19,52 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from . import features
+
 MAX_CORNER_JITTER = 0.25
 MAX_BLUR_SIGMA = 1.5
 BRIGHTNESS_RANGE = (0.7, 1.3)
 MAX_WARM_SHIFT = 0.15
 JPEG_QUALITY_RANGE = (50, 85)
 GLARE_PROBABILITY = 0.35
+
+# 合成之前把输入缩到这个长边。
+#
+# ## 为什么必须有这个上限（实测数字）
+#
+# `apply` 对每一张样本要做：透视 warp、高斯模糊、**转 float32**、逐通道乘、clip、转回
+# uint8、可选眩光、**JPEG 编码 + 解码**。也就是六七遍全图操作加一次 JPEG 往返。这在
+# 查询帧尺寸（640–1280）上是几十毫秒，在一张 12MP 的手机原图上是**18 秒一张**
+# （那次 float32 转换本身就要分配 144 MB）。
+#
+# 实测（3 CPU 容器内，一张 3000×4000 的手机照片，6 个样本）：
+#
+#     全分辨率(4000)   self_score=154   111125 ms   ← 入库直接超时
+#     缩到 1920        self_score=150     6385 ms
+#     缩到 1280        self_score=144     1371 ms   ← 选它
+#     缩到  960        self_score=145      355 ms
+#     缩到  640        self_score=130      127 ms
+#
+# ## 为什么这不是「降低精度」而是去掉浪费
+#
+# 下游的 `features.extract` **本来就会**把图缩到 `features.LONG_EDGE`(640) 再提特征。
+# 也就是说全分辨率 warp 出来的那些像素，97% 在下一步就被扔掉了 —— 111 秒里绝大部分是
+# 白算的。
+#
+# ## 为什么是 1280 而不是 640
+#
+# 640 会让 12MP 照片的自匹配分掉 24（-15.6%），而 1280 只掉 10（-6.5%），960 与 1280
+# 已经在噪声范围内（145 vs 144）。1280 还有一个现成的锚：那正是 App 喂给 ARCore 的
+# CPU 图像长边（`Frames.LONG_EDGE`），所以自匹配分是在**相机真正给出的那个尺度**上量的。
+#
+# ## 混代分数的问题（为什么可以接受）
+#
+# `self_score` 会存进库，而去重判据 `min(s_new, s_exist) < ratio * m` 要拿新旧两代比。
+# 换算法本该配一次全库重算。这里可以不重算，理由是实测的：**已经在库里的照片长边基本都
+# ≤1600，在 1280 上限下分数只差 0～1**（demo-a 1600px：109 → 108；wedding-01 708px：
+# 不受影响）。真正会变的只有 12MP 手机照片，而它们在改之前**根本入不了库**（超时）。
+# 而且变化方向是分数变低 = 去重更保守 = 宁可多报冲突，那是安全的方向。
+SYNTH_LONG_EDGE = 1280
 
 
 @dataclass(frozen=True)
@@ -144,7 +184,22 @@ def apply(img_bgr: np.ndarray, p: SynthParams) -> np.ndarray:
 
 
 def generate(
-    img_bgr: np.ndarray, count: int, seed: int
+    img_bgr: np.ndarray,
+    count: int,
+    seed: int,
+    long_edge: int | None = SYNTH_LONG_EDGE,
 ) -> list[tuple[np.ndarray, SynthParams]]:
+    """造 [count] 张「手机翻拍」风格的查询图。
+
+    @param long_edge 先把输入缩到这个长边再合成。理由与实测数字见 [SYNTH_LONG_EDGE]
+        那段注释（一句话版：不缩的话一张 12MP 手机照片要 111 秒，而其中 97% 的像素在
+        下一步提特征时就被扔掉了）。给 None 表示不缩 —— 只有在**刻意**要复现旧行为
+        或者研究分辨率影响时才这么用（`bench/` 里那类脚本）。
+
+    比 [count] 大的图会被缩，小的**不动**（`resize_to_long_edge` 只在尺寸不等时才动，
+    放大一张小图不会凭空造出细节，只会让 warp 更慢）。
+    """
+    if long_edge is not None and max(img_bgr.shape[:2]) > long_edge:
+        img_bgr = features.resize_to_long_edge(img_bgr, long_edge)
     rng = np.random.default_rng(seed)
     return [(apply(img_bgr, p), p) for p in (sample_params(rng) for _ in range(count))]

@@ -132,6 +132,10 @@ def ingest_photo(
     # 与 `library.conflicts`）。只在"我确定这两张不是同一张"或"临时排查闸门本身
     # 是不是误拦"时关，关完记得开回来。
     dedup_gate: bool = True,
+    # 自匹配分的合成分辨率。理由与实测数字见 `synth.SYNTH_LONG_EDGE`（一句话版：
+    # 不限的话一张 12MP 手机照片要 111 秒，而 97% 的像素在下一步提特征时就被扔掉）。
+    # 由 HTTP 层从热配置 `ingest.synth_long_edge` 传进来。
+    synth_long_edge: int = synth.SYNTH_LONG_EDGE,
     # 视频怎么贴进照片区域。None = 这一列留 NULL，读取侧回退到全局默认
     # （见 `db._PHOTO_V2_COLUMNS`）。HTTP 层会把当时的全局默认显式传进来，理由
     # 写在 `app.Server._create_photo` 里。
@@ -233,7 +237,9 @@ def ingest_photo(
     # 写进一个 0 分，而 conflicts 的判据是 `min(s_new, s_exist) < ratio * m` ——
     # 0 恒小于任何值，于是以后每一张与它沾点关系的新照片都会被判成冲突。
     # 也就是说"关掉去重闸门"会变成"以后入库全被拦住"，而拦人的是一个已经关掉的开关。
-    samples = synth.generate(img, cfg.self_score_samples, seed=0)
+    samples = synth.generate(
+        img, cfg.self_score_samples, seed=0, long_edge=synth_long_edge
+    )
     self_score = dedup.self_score(
         features,
         # 这里的合成样本是"查询"语义，但**故意不用 `backend.extract_query`**
@@ -256,7 +262,12 @@ def ingest_photo(
             str(p["id"]): int(p["self_score"])
             for p in catalog.list_photos()
         }
-        conflicts: list[Conflict] = library.conflicts(features, self_score, known)
+        # `query_features` 让 `m` 按识别时的口径量（4000 特征 / 1280px）。不传的话
+        # 闸门用入库口径的 300 特征去量交叉分，实测同一对近重复图 63 vs 123 ——
+        # 低一半，正好让一次真实的重复入库漏了网。理由全文见 `library.conflicts`。
+        conflicts: list[Conflict] = library.conflicts(
+            features, self_score, known, query_features=backend.extract_query(img)
+        )
         if conflicts:
             raise IngestRejected(
                 409,
@@ -374,6 +385,208 @@ def ingest_photo(
         video_asset_id=video_asset_id,
         playable_asset_id=playable_asset_id,
         transcoded=transcoded,
+        elapsed_ms=int((time.perf_counter() - t0) * 1000),
+    )
+
+
+@dataclass(frozen=True)
+class ReplaceRefResult:
+    photo_id: str
+    quality_score: int
+    self_score: int
+    imgdb_bytes: int
+    ref_asset_id: str
+    slot: int
+    elapsed_ms: int
+
+
+def replace_ref(
+    *,
+    cfg: ServerConfig,
+    catalog: Catalog,
+    library: PhotoLibrary,
+    photo_id: str,
+    ref_path: Path,
+    quality_gate: bool = True,
+    min_quality_score: int = quality.MIN_QUALITY_SCORE,
+    dedup_gate: bool = True,
+    synth_long_edge: int = synth.SYNTH_LONG_EDGE,
+) -> ReplaceRefResult:
+    """换掉一张已入库照片的**参考图**，photo_id 不变。
+
+    ## 为什么需要它，以及为什么不是「删掉重建」
+
+    真实场景：先拿手机拍的一张糊照片入了库，后来有了扫描件/原图，想换上去。或者
+    打印件重印了一版，颜色和裁切都不一样。
+
+    「删掉重建」要付两笔代价：**授权全丢**（`photo_grant.photo_id` 是
+    `ON DELETE CASCADE`，重建之后得一张张重新勾），以及删除本身要把识别库里后面
+    所有 slot 往前挪 —— 而那条路径出错的症状是「照片 A 的描述子挂在照片 B 的 id
+    上」，识别命中后播的是别人的视频，没有任何一步会报错。
+
+    换参考图不用碰这些：slot 原地替换（`PhotoLibrary.replace`），photo_id、授权、
+    配的视频、标题、打印宽度、贴合模式全部留着。
+
+    ## 顺序与失败形态
+
+    和 `ingest_photo` 同一个原则：所有可能失败的重活（质量分、特征、自匹配分、
+    去重、imgdb、缩略图）都在写库之前做完。写库分两步 —— catalog 先、library 后，
+    与 `ingest_photo` 一致，理由也一样（反过来失败会留下一个「识别得到但 catalog
+    里没有」的 photo_id，而那不会被任何检查报出来）。
+
+    这里 catalog 先写还有一个额外的好处：`library.replace` 失败时，库里还是旧特征，
+    而 catalog 指向新的 imgdb/缩略图 —— 那是一个 `check_consistency` 之外的软不一致
+    （识别仍然按旧图工作，只是管理台上的缩略图换了）。反过来（library 先）则是
+    「识别按新图走，但 imgdb 还是旧的」，端上离线识别会拿到对不上的目标库。
+
+    ## 去重要排除自己
+
+    近重复闸门必须把**这张照片自己**排除掉。不排的话，用一张只做了轻微调整的新图去
+    换（这正是最常见的用法：同一张照片重新扫一遍），必然与自己的旧特征判成近重复，
+    于是这个接口对最主要的场景恒定失败。
+    """
+    t0 = time.perf_counter()
+    if catalog.get_photo(photo_id) is None:
+        raise IngestRejected(404, "photo_not_found", f"照片不存在：{photo_id}")
+    if photo_id not in set(library.photo_ids()):
+        # catalog 里有、识别库里没有。这是 `check_consistency` 管的那种不一致，
+        # 在这里如实说出来而不是让 `library.replace` 抛一句 ValueError。
+        raise IngestRejected(
+            409,
+            "photo_not_in_library",
+            f"这张照片在识别库里没有对应的记录（{photo_id}），"
+            "先跑 `photoar-server reindex` 修一下。",
+        )
+    if not ref_path.is_file():
+        raise IngestRejected(404, "ref_not_found", f"参考图不存在：{ref_path}")
+    if fsbrowser.kind_of(ref_path) != "image":
+        raise IngestRejected(
+            415, "ref_not_image", f"参考图不是支持的图片格式：{ref_path.suffix}"
+        )
+
+    try:
+        img = fsbrowser.decode_for_thumb(ref_path, "image")
+    except fsbrowser.ThumbFailed as exc:
+        raise IngestRejected(415, "ref_undecodable", str(exc)) from exc
+
+    # --- 质量分 ---
+    try:
+        score = quality.eval_img(ref_path, arcoreimg=cfg.arcoreimg)
+    except quality.ArcoreimgMissing as exc:
+        raise IngestRejected(503, "arcoreimg_missing", str(exc)) from exc
+    except quality.NotEnoughKeypoints as exc:
+        if quality_gate:
+            raise IngestRejected(
+                422,
+                "quality_too_low",
+                f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
+                score=0,
+                minScore=min_quality_score,
+                suggestion=_LOW_QUALITY_SUGGESTION,
+            ) from exc
+        score = 0
+    if quality_gate and score < min_quality_score:
+        raise IngestRejected(
+            422,
+            "quality_too_low",
+            f"这张照片的 AR 跟踪质量分只有 {score}，低于 {min_quality_score}，"
+            "跟踪会明显抖动。原来那张没有被换掉。",
+            score=score,
+            minScore=min_quality_score,
+            suggestion=_LOW_QUALITY_SUGGESTION,
+        )
+
+    backend = library.backend
+    features = backend.extract(img)
+    if len(features) == 0:
+        raise IngestRejected(
+            422, "no_features", f"这张照片提不出任何 {backend.name} 特征，无法识别"
+        )
+
+    samples = synth.generate(
+        img, cfg.self_score_samples, seed=0, long_edge=synth_long_edge
+    )
+    self_score = dedup.self_score(
+        features,
+        [backend.extract(q) for q, _ in samples],
+        verify_fn=backend.verify,
+    )
+
+    if dedup_gate:
+        # 排除自己走 `exclude=` 参数，**不能**把它从 known 里删掉：`conflicts` 对
+        # 查不到分数的照片按「极低」处理（宁可多报冲突），于是删掉它会让
+        # `min(s_new, 0) < ratio * m` 恒成立 —— 把「可能冲突」变成「必然冲突」。
+        # 第一版就是这么写错的，症状是这个接口对主要用法 100% 失败。
+        known = {
+            str(p["id"]): int(p["self_score"]) for p in catalog.list_photos()
+        }
+        conflicts: list[Conflict] = library.conflicts(
+            features,
+            self_score,
+            known,
+            query_features=backend.extract_query(img),
+            exclude=photo_id,
+        )
+        if conflicts:
+            raise IngestRejected(
+                409,
+                "near_duplicate",
+                "库里**另一张**照片和你要换上去的这张几乎相同。换上去会让它们互相判"
+                "ambiguous，结果是两张都永久识别不出来。原来那张没有被换掉。",
+                selfScore=self_score,
+                conflicts=[
+                    {
+                        "photoId": c.photo_id,
+                        "inliers": c.inliers,
+                        "selfScore": c.self_score,
+                        "title": (catalog.get_photo(c.photo_id) or {}).get("title"),
+                    }
+                    for c in conflicts
+                ],
+            )
+
+    # --- 生成物。文件名按 photo_id，所以是原地覆盖旧的那份 ---
+    photo = catalog.get_photo(photo_id) or {}
+    imgdb_path = cfg.imgdb_dir / f"{photo_id}.imgdb"
+    try:
+        imgdb_bytes = quality.build_single_target_db(
+            ref_path,
+            name=photo_id,
+            print_width_m=float(photo.get("print_width_m") or 0.0),
+            out_path=imgdb_path,
+            arcoreimg=cfg.arcoreimg,
+        )
+    except quality.InvalidListingField as exc:
+        raise IngestRejected(422, "bad_ref_path", str(exc)) from exc
+
+    thumb_path = cfg.thumb_dir / f"{photo_id}.jpg"
+    thumb_path.parent.mkdir(parents=True, exist_ok=True)
+    thumb_path.write_bytes(
+        fsbrowser.encode_thumb(img, fsbrowser.REF_THUMB_LONG_EDGE)
+    )
+
+    ref_asset_id = _upsert_file_asset(
+        catalog, ref_path, "image", probe_video=False, cfg=cfg
+    )
+
+    catalog.set_photo_ref(
+        photo_id,
+        ref_asset_id=ref_asset_id,
+        quality_score=score,
+        self_score=self_score,
+        imgdb_path=str(imgdb_path),
+        imgdb_bytes=imgdb_bytes,
+        thumb_path=str(thumb_path),
+    )
+    slot = library.replace(photo_id, features)
+
+    return ReplaceRefResult(
+        photo_id=photo_id,
+        quality_score=score,
+        self_score=self_score,
+        imgdb_bytes=imgdb_bytes,
+        ref_asset_id=ref_asset_id,
+        slot=slot,
         elapsed_ms=int((time.perf_counter() - t0) * 1000),
     )
 

@@ -148,3 +148,81 @@ def test_params_seed_is_independent_of_pythonhashseed():
         )
         seeds.add(out.stdout.strip())
     assert len(seeds) == 1, f"PYTHONHASHSEED 不应该影响派生结果，实际得到 {seeds}"
+
+
+# ---------------------------------------------------------------- 分辨率上限
+
+# 这一组存在的理由是一次真实事故：一张 3000×4000 的手机照片入库要 **111 秒**，客户端
+# （180 秒预算）在慢一点的网络上直接超时，而用户看到的是「服务器没回话」。
+#
+# 根因不是特征提取（那只要 18 ms），是 `apply` 对每张样本做六七遍全图操作加一次 JPEG
+# 往返，在 12MP 上是 18 秒一张 × 6 张。而下游 `features.extract` **本来就会**把图缩到
+# 640 —— 那 97% 的像素从一开始就是白算的。
+#
+# 所以下面钉三件事：缩了、缩到多少、以及小图不受影响。
+
+
+def test_大图会被缩到上限再合成(textured_image):
+    from photoar import synth as S
+
+    big = textured_image(seed=1, w=3000, h=2000)
+    (out, _), = S.generate(big, 1, seed=0)
+    assert max(out.shape[:2]) == S.SYNTH_LONG_EDGE
+    # 长宽比要保住 —— 变形会让透视 warp 的角度含义整个变掉
+    assert abs(out.shape[1] / out.shape[0] - 3000 / 2000) < 0.01
+
+
+def test_小图不动(textured_image):
+    # `resize_to_long_edge` 只在尺寸不等时才动，而放大一张小图不会凭空造出细节，
+    # 只会让 warp 更慢。
+    from photoar import synth as S
+
+    small = textured_image(seed=1, w=700, h=500)
+    (out, _), = S.generate(small, 1, seed=0)
+    assert out.shape[:2] == (500, 700)
+
+
+def test_上限与端上给_ARCore_的_CPU_图像长边一致():
+    # 1280 不是随手定的：它是 App 喂给 ARCore 的 CPU 图像长边（`Frames.LONG_EDGE`），
+    # 所以自匹配分是在**相机真正给出的那个尺度**上量的。
+    from photoar import synth as S
+
+    assert S.SYNTH_LONG_EDGE == 1280
+
+
+def test_显式给_None_可以关掉缩放(textured_image):
+    # 只有刻意复现旧行为或研究分辨率影响时才用（bench/ 里那类脚本）。
+    from photoar import synth as S
+
+    big = textured_image(seed=1, w=2000, h=1500)
+    (out, _), = S.generate(big, 1, seed=0, long_edge=None)
+    assert out.shape[:2] == (1500, 2000)
+
+
+def test_缩放之后仍然是确定性的(textured_image):
+    from photoar import synth as S
+
+    big = textured_image(seed=1, w=2400, h=1600)
+    a = S.generate(big, 3, seed=7)
+    b = S.generate(big, 3, seed=7)
+    for (ia, pa), (ib, pb) in zip(a, b):
+        assert pa == pb
+        assert np.array_equal(ia, ib)
+
+
+def test_大图合成不会慢到离谱(textured_image):
+    """一条粗糙的性能护栏。
+
+    不断言具体毫秒数（CI 机器快慢差几倍），只断言**远低于**那次事故的量级：12MP 输入
+    6 个样本，改之前是 111 秒。给 20 秒的上限 —— 任何一次让全分辨率 warp 回来的改动都
+    会撞上它，而正常实现在开发机上是 0.5 秒、在 N5095 上大概 3 秒。
+    """
+    import time
+
+    from photoar import synth as S
+
+    big = textured_image(seed=1, w=3000, h=4000)
+    t = time.perf_counter()
+    S.generate(big, 6, seed=0)
+    elapsed = time.perf_counter() - t
+    assert elapsed < 20, f"6 个样本用了 {elapsed:.1f} 秒 —— 全分辨率 warp 可能回来了"
