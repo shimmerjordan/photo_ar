@@ -327,7 +327,9 @@ workflow** 时才发新的 —— 往 main 推代码不会动镜像。所以 `pu
 | 只改了服务端逻辑 / 接口 | 什么都不用 | — |
 | 照片原文件被移动或改名 | `verify` 看报告，重新关联 | 详情页 `refStale`，识别仍在（用的是入库时存的特征） |
 
-**改了 Android**：重新 `assembleRelease`，用**同一份 debug keystore** 覆盖安装。
+**改了 Android**：重新 `assembleRelease -Pphotoar.deviceAbiOnly=true`，用**同一份 debug
+keystore** 覆盖安装。CI 出的包签名不同（runner 上的 `debug.keystore` 是每次现生成的），
+和本地包互换必须先卸载 —— 而卸载会清掉设置里的通道、令牌和离线缓存。
 
 **备份**：值钱的只有 `data/`（每个文件的作用见 [deploy/README.md](../deploy/README.md)
 的表）。`imgdb/`、`thumb/`、`playable/` 丢了只能重新入库再生成，所以别只备份
