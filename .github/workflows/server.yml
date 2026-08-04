@@ -1,54 +1,73 @@
-# 后端把关：单元测试 + 用**线上那一份** Dockerfile 编镜像 + 把镜像当生产环境跑一遍。
+# 后端唯一的一条流水线：单元测试 → 编镜像 → 把镜像当生产环境跑一遍 →（打 tag 时）推 GHCR。
 #
 # ════════════════════════════════════════════════════════════════════════
-# 为什么要有这条流水线
+# 为什么是一条而不是两条
 #
-# 在它之前，仓库里 1000 多个 Python 用例**一次都没在 CI 上跑过** —— 只有安卓那条
-# （`android.yml`）和发镜像那条（`publish-image.yml`）。发镜像那条是 tag 触发的，
-# 而且它只 `docker build`，不跑测试、也不把镜像起来看一眼。也就是说服务端的把关
-# 完全靠「记得在本机跑一遍」。
+# 原来是 `server.yml`（每次推 main 跑测试 + 编镜像 + 起容器打接口）和
+# `publish-image.yml`（打 tag 时跑测试 + 编镜像 + 推 GHCR）两条。它们**都**跑一遍
+# 完整测试、**都**编一遍镜像 —— 发版时等于把同样的事做两遍。
 #
-# 这条流水线补的正是那一段，分三层，每层守的失效模式都不一样：
+# 但合并不只是省时间，它补上了一个真实的洞：`publish-image` 只 `docker build` 就
+# `docker push`，**推出去的镜像从来没被跑起来看过一眼**。而「编得出来」和「起得来
+# 并能对外服务」是两件事（非 root 写不了挂载进来的 /data、healthcheck 脚本路径对不上、
+# EXPOSE 的端口和实际监听的不一致 —— 三样都真实发生过）。症状是在 NAS 上
+# `docker compose up` 之后一直 restarting，而那时你第一反应不会是「镜像是坏的」。
 #
-#   1. **单元测试**（1000+ 用例，纯 CPU、不碰网络）—— 逻辑回归
-#   2. **编镜像**，用与 NAS 上完全同一份 Dockerfile —— 「本机能跑、镜像里缺个包」
-#   3. **把镜像跑起来打 API** —— 「镜像编出来了但起不来」（非 root 写不了 /data、
-#      healthcheck 脚本路径错、EXPOSE 的端口和实际监听的不一致）
+# 合并后 publish 挂在 image 之后，所以推上去的那一版**必然**是被起来打过接口的。
 #
-# 第 3 层是这里唯一能覆盖到的东西：`docker build` 成功和「容器能对外服务」是两件事，
-# 而后者出问题的时候，症状是在 NAS 上 `docker compose up` 之后一直 restarting。
+# ## 三层各守什么
 #
-# ⚠️ `arcoreimg` 不在仓库里（ARCore SDK 里的闭源二进制、不可再分发），所以镜像里
-# 没有它，入库那条路在 CI 上会回 503。这是**预期**的：E2E 只打不需要它的接口。
-# 入库那一整条的覆盖在单元测试里（`fake_arcoreimg` fixture）。
+#   1. **单元测试** —— 逻辑回归。装的是 `pip install -e ".[dev]"`，也就是
+#      **pyproject 声明的那份依赖**，顺手验证「照着 README 装能不能跑起来」。
+#   2. **编镜像** —— 用与 NAS 上完全同一份 Dockerfile，守「本机能跑、镜像里缺个包」。
+#   3. **起容器打接口** —— 守 build 覆盖不到的那一半，并且这是唯一验证
+#      **Dockerfile 里那三个 pip 包够不够**的地方（第 1 层装的是 pyproject 那份，
+#      两份清单不必也不该保持一致）。
+#
+# ⚠️ `arcoreimg` 不在仓库里（ARCore SDK 里的闭源二进制、不可再分发），所以镜像里没有它，
+# 入库那条路在 CI 上会回 503。这是**预期**的：E2E 只打不需要它的接口，入库那一整条的
+# 覆盖在单元测试里（`fake_arcoreimg` fixture）。
+#
+# ## 发版
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#   临时发一版：Actions → server → Run workflow，把 publish 勾上
+#
+# 第一次推完要手动做一件事：GHCR 上新建的包**默认是 private**，NAS 上
+# `docker compose pull` 会 denied。仓库右侧 Packages → photo-ar-server →
+# Package settings → Change visibility 改成 public（或者在 NAS 上 docker login）。
 # ════════════════════════════════════════════════════════════════════════
 
 name: server
 
+# 没有 paths 过滤，是刻意的。
+#
+# 加上 `paths: [src/**, ...]` 能让「只改了安卓」的提交跳过这条流水线，但一旦同时写了
+# `tags: ["v*"]`，路径过滤对 tag 推送是否生效就变成一个说不清的行为 —— 而说不清的那个
+# 分支恰好是**发版**：打完 tag 却没有任何流水线跑起来，你要过一会儿才会发现镜像没更新。
+# 这个仓库是公开的，Actions 分钟数不计费，所以用「每次都跑」换掉那个坑是划算的。
 on:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "docker/**"
-      - "Dockerfile"
-      - "docker-compose.yml"
-      - ".github/workflows/server.yml"
+    tags: ["v*"]
   pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "docker/**"
-      - "Dockerfile"
-      - "docker-compose.yml"
-      - ".github/workflows/server.yml"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "同时把镜像推到 GHCR（发版用；只想跑一遍检查就留 false）"
+        type: boolean
+        default: false
+
+env:
+  # ghcr.io/<owner>/photo-ar-server。用 repository_owner 而不是写死用户名，
+  # fork 出去的仓库不必改这个文件。
+  IMAGE: ghcr.io/${{ github.repository_owner }}/photo-ar-server
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    # 1000+ 个用例里有一批要跑真的 ORB + RANSAC，比纯逻辑测试慢；本机整套约 6 分钟。
+    # 1000+ 个用例里有一批要跑真的 ORB + RANSAC，比纯逻辑测试慢；本机整套约 6 分钟，
+    # runner 上约 10 分钟。
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -58,47 +77,69 @@ jobs:
           python-version: "3.11" # 与 Dockerfile 里的 python:3.11-slim 同版本
           cache: pip
 
-      # 依赖清单不在 requirements.txt 里，而是写在 Dockerfile 的 pip install 那一行
-      # （零依赖是这个项目的原则，运行期只要 numpy + opencv）。这里照抄那三样，
-      # 而不是新开一个清单文件 —— 两份清单迟早会不一致，而不一致的表现是「CI 绿、
-      # 镜像里缺个包」。
+      # pyproject 里是 opencv-python（**非** headless），`import cv2` 要 libGL.so.1，
+      # 而 runner 上没有。装两个系统库比改依赖轻 —— 改成 headless 会影响本机开发时
+      # 那些要弹窗看图的 bench 脚本。
+      - name: 装系统库
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      # 装 pyproject 声明的那一份，而不是照抄 Dockerfile 里的 pip 行。
+      # 「Dockerfile 那三个包够不够」由下面 image job 跑真镜像来验。
       - name: 装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy>=1.26" "opencv-python-headless>=4.9" pytest
+          pip install -e ".[dev]"
 
+      # 测试里的 arcoreimg / ffmpeg / ffprobe 全是 conftest 造的假二进制，
+      # 所以这里不需要真的装它们。
       - name: 单元测试
-        env:
-          PYTHONPATH: src
-        run: python -m pytest tests -q
+        run: pytest -q
 
   image:
     runs-on: ubuntu-latest
     needs: test
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # 只有 publish 那两步用得到，但权限是 job 级的
     steps:
       - uses: actions/checkout@v4
 
-      # 用线上那一份 Dockerfile，不另写一个「CI 专用」的。
+      - uses: docker/setup-buildx-action@v3
+
+      # 只构建 linux/amd64。目标机器是 QNAP TS-464C2（Celeron N5095，x86-64）；
+      # 加 arm64 会让构建时间翻倍（opencv 的 arm64 wheel 要走 QEMU 模拟），而现在没有
+      # 任何 arm 机器要跑它。将来真要上 arm，改这一行。
+      #
+      # `load: true` 而不是 `push: true`：先把镜像装进本地 docker 跑一遍，验过了再推。
+      # 这样**推上去的就是被测过的那一个镜像**（分两次 build 的话，推的那一份严格来说
+      # 没被跑过）。
+      #
+      # 镜像里不含 arcoreimg 和 vocab.npz：前者不可再分发，后者是你自己照片训出来的
+      # 数据。两个都在运行时 bind mount 送进容器（见 docker-compose.yml）。
       - name: 编镜像
-        run: docker build -t photo-ar-server:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: photo-ar-server:ci
+          # 层缓存存在 Actions 的缓存里：不改依赖的话，opencv 那层不会重装。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # 把它当生产环境跑：非 root、/data 是 volume、healthcheck 由镜像自己带。
       #
-      # 这一步守的是 `docker build` 覆盖不到的那一半。历史上真实发生过的两类：
-      # 非 root 用户写不了挂载进来的 /data（起来就崩），以及 healthcheck 脚本
-      # 的路径在镜像里对不上（容器永远 unhealthy，compose 一直重启它）。
-      #
-      # 不设 PHOTOAR_TOKEN 是**刻意**的：`docker/healthcheck.py` 在没配 token 时
-      # 把 401 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署
-      # 走的那条 —— 顺手把它验一遍。配了 token 的那条由那份 docstring 说明。
+      # 不设 PHOTOAR_TOKEN 是**刻意**的：`docker/healthcheck.py` 在没配 token 时把 401
+      # 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署走的那条 ——
+      # 顺手把它验一遍。
       - name: 起容器并打接口
         run: |
           set -euo pipefail
           docker volume create photoar-ci-data
           # PHOTOAR_ROOTS 是**必填**的：不给的话 entrypoint 直接拒绝启动
-          # （「必须设 PHOTOAR_ROOTS（白名单根目录）」）。这一条是照着一次本地
-          # 实跑加上的 —— 第一版这个 workflow 少了它，容器 2 秒就 unhealthy。
+          # （「必须设 PHOTOAR_ROOTS（白名单根目录）」）。这一条是照着一次本地实跑
+          # 加上的 —— 第一版这个 workflow 少了它，容器 2 秒就 unhealthy。
           # 名字用 ASCII：真实部署里是「照片=/share/Photo」这样的中文名，而在
           # CI 的 shell → docker → python 这条链上省掉一层编码变量。
           docker run -d --name photoar-ci \
@@ -137,9 +178,9 @@ jobs:
                 | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
           test -n "$tok" || { echo "::error::登录没拿到 token"; docker logs photoar-ci; exit 1; }
           curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping | tee /tmp/ping.json
-          # 用 python3 -c 而不是 heredoc：YAML 的字面块会把整段一起缩进，于是
-          # 结束标记 `PY` 前面带着空格，bash 认不出来（`<<-` 只吃 tab 不吃空格），
-          # heredoc 永不终止、这一步挂到超时。这个坑不会在本地 shell 里复现。
+          # 用 python3 -c 而不是 heredoc：YAML 的字面块会把整段一起缩进，于是结束标记
+          # `PY` 前面带着空格，bash 认不出来（`<<-` 只吃 tab 不吃空格），heredoc 永不
+          # 终止、这一步挂到超时。这个坑不会在本地 shell 里复现。
           python3 -c "import json;d=json.load(open('/tmp/ping.json'));assert d['ok'] is True,d;assert d.get('backendDegraded') is not True,d;print('ping ok:',d)"
 
           # 重启一次，验证 /data 上的东西是持久的（登录还在、库还在）。
@@ -163,3 +204,45 @@ jobs:
         run: |
           docker rm -f photoar-ci || true
           docker volume rm photoar-ci-data || true
+
+      # ---- 到这里镜像已经被起来打过接口了，才允许推出去 ----
+
+      - name: 登录 GHCR
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # 仓库自带的 token 就够，不用另配 PAT
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # 打 v1.2.3 得到 :1.2.3 和 :1.2；手动跑得到当前分支名（如 :main）。
+          # :sha-xxxxxxx 一直有，用来精确回滚到某次提交。
+          #
+          # latest 无条件更新：只有打 tag 和手动勾 publish 才会走到这里，所以
+          # 「latest = 我上次特意发布的那一版」就是准确的语义。
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable=true
+
+      # 用 docker tag + push 而不是再跑一次 build-push-action：后者会重新 build
+      # （即便全部命中缓存，产出的也是"另一次构建"），而这里要的正是**把刚刚跑过的
+      # 那个镜像**推出去。photo-ar-server:ci 就在本地 docker 里，直接改名推走。
+      - name: 推镜像
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        run: |
+          set -euo pipefail
+          echo "${{ steps.meta.outputs.tags }}" | while read -r t; do
+            [ -z "$t" ] && continue
+            echo "推 $t"
+            docker tag photo-ar-server:ci "$t"
+            docker push "$t"
+          done
