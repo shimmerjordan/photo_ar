@@ -11,9 +11,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import app.photoar.standalone.pixel.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -70,7 +70,7 @@ fun NetImage(
 
     Box(
         modifier
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RectangleShape)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
     ) {
@@ -151,7 +151,7 @@ fun Banner(text: String, tone: Tone = Tone.WARN, modifier: Modifier = Modifier) 
         modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RectangleShape)
             .background(bg)
             .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {

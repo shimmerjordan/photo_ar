@@ -8,8 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Button
+import app.photoar.standalone.pixel.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -63,11 +62,14 @@ fun ScanHomeScreen(shell: Shell) {
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.padding(horizontal = 32.dp),
         ) {
-            // 200dp：比 FAB 的 76dp 大得多，是这一屏唯一的视觉重心。圆形而不是
-            // 圆角矩形，因为它要读成「一个大按钮」而不是「一个卡片」。
+            // 200dp：比 FAB 的 76dp 大得多，是这一屏唯一的视觉重心。
+            //
+            // 原来是 `shape = CircleShape`（"要读成一个大按钮而不是一个卡片"）。
+            // 像素风里这个理由不成立：直径 200dp 的圆在像素网格上只能靠抗锯齿画出来，
+            // 而那是这套设计里唯一不能有的东西。改成正方形之后它靠**尺寸**读成重心，
+            // 不靠形状 —— 一屏里唯一一个 200dp 的方块不会被当成卡片。
             Button(
                 onClick = { ArScanActivity.start(context) },
-                shape = CircleShape,
                 modifier = Modifier.size(200.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,

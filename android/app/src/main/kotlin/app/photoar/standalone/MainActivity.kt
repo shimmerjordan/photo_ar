@@ -11,8 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -27,6 +26,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -222,6 +222,21 @@ fun AppRoot() {
                                 )
                             },
                             label = { Text(labelOf(tab)) },
+                            // 选中指示器画成透明。
+                            //
+                            // Material 3 在选中项的图标后面画一个**药丸形**的
+                            // activeIndicator，它的形状来自 `NavigationBarTokens.
+                            // ActiveIndicatorShape`（= shape token `CornerFull`），而
+                            // `CornerFull` 在 Material 内部硬编码成 `CircleShape`，
+                            // 不读 `MaterialTheme.shapes` —— 主题里没有任何旋钮能把它
+                            // 变方，`indicatorColor` 是唯一的出口。
+                            //
+                            // 去掉它不丢信息：选中态已经由图标与文字的主色表达（上面
+                            // 那个 tint，以及 selectedTextColor），而那是无障碍上更可靠
+                            // 的一层 —— 药丸只是同一件事的第二种说法。
+                            colors = NavigationBarItemDefaults.colors(
+                                indicatorColor = Color.Transparent,
+                            ),
                         )
                     }
                 }
@@ -363,7 +378,7 @@ private fun ViaChip(resolution: Resolution?, onClick: () -> Unit) {
     Box(
         Modifier
             .padding(end = 8.dp)
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RectangleShape)
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 5.dp),
