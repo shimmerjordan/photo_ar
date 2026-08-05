@@ -7,19 +7,19 @@ dist/
 .venv/
 venv/
 tools/arcoreimg
+
+# opencv 的原件（13.3MB）。它只在重跑 `npm run wasm:split` 时用得到，而它是**原封不动
+# 的第三方下载** —— URL 与 sha256 记在 web-front/public/vendor/README.md 里，等于一条
+# 锁文件记录。让每个 clone 都背 13.3MB 换"离线也能重跑那个脚本"，不划算。
+web-front/public/vendor/opencv.orig.js
 data/
 deploy/config.json
 
-# Android（build/ 已在上面覆盖，Gradle 名字就叫 build）
-.gradle/
-local.properties
-*.apk
-*.aab
-captures/
-.cxx/
-# 内置 ARCore 运行时的下载缓存。上面的 *.apk 其实已经盖住了里面的文件，
-# 这一行是为了写清意图：72 MiB 的二进制永远不进版本库，构建时按 sha256 取。
-android/.arcore/
+# 安卓客户端已于 2026-08-05 下线（只做网页版），那一整套 Gradle 的忽略项
+# 跟着一起删了。要翻旧代码去 git 历史里找 `android/`。
+
+# node_modules 不该出现（web-front 是零依赖的），但装过一次工具就会有
+node_modules/
 
 # superpowers 的 spec/plan 是过程产物，留在本地不进仓库
 docs/superpowers/

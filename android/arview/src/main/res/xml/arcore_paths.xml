@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- 只开放 cache/ar/ 这一个目录：老式安装要把内置的 ARCore 运行时交给系统安装器，
-     那是唯一需要对外可读的东西。写成 <cache-path path="."> 就等于把整个 cache
-     目录（缩略图、ExoPlayer 的分片）都暴露给任何拿到 URI 的应用。
-     name/path 与 ArCoreInstaller.STAGE_DIR 一致。 -->
-<paths>
-    <cache-path name="arcore" path="ar/" />
-</paths>
