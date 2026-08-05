@@ -87,9 +87,40 @@ async function onInit(msg) {
 }
 
 function onFrame(msg) {
-  if (!pipeline) return // 还没 init 完，丢掉——补齐它没有意义，那一帧早过时了
+  if (!pipeline) {
+    // 还没 init 完，丢掉 —— 补齐它没有意义，那一帧早过时了。
+    // 但 bitmap **必须 close**：它持有 GPU 内存，丢引用不等于释放。
+    msg.bitmap?.close()
+    return
+  }
+  // 被顶掉的那一帧同理。跟踪 46ms 而送帧更快时这条每秒都在发生 ——
+  // 漏一个 close 就是每秒泄漏一张 1280×960 的纹理。
+  pending?.bitmap?.close()
   pending = msg
   drain()
+}
+
+/**
+ * `ImageBitmap` → `ImageData`，**在 worker 线程上**。
+ *
+ * 这一段就是从主线程搬过来的那 65ms（真机实测 1280×960；搬到这边之后主线程只付
+ * `createImageBitmap` 的 19.4ms）。`drawImage(bmp, 0, 0, w, h)` 与主线程那条
+ * `grab()` 是**逐字节同一条路** —— 缩放算法不能换，理由写在 `camera.js` 的
+ * `grabBitmap()` 上面。
+ *
+ * OffscreenCanvas 复用一张：每帧新建会让 GPU 侧不停分配纹理。
+ */
+let offscreen = null
+let offctx = null
+function imageDataFromBitmap(bmp, w, h) {
+  if (!offscreen || offscreen.width !== w || offscreen.height !== h) {
+    offscreen = new OffscreenCanvas(w, h)
+    offctx = offscreen.getContext('2d', { willReadFrequently: true, alpha: false })
+  }
+  offctx.drawImage(bmp, 0, 0, w, h)
+  // **必须 close()**：ImageBitmap 持有 GPU 内存，不关就是真的泄漏。
+  bmp.close()
+  return offctx.getImageData(0, 0, w, h)
 }
 
 function drain() {
@@ -98,9 +129,14 @@ function drain() {
   pending = null
   busy = true
   try {
-    const imageData = { width: msg.width, height: msg.height, data: new Uint8ClampedArray(msg.buf) }
+    const imageData = msg.bitmap
+      ? imageDataFromBitmap(msg.bitmap, msg.width, msg.height)
+      : { width: msg.width, height: msg.height, data: new Uint8ClampedArray(msg.buf) }
     const out = pipeline.push(imageData)
-    self.postMessage({ type: 'result', id: msg.id, ...out })
+    // `grabbedAt` 原样带回。主线程的延迟补偿要知道"这个结果测的是多久之前的画面"，
+    // 而那**不等于** `now - ms`：帧可能在 `pending` 里排过队（跟踪 44ms > 送帧
+    // 间隔 33ms 时必然发生），排队那一段不在 ms 里。
+    self.postMessage({ type: 'result', id: msg.id, grabbedAt: msg.grabbedAt, ...out })
   } catch (e) {
     self.postMessage({ type: 'error', message: `识别失败：${e?.message ?? e}`, stack: `${e?.stack ?? ''}`.slice(0, 1500) })
   } finally {
