@@ -333,6 +333,42 @@ describe('反代', () => {
 })
 
 describe('/api/config', () => {
+  test('带版本号 —— 设置页那个「连按进调试模式」的行要显示它', async () => {
+    const r = await fetch(url('/api/config'))
+    assert.equal(r.status, 200)
+    const body = await r.json()
+    assert.equal(typeof body.version, 'string')
+    assert.ok(body.version.length > 0, '版本号不能是空串')
+    // 没注入 PHOTOAR_VERSION 时退回 package.json 的版本 + `-dev`。那个后缀是有用的：
+    // 它区分「从镜像跑的」和「本地 node server/index.js 跑的」，而这两者的行为差别
+    // （有没有预压的 .br、public/ 是不是镜像里那一份）正是排查时第一个要问的。
+    assert.match(body.version, /-dev$/)
+  })
+
+  test('注入 PHOTOAR_VERSION 时用注入的那个', async () => {
+    const { spawn: sp } = await import('node:child_process')
+    const child = sp(process.execPath, [join(HERE, '../server/index.js')], {
+      env: { ...process.env, PORT: '0', HOST: '127.0.0.1', PHOTOAR_VERSION: 'v9.9.9-abc1234',
+             PHOTOAR_UPSTREAM: `http://127.0.0.1:${upstreamPort}`, PHOTOAR_LIBRARY: LIB_DIR },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    try {
+      const port = await new Promise((res, rej) => {
+        let out = ''
+        child.stdout.on('data', (d) => {
+          out += d
+          const m = /http:\/\/127\.0\.0\.1:(\d+)/.exec(out)
+          if (m) res(Number(m[1]))
+        })
+        setTimeout(() => rej(new Error('10 秒内没报出端口')), 10_000)
+      })
+      const body = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json()
+      assert.equal(body.version, 'v9.9.9-abc1234')
+    } finally {
+      child.kill('SIGKILL')
+    }
+  })
+
   test('拿不到 admin 配置时返回空阈值，而不是失败', async () => {
     fake.configStatus = 403
     const r = await fetch(url('/api/config'))

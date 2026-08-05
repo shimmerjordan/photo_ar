@@ -42,7 +42,7 @@ els.boot?.prepend(bootSprite)
 const bootText = document.createElement('span')
 els.boot?.append(bootText)
 
-const state = { me: null, worker: null, libInfo: null, shell: null }
+const state = { me: null, worker: null, libInfo: null, shell: null, webCfg: {} }
 
 initDiag()
 
@@ -153,6 +153,7 @@ async function boot() {
   try {
     cfg = await api.webConfig()
   } catch { /* 拿不到就用 consts.js 的源码默认阈值 */ }
+  state.webCfg = cfg
 
   let libBuf
   try {
@@ -265,6 +266,7 @@ function mountShell() {
       me: () => state.me,
       isAdmin,
       libInfo: () => state.libInfo,
+      webCfg: () => state.webCfg,
       worker: state.worker,
       toast,
       bindDiagToggle: (el) => bindToggle(el),

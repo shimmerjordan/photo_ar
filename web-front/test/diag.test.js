@@ -7,6 +7,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { DiagLog, MEDIA_ERR, NETWORK_STATE, READY_STATE, short } from '../public/diag.js'
 
 test('同模板的行按数字聚合成一条，并给出范围', () => {
@@ -94,4 +95,30 @@ test('short() 不泄露完整 URL —— 这块日志是要被发出去的', () 
   assert.ok(s.includes('media'), '末段要留着，否则看不出是哪个接口')
   assert.equal(short(''), '(空)')
   assert.equal(short(null), '(空)')
+})
+
+// ── 调试模式的两条守卫 ──────────────────────────────────────────────
+//
+// `diag.js` 里那套开关要碰 DOM 与 localStorage，所以这里不 import 它的
+// enable/disable（node 里没有 document），只**读源码**验两条约定。笨，但它守的是
+// 两件在浏览器里出错时完全不响的事，而写一套 DOM stub 的成本远高于收益。
+test('bindToggle 只能关调试模式，不能开', async () => {
+  const src = await readFile(new URL('../public/diag.js', import.meta.url), 'utf8')
+  const body = src.slice(src.indexOf('export function bindToggle'))
+  const fn = body.slice(0, body.indexOf('\n}'))
+  // 早退：没开着就什么都不做。少了它，宾客在扫描页那条读数上手快点三下就掉进调试模式，
+  // 看到一屏内点数和毫秒数。
+  assert.match(fn, /if \(!enabled\) return/, 'bindToggle 必须先判 enabled 再数点击')
+  assert.match(fn, /disable\(\)/, 'bindToggle 该能关')
+  assert.ok(!/\benable\(\)/.test(fn), 'bindToggle 不能开 —— 入口只有设置页连按版本号')
+})
+
+test('调试模式的开关状态要存起来（否则刷新一次就白解锁了）', async () => {
+  const src = await readFile(new URL('../public/diag.js', import.meta.url), 'utf8')
+  // 用法是"打开它，然后再复现一次问题"，而复现往往就要刷新。
+  assert.match(src, /localStorage/, '调试模式必须持久化')
+  assert.match(src, /photoar\.debug/, '键名固定，别改')
+  // 隐私模式下 localStorage 会抛。抛了只该退化成"只在本次会话有效"，不能崩。
+  const save = src.slice(src.indexOf('function saveDebugFlag'))
+  assert.match(save.slice(0, save.indexOf('\n}')), /catch/, '存不进去不能抛出去')
 })

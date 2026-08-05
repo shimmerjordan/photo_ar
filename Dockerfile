@@ -90,6 +90,12 @@ RUN chmod +x ./tools/arcoreimg 2>/dev/null || true
 
 # ---- 网页版 ----
 #
+# 版本号注入。CI 填 tag 或短 sha（`--build-arg PHOTOAR_VERSION=...`）；不填的话
+# 网页版会退回 package.json 里那个 + `-dev`，而那正好区分"从镜像跑的"和"本地跑的"。
+# 它显示在设置页「关于」那一节，也是那个"连按 7 下进调试模式"的行。
+ARG PHOTOAR_VERSION=
+ENV PHOTOAR_VERSION=$PHOTOAR_VERSION
+
 # Node 就一个二进制（约 120MB）。没有 npm、没有 corepack、没有 node_modules ——
 # web-front 是零依赖的，那些一个都用不上，少拷一样就少一样要跟着升级的东西。
 COPY --from=nodert /usr/local/bin/node /usr/local/bin/node

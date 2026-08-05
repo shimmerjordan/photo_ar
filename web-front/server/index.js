@@ -56,6 +56,26 @@ import { extname, join, normalize, resolve } from 'node:path'
 import { Library } from './library.js'
 
 const PUBLIC = resolve(import.meta.dirname, '../public')
+
+/**
+ * 版本号。**给设置页那个"连按进调试模式"的行用的**，顺带让"线上跑的是哪一版"变成
+ * 一句能看的话。
+ *
+ * `PHOTOAR_VERSION` 由镜像构建时注入（Dockerfile 的 ARG → ENV，CI 填 tag 或短 sha）。
+ * 没注入就退回 package.json 里那个 + `-dev` —— 那正好区分"从镜像跑的"和"本地
+ * `node server/index.js` 跑的"，而这两者的行为差别（有没有预压的 .br、public/ 是不是
+ * 镜像里那一份）恰恰是排查时第一个要问的。
+ */
+const VERSION = (() => {
+  const injected = (process.env.PHOTOAR_VERSION ?? '').trim()
+  if (injected) return injected
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf8'))
+    return `${pkg.version}-dev`
+  } catch {
+    return 'unknown'
+  }
+})()
 // 默认值与后端的 `DEFAULT_PORT` 是同一个数：合并之后这两个进程对外只有一个端口，
 // 而它归这个进程管（容器里由 entrypoint 显式设 PORT，这个默认值是给
 // `npm start` 那种单独跑的用法的）。
@@ -358,7 +378,7 @@ async function serveConfig(req, res) {
   } catch {
     /* 访客拿不到 admin 配置是正常的，用源码默认值 */
   }
-  json(res, 200, { thresholds, upstream: UPSTREAM.origin, isolation: ISOLATION })
+  json(res, 200, { thresholds, version: VERSION, upstream: UPSTREAM.origin, isolation: ISOLATION })
 }
 
 // ── /api/lib ──────────────────────────────────────────────────────────
@@ -669,6 +689,7 @@ server.listen(PORT, HOST, () => {
   console.log(`[web-front] 上游 ${UPSTREAM.origin}`)
   console.log(`[web-front] 识别库 ${LIB_DIR}`)
   console.log(`[web-front] 跨源隔离 ${ISOLATION ? '开（wasm 线程可用）' : '关'}`)
+  console.log(`[web-front] 版本 ${VERSION}`)
 })
 
 // 收到 SIGTERM 就停止接新连接并让在飞的请求跑完。容器编排靠它做优雅重启 ——

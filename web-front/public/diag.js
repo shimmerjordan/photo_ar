@@ -8,7 +8,7 @@
  *
  * 三件事刻意做成这样：
  *
- * - **默认关**，`?diag=1` 或连点底部信息三次打开。开着的时候才拼字符串
+ * - **默认关**，`?diag=1` 或「设置 → 关于 → 连按版本号 7 下」打开。开着的时候才拼字符串
  *   （`log()` 在关闭时直接 return），因为打点密度是每帧一次。
  * - **有"复制"按钮**。这块日志的用途就是被发出来给人看，而手机上选中一段等宽小字
  *   几乎不可能。
@@ -123,9 +123,34 @@ let panel = null
 let pre = null
 let dirty = false
 
-/** `?diag=1` 直接开。否则等 `bindToggle` 的三连击。 */
+/**
+ * 调试模式**要能跨刷新活着**，所以状态存 localStorage。
+ *
+ * 以前它只是个内存变量：刷新一次就关了。而调试模式的用法恰恰是"打开它，然后再复现
+ * 一次问题" —— 复现往往就要刷新，于是每次都得重新连按一遍。
+ *
+ * 存储失败（隐私模式）不算错误：那时它退化成"只在这一次会话里有效"，也就是以前的行为。
+ */
+const DEBUG_KEY = 'photoar.debug'
+
+function loadDebugFlag() {
+  if (new URLSearchParams(location.search).get('diag') === '1') return true
+  try {
+    return localStorage.getItem(DEBUG_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function saveDebugFlag(on) {
+  try {
+    on ? localStorage.setItem(DEBUG_KEY, '1') : localStorage.removeItem(DEBUG_KEY)
+  } catch { /* 隐私模式：只在本次会话里有效 */ }
+}
+
+/** `?diag=1` 或上次开着就直接开。否则等连按解锁。 */
 export function initDiag() {
-  if (new URLSearchParams(location.search).get('diag') === '1') enable()
+  if (loadDebugFlag()) enable()
   installGlobalHooks()
   return { log, enable, disable, isEnabled: () => enabled, diag }
 }
@@ -163,32 +188,60 @@ export function pendingErrorCount() {
 function enable() {
   enabled = true
   pendingErrors = 0
+  saveDebugFlag(true)
   if (!panel) buildPanel()
   panel.hidden = false
   render()
+  for (const fn of watchers) fn(true)
 }
 
 function disable() {
   enabled = false
+  saveDebugFlag(false)
   if (panel) panel.hidden = true
+  for (const fn of watchers) fn(false)
 }
 
-/** 给设置页用的明面开关（连点三次那条路仍然保留 —— 它在扫描页上更顺手）。 */
+/**
+ * 调试模式开关的订阅者。
+ *
+ * 扫描页那条元信息要按模式换内容（非调试模式下只说人话，见 `pages/scan.js` 的
+ * `meta()`），而它是每帧重绘的，所以其实不需要订阅。真正需要的是**设置页** ——
+ * 在那一页连按解锁时，页面上的按钮要立刻跟着变，否则用户不知道解锁成功了。
+ */
+const watchers = new Set()
+export function onDebugChange(fn) {
+  watchers.add(fn)
+  return () => watchers.delete(fn)
+}
+
+/** 调试模式开着没开着。名字保留 `isDiagEnabled` —— 调用点不少，而它就是同一件事。 */
 export const isDiagEnabled = () => enabled
 export function setDiagEnabled(on) {
   on ? enable() : disable()
 }
 
-/** 连点某个元素三次开/关。用三连击而不是长按：长按在相机页面上会和系统手势打架。 */
+/**
+ * 连点某个元素三次**关掉**调试模式。用三连击而不是长按：长按在相机页面上会和系统
+ * 手势打架。
+ *
+ * ⚠️ 它只能关、不能开。进调试模式的唯一入口是**设置页里连按版本号**
+ * （`pages/settings.js`）—— 那是个明确的、要找一下才找得到的动作。
+ *
+ * 以前这里是"没开就开、开了就关"，而它绑在扫描页那条元信息上：宾客在那条字上手快点
+ * 三下就掉进调试模式，看到一屏内点数和毫秒数。反过来"开着的时候能就地关掉"是真需求
+ * （调试时手机就在手上，跑回设置页很烦），所以留下关的那一半。
+ */
 export function bindToggle(el) {
   let hits = []
   el.addEventListener('click', () => {
+    if (!enabled) return
     const now = Date.now()
     hits = hits.filter((t) => now - t < 900)
     hits.push(now)
     if (hits.length >= 3) {
       hits = []
-      enabled ? disable() : enable()
+      disable()
     }
   })
 }
