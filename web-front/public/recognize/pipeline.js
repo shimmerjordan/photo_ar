@@ -36,6 +36,7 @@ import { OrbExtractor, opencv } from './orb.js'
 import { candidateDocs } from './library.js'
 import { thresholds } from './consts.js'
 import { decideWith, normalizedQuad, ransacPair, verifyPair } from './verify.js'
+import { Streak } from './streak.js'
 
 export const SCANNING = 'scanning'
 export const LOCKED = 'locked'
@@ -134,6 +135,8 @@ export class Pipeline {
     this.state = SCANNING
     this.locked = null      // {photoId, doc, quad, inliers}
     this.misses = 0
+    /** 跨帧证据累积。修的是「内点 30~38 打不过门槛 40」，见 `streak.js`。 */
+    this.streak = new Streak()
     this.stats = { detects: 0, tracks: 0, lastDetectMs: 0, lastTrackMs: 0 }
 
     // 跟踪状态。gray 是**上一帧**的灰度图，光流要用它。
@@ -165,6 +168,7 @@ export class Pipeline {
 
   /** 强制回到检测。用户点"重新扫描"、或者上层判断该放手时调。 */
   reset() {
+    this.streak?.reset()
     this.state = SCANNING
     this.locked = null
     this.misses = 0
@@ -196,11 +200,33 @@ export class Pipeline {
         results.push(r)
       }
       const decision = decideWith(results, thresholds)
+      let top = decision.top
+      let reason = 'ok'
       if (!decision.matched) {
-        return { quad: null, reason: decision.reason, inliers: decision.inliers }
+        // 单帧没过。**交给跨帧累积再看一眼** —— 真机实测内点分布中位 30、最大 38，
+        // 而门槛是 40，单帧判定在这种视角下永远过不了（那组数字在 `streak.js` 里）。
+        this.streak.configure({
+          softMin: thresholds.streakSoftMin,
+          need: thresholds.streakNeed,
+        })
+        const got = this.streak.offer(results, performance.now(), [thresholds.detMin, thresholds.detMax])
+        if (!got) {
+          const p = this.streak.progress
+          return {
+            quad: null,
+            reason: decision.reason,
+            inliers: decision.inliers,
+            // 攒到第几帧了。诊断日志靠它区分「完全没看到」和「正在攒」——
+            // 后者是「再举稳一会儿就好了」，而那句话值得说给用户听。
+            streak: p.n > 0 ? p : undefined,
+          }
+        }
+        top = got.top
+        reason = 'streak'
+      } else {
+        // 单帧命中了：链要清掉。不清的话下一次未命中会接着一条属于上一次的链。
+        this.streak.reset()
       }
-
-      const top = decision.top
       const photo = this.lib.photos[top.doc]
       // 参考侧高度：从照片的宽高比反推。库里存的 pts 在 640 长边的空间里，而那张图
       // 的短边是多少只有 aspect 知道。aspect 缺失时退回 3:2（最常见的相纸比例）——
@@ -216,7 +242,7 @@ export class Pipeline {
       this.misses = 0
       const meta = photoMeta(photo)
       this.locked = { photoId: photo.id, doc: top.doc, inliers: top.inliers, photo: meta, quad }
-      return { quad, photoId: photo.id, inliers: top.inliers, reason: 'ok', photo: meta, fresh: true }
+      return { quad, photoId: photo.id, inliers: top.inliers, reason, photo: meta, fresh: true }
     } finally {
       src.delete()
     }

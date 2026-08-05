@@ -50,6 +50,9 @@ export const thresholds = {
   detMin: 0.05,
   detMax: 20.0,
   topK: 20,
+  // 跨帧累积那两个（见 `streak.js`）。与服务端 `streak.py` 的常量同一组数。
+  streakNeed: 3,
+  streakSoftMin: 30,
 }
 
 /** RANSAC。**不可配** —— 服务端也没把它做成热配置，两侧必须完全一样。 */
@@ -75,7 +78,7 @@ export const MIN_MATCHES_FOR_HOMOGRAPHY = 4
  */
 export function applyServerConfig(cfg) {
   if (!cfg || typeof cfg !== 'object') return thresholds
-  for (const k of ['minInliers', 'ratio', 'detMin', 'detMax', 'topK']) {
+  for (const k of ['minInliers', 'ratio', 'detMin', 'detMax', 'topK', 'streakNeed', 'streakSoftMin']) {
     const v = cfg[k]
     if (typeof v === 'number' && Number.isFinite(v)) thresholds[k] = v
   }
