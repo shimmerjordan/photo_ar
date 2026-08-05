@@ -45,10 +45,28 @@ function startUpstream() {
       }
       if (req.url === '/v1/admin/config') {
         res.writeHead(fake.configStatus, { 'Content-Type': 'application/json' })
+        // ⚠️ **这是真服务端实际返回的形状**，从跑着的容器上抄下来的：
+        // `{fields: [{key, kind, value, default, label, help, …}], values: {键: 值}}`。
+        //
+        // 上一版这个假上游返回的是 `{'recog.min_inliers': {value: 44}}` —— 一个真服务端
+        // **从来没有产出过**的形状。于是 `/api/config` 那条转换代码按那个形状写，测试
+        // 当然通过，而线上一个值都没取到：管理台上那三个识别参数对网页版完全无效，
+        // 改了没有任何反应。这就是"假的太假"能掩盖的那一类 bug —— 它不是漏了一条断言，
+        // 是断言在一个不存在的世界里。
+        const vals = {
+          'recog.backend': 'orb',
+          'recog.min_inliers': 44,
+          'recog.ratio': 1.6,
+          'recog.top_k': 12,
+          'recog.streak_need': 3,
+          'recog.streak_soft_min': 30,
+        }
         return res.end(JSON.stringify({
-          'recog.min_inliers': { value: 44 },
-          'recog.ratio': { value: 1.6 },
-          'recog.top_k': { value: 12 },
+          fields: Object.entries(vals).map(([key, value]) => ({
+            key, value, default: value, kind: typeof value === 'number' ? 'int' : 'enum',
+            label: key, help: '', needsRestart: false,
+          })),
+          values: vals,
         }))
       }
       if (req.url?.startsWith('/v1/photo/') && req.url.endsWith('/media')) {
@@ -385,6 +403,22 @@ describe('/api/config', () => {
     assert.equal(thresholds.minInliers, 44)
     assert.equal(thresholds.ratio, 1.6)
     assert.equal(thresholds.topK, 12)
+    // 跨帧累积那两个也要过来 —— 浏览器的累积规则用的是服务端同一份数字，
+    // 不然会出现"服务端调了、网页没跟上"。
+    assert.equal(thresholds.streakNeed, 3)
+    assert.equal(thresholds.streakSoftMin, 30)
+    fake.configStatus = 403
+  })
+
+  test('非数值的字段不往下传（backend 是字符串，浏览器那边只认数）', async () => {
+    fake.configStatus = 200
+    const { thresholds } = await (await fetch(url('/api/config'))).json()
+    // 假上游里有 `recog.backend: 'orb'`。它不该混进 thresholds ——
+    // `consts.applyServerConfig` 只认有限个数值键，混进字符串会被静默忽略，
+    // 而"静默忽略"意味着将来真加一个字符串型阈值时不会有人发现。
+    for (const [k, v] of Object.entries(thresholds)) {
+      assert.equal(typeof v, 'number', `${k} 不是数字：${v}`)
+    }
     fake.configStatus = 403
   })
 })

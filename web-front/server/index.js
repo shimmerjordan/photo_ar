@@ -364,16 +364,7 @@ async function serveConfig(req, res) {
   try {
     const up = await fetchUpstream('/v1/admin/config', req)
     if (up.status === 200) {
-      const cfg = JSON.parse(up.body.toString('utf8'))
-      const pick = (k) => (typeof cfg[k]?.value === 'number' ? cfg[k].value : cfg[k])
-      thresholds = {
-        minInliers: pick('recog.min_inliers'),
-        ratio: pick('recog.ratio'),
-        topK: pick('recog.top_k'),
-      }
-      for (const k of Object.keys(thresholds)) {
-        if (typeof thresholds[k] !== 'number' || !Number.isFinite(thresholds[k])) delete thresholds[k]
-      }
+      thresholds = pickThresholds(JSON.parse(up.body.toString('utf8')))
     }
   } catch {
     /* 访客拿不到 admin 配置是正常的，用源码默认值 */
@@ -655,6 +646,46 @@ function fetchUpstream(path, req) {
     r.on('error', reject)
     r.end()
   })
+}
+
+/**
+ * 从 `/v1/admin/config` 的响应里挑出浏览器要用的那几个阈值。
+ *
+ * ## 这里曾经**一个值都没取到**，而且完全无声
+ *
+ * 上一版写的是 `cfg['recog.min_inliers']?.value`，也就是假设响应是一个以配置键为键的
+ * 对象。而服务端返回的是 `{fields: [{key, value, label, help, …}], values: {键: 值}}`
+ * —— 两层都不是那个形状。于是每一个 `pick()` 都是 undefined，`thresholds` 被清成
+ * 空对象，浏览器**一直在用 `consts.js` 里的源码默认值**。
+ *
+ * 后果不是"少了个功能"：管理台上那三个识别参数（内点门槛、比值、Top-K）**对网页版
+ * 完全无效**，改了没有任何反应；而设置页那一节还标着"服务端热配置"，显示的却是源码
+ * 默认值。这个 bug 没有任何症状能把人指向这里 —— 它只是让一个旋钮变成装饰。
+ *
+ * 所以现在**两种形状都吃**，并且哪个都拿不到时留空（让浏览器用源码默认值）。
+ * 读 `values` 优先：它就是为这种用途给的扁平映射。
+ */
+function pickThresholds(cfg) {
+  const flat = cfg?.values && typeof cfg.values === 'object' ? cfg.values : null
+  const byKey = Object.create(null)
+  if (Array.isArray(cfg?.fields)) {
+    for (const f of cfg.fields) if (f?.key) byKey[f.key] = f.value
+  }
+  const pick = (k) => {
+    const v = flat && k in flat ? flat[k] : byKey[k]
+    return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+  }
+  const out = {
+    minInliers: pick('recog.min_inliers'),
+    ratio: pick('recog.ratio'),
+    topK: pick('recog.top_k'),
+    // 跨帧累积那两个。服务端 §35 就是按它们做的，浏览器这条管线现在也用同一份数字 ——
+    // 两边都从这一个地方取，就不会出现"服务端调了、网页没跟上"。
+    streakNeed: pick('recog.streak_need'),
+    streakSoftMin: pick('recog.streak_soft_min'),
+  }
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k]
+  return out
 }
 
 function json(res, status, body) {
