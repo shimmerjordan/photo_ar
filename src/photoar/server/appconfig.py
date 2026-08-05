@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .. import backend as recog_backend
-from .. import quality, recognizer, synth, verify
+from .. import quality, recognizer, streak, synth, verify
 from . import auth, db, framedump
 
 # 进程内缓存的默认 TTL（秒）。
@@ -141,6 +141,38 @@ FIELDS: tuple[Field, ...] = (
             f"默认 {recognizer.TOP_K}。词汇树粗排取前 N 个候选送去做几何校验。"
             "调大提高召回但每次识别要多跑几次 RANSAC（延迟线性增长）；"
             "调小会让「排在第 21 名的正确答案」永久漏检。"
+        ),
+    ),
+    Field(
+        key="recog.streak_need",
+        kind=KIND_INT,
+        default=streak.STREAK_NEED,
+        minimum=0,
+        maximum=20,
+        label="累积命中所需的连续帧数",
+        help=(
+            f"默认 {streak.STREAK_NEED}。连续这么多帧的第一名都是同一张照片时，即使每一帧都"
+            f"没到「命中所需最少内点数」，也判命中（依据：真机日志里 11.3% 的未命中"
+            "其实是「看到了、就差几分」，而那些帧的第一名比第二名高 3 倍以上）。"
+            "**填 0 等于关掉这条路**，回到纯单帧判定。"
+            "⚠️ 这条路会放行单帧门槛本来挡住的一段（真实误识别的内点数最大到 39），"
+            "挡不住「稳定误配到同一张」那一类 —— 代价没量过，"
+            "要量就查历史里 reason 为 streak 的那些记录。详见 streak.py 的注释。"
+        ),
+    ),
+    Field(
+        key="recog.streak_soft_min",
+        kind=KIND_INT,
+        default=streak.STREAK_SOFT_MIN_INLIERS,
+        minimum=1,
+        maximum=500,
+        label="参与累积的最少内点数",
+        help=(
+            f"默认 {streak.STREAK_SOFT_MIN_INLIERS}。低于它的那一帧算「没看清」而不是"
+            "「差一点」，不但不算证据，还会把已经攒起来的连续帧打断 —— 不打断的话"
+            "「举着手机晃过去偶尔扫到」也会被攒成一次命中。"
+            "调低会让更多帧参与累积（更容易命中，也更容易误识别），"
+            "调到「命中所需最少内点数」以上等于关掉这条路。"
         ),
     ),
     Field(

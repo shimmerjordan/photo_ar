@@ -86,6 +86,87 @@ def _scene(scene: Path | None, w: int, h: int) -> np.ndarray:
     return cv2.resize(bg, (w, h), interpolation=cv2.INTER_AREA)
 
 
+#: 遮挡角的固定顺序：左上、右上、左下、右下。
+#:
+#: 必须是**确定**的，否则「遮 2 个角」在两次运行之间不是同一个实验，而这一列的数字
+#: 是要拿去定阈值的。上面两角排在前面：单手拿照片时拇指压在上缘、双手拿时两个拇指
+#: 压住上面两角，这是用户描述的持握方式里最常见的两种。
+CORNER_ORDER = ("tl", "tr", "bl", "br")
+
+#: 遮挡块的羽化带宽，占块边长的比例。
+#:
+#: **不能是 0**。纯色硬边块与照片的交界会变成整幅图最强的对比边，ORB 会在那四条边上
+#: 找到一堆**新**角点 —— 那样量出来的就不是「手指挡掉了特征」而是「手指换掉了特征」，
+#: 两者对识别的影响方向完全不同（后者还会污染词袋）。真手指是软边、没有高频纹理，
+#: 只删信息不加信息。`tests/test_simcam_occlude.py` 里有一条测试盯着这件事。
+OCCLUDE_FEATHER = 0.35
+
+#: 遮挡阶梯的默认档位（每个角遮掉照片面积的比例）。
+#:
+#: 量纲：一个指尖压在六寸照片（152×102mm）的角上覆盖约 15×15mm，占照片面积约 1.5%；
+#: 两根手指约 3%。所以 0.02 是「轻轻捏着」，0.05 是「抓得比较满」，0.10 已经偏重 ——
+#: 留着 0.10 是因为它能看出曲线的斜率，而斜率决定「值不值得为遮挡专门做补偿」。
+DEFAULT_OCCLUDES = (0.0, 0.02, 0.05, 0.10)
+
+
+def occlusion_side(w: int, h: int, area_frac: float) -> int:
+    """每个遮挡块的边长（正方形）。
+
+    按**面积**开方，不是按宽度取比例 —— 后者会让实际遮挡面积差一个数量级，而表格里
+    那一列会显得「遮挡几乎没影响」，然后得出一个完全错误的结论。
+    """
+    return round((area_frac * w * h) ** 0.5)
+
+
+def _blot(frame: np.ndarray, x: int, y: int, side: int) -> None:
+    """把 (x, y) 起 side 见方的那块抹平，软边。
+
+    填的是**这块区域自己的均值颜色**，不是肤色也不是灰色：均值只删信息（把这一小块
+    的高频抹掉），而任何外来颜色都会在交界处引入原图没有的对比。实验要孤立的变量是
+    「特征少了多少」，多引入一个变量就白做。
+    """
+    roi = frame[y : y + side, x : x + side]
+    if roi.size == 0:
+        return
+    color = roi.reshape(-1, roi.shape[-1]).mean(axis=0)
+    pad = max(1, round(side * OCCLUDE_FEATHER))
+    yy, xx = np.mgrid[0:side, 0:side]
+    # 到四条边的最短距离 → 边缘 0、内部 1 的线性斜坡
+    dist = np.minimum.reduce([xx, yy, side - 1 - xx, side - 1 - yy]).astype(np.float32)
+    a = np.clip(dist / pad, 0.0, 1.0)[..., None]
+    frame[y : y + side, x : x + side] = (roi * (1.0 - a) + color * a).astype(frame.dtype)
+
+
+def occlude_corners(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    area_frac: float,
+    corners: int,
+) -> None:
+    """在照片矩形的角上抹掉几块，模拟手指遮挡。**原地改 [frame]。**
+
+    这是 bench 里唯一一个模拟遮挡的地方，而遮挡是用户报的头号现象（「手指会遮挡四角，
+    就无法识别」）—— 在此之前整个 bench 里没有这个变量，那张「全过的最小占比」表因此
+    系统性偏乐观：它量的是「照片完整可见时最远能站多远」，而真机上照片从来不是完整
+    可见的。
+
+    @param rect 照片在帧里的位置 `(x0, y0, w, h)`。遮挡只落在这个矩形**之内** ——
+        手指压在照片上，不是压在桌面上。
+    @param area_frac 每个被遮的角吃掉照片面积的比例。0 = 不遮（对照组）。
+    @param corners 遮几个角，顺序见 [CORNER_ORDER]。0 = 不遮。
+    """
+    if area_frac <= 0.0 or corners <= 0:
+        return
+    x0, y0, w, h = rect
+    side = min(occlusion_side(w, h, area_frac), w, h)
+    if side <= 0:
+        return
+    for name in CORNER_ORDER[: min(corners, len(CORNER_ORDER))]:
+        cx = x0 if name in ("tl", "bl") else x0 + w - side
+        cy = y0 if name in ("tl", "tr") else y0 + h - side
+        _blot(frame, cx, cy, side)
+
+
 def make_frame(
     ref_bgr: np.ndarray,
     fill: float,
@@ -94,6 +175,8 @@ def make_frame(
     scene: Path | None,
     crop: float = 1.0,
     frame_long_edge: int = FRAME_LONG_EDGE,
+    occlude: float = 0.0,
+    occlude_corners_n: int = 4,
 ) -> np.ndarray:
     """造一帧"手机在某个取景距离上拍这张照片"的查询帧。"""
     # 1) 视角/光照扰动：复用 synth 的同一套参数分布，这样与 Phase 0 的数字可比
@@ -114,6 +197,11 @@ def make_frame(
     x0 = (cw - tw) // 2
     y0 = (ch - th) // 2
     frame[y0 : y0 + th, x0 : x0 + tw] = photo
+
+    # 2.5) 手指遮挡。位置**必须**在这里：贴进画面之后（手指压在照片上，要用照片在帧
+    #      里的实际矩形定位），模糊之前（真机上手指和照片一起被相机成像，所以遮挡的
+    #      边缘也要吃到同一份传感器模糊 —— 加在模糊之后会留下比真机锐利得多的边）。
+    occlude_corners(frame, (x0, y0, tw, th), occlude, occlude_corners_n)
 
     # 3) 传感器端的模糊：加在整帧上、缩放之前 —— 这是与 synth 最关键的差别
     rng = np.random.default_rng(seed)
@@ -172,7 +260,11 @@ def main(argv: list[str]) -> int:
                     help="背景图（真实拍摄的桌面最有说服力）；不给则用中性灰")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--repeat", type=int, default=3,
-                    help="每个占比造几帧（换 seed），看的是分布不是单点")
+                    help="每个占比造几帧（换 seed），看的是分布不是单点。"
+                         "⚠️ **默认 3 次不足以支撑「全过」这个结论** —— 它只抽 3 个视角，"
+                         "而 inliers 在同一占比下的跨度能到 4 倍（39~150）。"
+                         "要拿数字去定阈值就给 20 以上，理由见 bench/README.md 里"
+                         "「repeat=3 是虚假的精度」那一节")
     ap.add_argument("--out", type=Path, default=None, help="把帧存到这个目录")
     ap.add_argument("--post", default=None, help="服务端 base URL，给了才走 HTTP")
     ap.add_argument("--token", default=None)
@@ -195,6 +287,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--crop", type=float, default=1.0,
                     help="客户端中心裁剪比例，如 0.7 表示只发中间 70%%。"
                          "等效把照片占比放大 1/crop 倍")
+    # 遮挡是用户报的**头号现象**（「手指会遮挡四角，就无法识别」），而在此之前整个
+    # bench 里没有这个变量 —— 那张「全过的最小占比」表量的是「照片完整可见时最远能
+    # 站多远」，而真机上照片从来不是完整可见的。
+    #
+    # 默认 "0"（不遮）**刻意**保持既有行为：不带这个参数跑出来的数字必须和加这个
+    # 功能之前逐位相同，否则已经写进 `backend.py` 注释里的那张表就无从对照了。
+    ap.add_argument("--occlude", default="0",
+                    help="手指遮挡阶梯：每个被遮的角吃掉照片面积的比例，逗号分隔。"
+                         f"典型值见 simcam.DEFAULT_OCCLUDES（{','.join(str(o) for o in DEFAULT_OCCLUDES)}）"
+                         "—— 一个指尖压在六寸照片角上约 1.5%%，两根手指约 3%%。"
+                         "默认 0 = 不遮，与加这个参数之前的行为逐位相同")
+    ap.add_argument("--occlude-corners", type=int, default=4,
+                    help=f"遮几个角（0-4），顺序 {'/'.join(CORNER_ORDER)}。"
+                         "单手拿通常压住 1-2 个角，双手拿 2-4 个。默认 4 = 最坏情况")
     ap.add_argument("--frame-long-edge", type=int, default=FRAME_LONG_EDGE,
                     help=f"客户端发的帧长边（默认 {FRAME_LONG_EDGE}，与 Frames.LONG_EDGE 一致）。"
                          "抬它是唯一能真正**增加信息量**的旋钮：照片在帧里的实际像素数"
@@ -232,45 +338,73 @@ def main(argv: list[str]) -> int:
     print(f"判定门槛 MIN_INLIERS={verify.MIN_INLIERS}  查询侧特征 {a.query_features}  "
           f"中心裁剪 {a.crop:.2f}  发帧长边 {a.frame_long_edge}  "
           f"查询尺度 {','.join(str(x) for x in ladder)}\n")
-    print(f"{'占比':>6} {'照片像素宽':>10} {'inliers':>26}  {'过门槛':>6}  {'全过':>4}")
+    fills = [float(x) for x in a.fill.split(",")]
+    occludes = [float(x) for x in a.occlude.split(",")]
 
-    worst_pass = None
-    worst_all = None
-    for fill in [float(x) for x in a.fill.split(",")]:
-        scores = []
-        for i in range(a.repeat):
-            frame = make_frame(ref, fill, seed=a.seed + i, scene=a.scene, crop=a.crop,
-                               frame_long_edge=a.frame_long_edge)
-            # 多尺度阶梯取最好的一档 —— 服务端真要这么做的话也是取最好的
-            best_in = 0
-            for le in ladder:
-                q = features.extract(frame, long_edge=le, n_features=a.query_features)
-                best_in = max(best_in, verify.verify_pair(q, ref_f, "ref").inliers)
-            scores.append(best_in)
-            if a.out:
-                p = a.out / f"fill{fill:.2f}_s{a.seed + i}_in{best_in}.jpg"
-                cv2.imwrite(str(p), frame, [cv2.IMWRITE_JPEG_QUALITY, FRAME_QUALITY])
-                if a.post and a.token:
-                    print(f"       ·  HTTP {p.name}: {_post(a.post, a.token, p)}")
-        ok = max(scores) >= verify.MIN_INLIERS
-        # "全过"才是真机上的可用判据：手持角度是随机的，只有一个 seed 过说明
-        # 用户得靠运气 —— 前面 demo-a 就是这么骗过我一次的
-        all_ok = min(scores) >= verify.MIN_INLIERS
-        if ok:
-            worst_pass = fill if worst_pass is None else min(worst_pass, fill)
-        if all_ok:
-            worst_all = fill if worst_all is None else min(worst_all, fill)
-        detail = " ".join(f"{s:3d}" for s in scores)
-        px = int(min(a.frame_long_edge, a.frame_long_edge * fill / a.crop))
-        print(f"{fill:6.2f} {px:10d} {detail:>26}  {'是' if ok else '否':>6}  "
-              f"{'是' if all_ok else '否':>4}")
+    summary: list[tuple[float, float | None, float | None]] = []
+    for occ in occludes:
+        if len(occludes) > 1 or occ > 0:
+            print(f"\n── 遮挡 {occ:.0%}／角 × {a.occlude_corners} 角 "
+                  f"（照片面积的 {occ * a.occlude_corners:.0%}）──")
+        print(f"{'占比':>6} {'照片像素宽':>10} {'inliers':>26}  {'过门槛':>6}  {'全过':>4}")
+        worst_pass = None
+        worst_all = None
+        for fill in fills:
+            scores = []
+            for i in range(a.repeat):
+                frame = make_frame(ref, fill, seed=a.seed + i, scene=a.scene, crop=a.crop,
+                                   frame_long_edge=a.frame_long_edge,
+                                   occlude=occ, occlude_corners_n=a.occlude_corners)
+                # 多尺度阶梯取最好的一档 —— 服务端真要这么做的话也是取最好的
+                best_in = 0
+                for le in ladder:
+                    q = features.extract(frame, long_edge=le, n_features=a.query_features)
+                    best_in = max(best_in, verify.verify_pair(q, ref_f, "ref").inliers)
+                scores.append(best_in)
+                if a.out:
+                    p = (a.out /
+                         f"fill{fill:.2f}_occ{occ:.2f}_s{a.seed + i}_in{best_in}.jpg")
+                    cv2.imwrite(str(p), frame, [cv2.IMWRITE_JPEG_QUALITY, FRAME_QUALITY])
+                    if a.post and a.token:
+                        print(f"       ·  HTTP {p.name}: {_post(a.post, a.token, p)}")
+            ok = max(scores) >= verify.MIN_INLIERS
+            # "全过"才是真机上的可用判据：手持角度是随机的，只有一个 seed 过说明
+            # 用户得靠运气 —— 前面 demo-a 就是这么骗过我一次的
+            all_ok = min(scores) >= verify.MIN_INLIERS
+            if ok:
+                worst_pass = fill if worst_pass is None else min(worst_pass, fill)
+            if all_ok:
+                worst_all = fill if worst_all is None else min(worst_all, fill)
+            detail = " ".join(f"{s:3d}" for s in scores)
+            px = int(min(a.frame_long_edge, a.frame_long_edge * fill / a.crop))
+            print(f"{fill:6.2f} {px:10d} {detail:>26}  {'是' if ok else '否':>6}  "
+                  f"{'是' if all_ok else '否':>4}")
+        summary.append((occ, worst_pass, worst_all))
 
     print()
-    if worst_pass is None:
-        print("这张图在任何取景距离下都过不了门槛 —— 它不适合作为识别目标。")
-    else:
-        print(f"最小可用占比 ≈ {worst_pass:.2f}（至少一个角度过）"
-              f"／ {worst_all if worst_all else '—'}（所有角度都过）")
+    for occ, worst_pass, worst_all in summary:
+        label = f"遮挡 {occ:.0%}／角" if len(summary) > 1 or occ > 0 else "无遮挡"
+        if worst_pass is None:
+            print(f"{label}：这张图在任何取景距离下都过不了门槛。")
+        else:
+            print(f"{label}：最小可用占比 ≈ {worst_pass:.2f}（至少一个角度过）"
+                  f"／ {worst_all if worst_all else '—'}（所有角度都过）")
+    # 这一行才是这个 harness 加遮挡之后的真正产物：**遮挡把可用取景距离推近了多少。**
+    # 「所有角度都过」的那一列是真机可用判据（手持角度是随机的），所以拿它算代价。
+    if len(summary) > 1:
+        base_all = summary[0][2]
+        print()
+        if base_all is None:
+            print("对照组（第一档）本身就不全过，遮挡的代价无从对照 —— 先换一张图。")
+        else:
+            for occ, _, worst_all in summary[1:]:
+                if worst_all is None:
+                    print(f"遮挡 {occ:.0%}／角：**全过的档位一个都没有** "
+                          f"（对照组 {base_all:.2f}）")
+                else:
+                    print(f"遮挡 {occ:.0%}／角：最小全过占比 {base_all:.2f} → "
+                          f"{worst_all:.2f}（照片得再靠近 "
+                          f"{worst_all / base_all:.2f} 倍）")
     return 0
 
 

@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import backend as backend_mod
 from .. import sheet as sheet_mod
-from .. import verify, xfeat
+from .. import streak, verify, xfeat
 from ..nullvocab import NullVocab
 from ..sheet import SheetError
 from . import (
@@ -379,6 +379,10 @@ class Server:
         # 构造它不碰盘（目录在第一次真的要写帧时才建），所以即使这个开关一辈子
         # 不开，也不会在 data/ 下留一个空目录让人以为功能开着。
         self.frames = framedump.FrameDump(cfg.data_dir)
+        # 跨帧证据累积（`photoar.streak`）。**纯内存、不落盘**：它是缓存而不是数据，
+        # 重启丢了最多少一次累积（下一次扫描 1.2 秒内又攒回来）。阈值不在这里定 ——
+        # 它们是热配置，每次 offer 时传进去（见 `_decide_and_respond`）。
+        self.streaks = streak.StreakTracker()
         self.webui_dir = webui_dir
         self.backend_requested = backend_requested or library.backend.name
         self.backend_error = backend_error
@@ -1131,6 +1135,20 @@ class Server:
             req, prin, t0, lambda top_k: self.library.verify_features(query, top_k)
         )
 
+    @staticmethod
+    def _streak_key(prin: Principal) -> str:
+        """跨帧累积按谁分链。
+
+        **不用 token**：这个字符串会进 `StreakTracker` 的内存字典，而那个对象可能被
+        打进诊断输出。身份足够区分「谁在扫」，而 token 是凭证。
+
+        已知限制：同一个用户拿两台手机同时扫会共用一条链。后果很轻 —— 扫不同照片时
+        两台互相打断（累积失效，退回单帧判定，也就是改这一版之前的行为），扫同一张时
+        会稍微提早命中。要修得把 session id 带进 [Principal]，而那个改动的面比这个
+        限制大。
+        """
+        return f"{prin.via}:{prin.user_id or prin.name}"
+
     def _decide_and_respond(
         self,
         req: Request,
@@ -1160,6 +1178,27 @@ class Server:
             min_inliers=int(values["recog.min_inliers"]),
             ratio=float(values["recog.ratio"]),
         )
+        # 单帧没过 → 让跨帧累积再看一次（`photoar.streak`）。依据是真机日志：194 条
+        # weak 里 22 条（11.3%）其实是「看到照片了、就差几分」，而它们的第一名比第二名
+        # 高 3 倍以上 —— 每一帧都被单独扔掉了。
+        #
+        # 攒够了就**原地把 decision 换掉**，于是下面每一步（留帧、记历史、orphan 判断、
+        # 授权检查、响应字段）都与单帧命中走**完全同一条路**。这正是「状态放服务端」
+        # 这个选择的全部理由：客户端累积要把未命中时的最佳猜测回给客户端，而 weak 那
+        # 一支不跑授权检查，回 photoId 就是一次信息泄漏。这里一个新暴露面都没有。
+        #
+        # `need = 0` 关掉整条路 —— 那时候连 offer 都不调，链也就不会攒。
+        need = int(values["recog.streak_need"])
+        if not decision.matched and need > 0:
+            upgraded = self.streaks.offer(
+                self._streak_key(prin),
+                int(time.time() * 1000),
+                results,
+                need=need,
+                soft_min=int(values["recog.streak_soft_min"]),
+            )
+            if upgraded is not None:
+                decision = upgraded
         latency_ms = int((time.perf_counter() - t0) * 1000)
         # 第二名与前几名一起记进历史。**这不是可选的诊断糖**：一次真实排查里 941 条
         # 记录只有 inliers 一列，其中 897 条内点数 160~229（门槛 40）却判了未命中，
