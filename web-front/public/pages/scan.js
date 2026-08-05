@@ -22,16 +22,19 @@
  * 就是每次重新加载 + 实例化 —— 而用户在页签之间来回切是常态。所以 Worker 由外壳长驻，
  * 这里只给它发一次 `reset`（清掉跟踪状态，免得回来时还锁着上一张照片）。
  */
-import { CameraError, FrameGrabber, openCamera, stopCamera } from '../camera.js'
+import { CameraError, FrameGrabber, canGrabBitmap, openCamera, stopCamera } from '../camera.js'
 import { MEDIA_ERR, NETWORK_STATE, READY_STATE, diag, diagAlways, flushDiag, isDiagEnabled, short } from '../diag.js'
 import { Renderer } from '../render/gl.js'
 import {
-  FULL_RECT, TTL_MS, approach, clipVertices, imageToNdc, plausible, smoothingAlpha, unitSquareH,
+  FULL_RECT, TTL_MS, clipVertices, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
 import * as api from '../api.js'
 import { playStream } from '../mp4stream.js'
 import { button, h } from '../ui.js'
+import { traceRender, traceResult } from '../trace.js'
+import { QuadFilter } from '../render/quadfilter.js'
+import { thresholds } from '../recognize/consts.js'
 
 /** 多久送一帧给 Worker。Worker 忙时会丢帧（它只处理最新一帧），所以按 ~30fps 送就够。 */
 const SEND_INTERVAL_MS = 33
@@ -87,10 +90,12 @@ export default {
     }
 
     const st = {
-      quad: null, quadAt: 0, smooth: null, lastRenderAt: 0,
+      quad: null, quadAt: 0, filter: new QuadFilter(), smoothOut: new Float32Array(8), lastRenderAt: 0,
       lockedPhoto: null, trackPoints: null,
       frameSeq: 0, inflight: false, lastSentAt: 0, paused: false,
-      fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0,
+      fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0, lastGrabMs: 0,
+      // 走不走 bitmap 那条路。一次失败就永久退回（见 sendFrame）。
+      useBitmap: canGrabBitmap(),
       raf: 0, stream: null, renderer: null, grabber: null, alive: true, stopStream: null,
     }
 
@@ -177,7 +182,7 @@ export default {
     function resetLock() {
       ctx.worker?.postMessage({ type: 'reset' })
       st.quad = null
-      st.smooth = null
+      st.filter.reset()
       st.lockedPhoto = null
       // 先掐流再动元素：不掐的话上一段的 fetch 还在往一个已经换了 src 的
       // SourceBuffer 里喂，报的是一个跟「重新扫描」毫无关系的 append 错误。
@@ -263,30 +268,49 @@ export default {
         return
       }
       if (m.type !== 'result') return
+      traceResult(performance.now(), m)
       st.inflight = false
       if (m.state === 'locked' && m.ms) st.trackMs = m.ms
       else if (m.ms) st.detectMs = m.ms
       st.trackPoints = m.inliers ?? null
       diag(() => `${m.state === 'locked' ? '跟踪' : '检测'} ${m.reason}` +
         ` 内点=${m.inliers ?? '-'} ${m.ms}ms 四角=${m.quad ? '有' : '无'}` +
+        (m.streak ? ` 累积 ${m.streak.n}/${m.streak.need}` : '') +
         (m.tracked ? ` 光流存活=${m.tracked}` : '') +
         (m.reseeded ? ` 补种子→${m.reseeded}` : '') +
         (m.gaveUp ? ' 放手' : ''))
+      // 累积命中要与单帧命中**分得开**。不分的话，跨帧累积带来的误识别会混进单帧
+      // 命中里，永远量不出来（服务端那边靠 recognize_log 的 reason 分，这边靠这一行）。
+      if (m.reason === 'streak') diagAlways(`累积命中：连续 ${thresholds.streakNeed} 帧一致，内点 ${m.inliers}（单帧门槛 ${thresholds.minInliers}）`)
 
       // 命中就加载视频，与这一帧四角合不合格**无关**（命中那一帧算不出四角是常态）。
       if (m.fresh) onHit(m).catch((e) => diagAlways(`onHit 失败 ${e.message}`))
 
       if (m.quad && plausible(m.quad)) {
+        const at = performance.now()
         st.quad = m.quad
-        st.quadAt = performance.now()
+        st.quadAt = at
+        // **这个四角测的是多久之前的画面** —— 抓帧那一刻到现在。滤波器要补的就是它。
+        // `m.grabbedAt` 由 worker 原样带回（见 worker.js），拿不到就退回用跟踪耗时估。
+        const age = m.grabbedAt ? Math.max(0, at - m.grabbedAt) : (m.ms ?? 0)
+        st.filter.observe(m.quad, at, age)
       } else if (m.gaveUp) {
         // 放手时撤掉四角但**不停视频** —— 用户可能只是手抖了一下，重新检测通常一两秒
         // 就回来。停了再播会从头开始，那比继续播难看得多。
         st.quad = null
-        st.smooth = null
+        st.filter.reset()
         tip(TIPS[m.reason] ?? TIPS.scanning)
       } else if (!st.lockedPhoto) {
-        tip(TIPS[m.reason] ?? TIPS.scanning)
+        // 正在攒证据时说"就快了"，而不是那句"认不出来"。
+        //
+        // 这两件事在用户那边是**完全不同的下一步**：「认不出来」意味着要换姿势
+        // （靠近、正过来、避反光），而「攒到 2/3」意味着**保持现在这个姿势别动**。
+        // 上一版两种都显示"认不出来"，于是用户在最接近成功的那一刻改变了姿势。
+        if (m.streak && m.streak.n > 0) {
+          tip(`看到了，拿稳别动… ${m.streak.n}/${m.streak.need}`)
+        } else {
+          tip(TIPS[m.reason] ?? TIPS.scanning)
+        }
       }
       meta()
     }
@@ -331,11 +355,13 @@ export default {
       r.drawCamera(dom.cam, vw / vh, canvasAspect)
 
       const age = now - st.quadAt
+      const dtFrame = st.lastRenderAt ? now - st.lastRenderAt : 0
+      let drew = 0
       if (st.quad && age <= TTL_MS) {
-        if (!st.smooth) st.smooth = Float32Array.from(st.quad)
-        const dt = st.lastRenderAt ? now - st.lastRenderAt : 0
-        approach(st.smooth, st.quad, smoothingAlpha(dt))
-        const ndc = imageToNdc(st.smooth, vw / vh, canvasAspect, new Float32Array(8))
+        // 自适应预测滤波：静止时重平滑压噪声、运动时按速度外推补掉管线那 88ms。
+        // 观测在 `onWorkerMessage` 里喂进去（那才是它到达的时刻），这里只问"现在画哪"。
+        const smooth = st.filter.at(now, st.smoothOut) ?? st.quad
+        const ndc = imageToNdc(smooth, vw / vh, canvasAspect, new Float32Array(8))
         const hm = unitSquareH(ndc)
         if (hm) {
           const photoAspect = st.lockedPhoto?.aspect > 0 ? st.lockedPhoto.aspect : 1.5
@@ -344,16 +370,34 @@ export default {
           // 面片**恒等于整张照片**（FULL_RECT），比例对不上时裁的是源（videoCrop）——
           // 也就是 object-fit: cover。上一版反过来：缩面片、留出照片边缘。
           if (clipVertices(hm, FULL_RECT, clip)) {
-            const drew = r.drawVideoQuad(clip, dom.clip, videoCrop(photoAspect, videoAspect))
-            if (!drew) diag(() => `几何 OK 但没画：视频 ready=${READY_STATE[dom.clip.readyState]}`)
+            const ok = r.drawVideoQuad(clip, dom.clip, videoCrop(photoAspect, videoAspect))
+            drew = ok ? 1 : 0
+            if (!ok) diag(() => `几何 OK 但没画：视频 ready=${READY_STATE[dom.clip.readyState]}`)
           } else {
             diag('clipVertices 拒了这一帧（四边形跨越无穷远线或退化）')
           }
         }
       } else if (st.quad && age > TTL_MS) {
         st.quad = null
-        st.smooth = null
+        st.filter.reset()
       }
+      // 打桩：这一帧**实际用到**的几何与时序。放在渲染之后、送帧之前 ——
+      // 它记的是"画出去的那一帧"，而不是"我们希望画出去的"。
+      traceRender(now, {
+        // 上一帧的抓帧耗时。抓帧在这行之后（渲染完才抓），所以只能记上一帧的 ——
+        // 而"上一帧抓了多久"正好解释"这一帧为什么来晚了"。
+        // 上一帧的抓帧耗时，**用完清零**。不清的话它在每一帧上都是非零的，
+        // 于是"迟到的帧里有多少跟在抓帧后面"这个统计恒等于 100% —— 那是统计方法
+        // 造出来的结论，不是数据里的。踩过一次。
+        grabMs: st.lastGrabMs,
+        fps: st.fps.value,
+        quadAge: st.quad ? age : -1,
+        drew,
+        dt: dtFrame,
+        smooth: st.quad ? st.smoothOut : null,
+        raw: st.quad,
+      })
+      st.lastGrabMs = 0
       st.lastRenderAt = now
       flushDiag()
 
@@ -366,16 +410,47 @@ export default {
       }
 
       if (!st.paused && !st.inflight && now - st.lastSentAt >= SEND_INTERVAL_MS) {
-        const img = st.grabber.grab()
-        if (img) {
-          st.lastSentAt = now
-          st.inflight = true
-          const buf = img.data.buffer
-          // transfer：1280×960 的 RGBA 是 4.9MB，每秒 30 次，克隆不可接受。
-          ctx.worker.postMessage(
-            { type: 'frame', id: ++st.frameSeq, width: img.width, height: img.height, buf }, [buf])
-        }
+        st.lastSentAt = now
+        st.inflight = true
+        sendFrame(now)
       }
+    }
+
+    /**
+     * 送一帧去识别。**两条路，首选把 RGBA 转换挪出主线程的那条。**
+     *
+     * 真机实测（1280×960）：老路 `getImageData` 在主线程上花 65ms，抓帧因此占掉主线程
+     * 的 55%，22.5% 的帧迟到、其中 92% 正好跟在一次抓帧之后 —— 那就是"不丝滑"。
+     * 新路主线程只付 `createImageBitmap` 的 19.4ms，剩下的 10.2ms 在 worker 上。
+     *
+     * `grabbedAt` 两条路都带：滤波器要知道"这个结果测的是多久之前的画面"，而那必须
+     * 来自**抓帧**那一刻，不是"收到结果"减去计算耗时（后者漏掉了排队等待）。
+     */
+    function sendFrame(now) {
+      const t0 = performance.now()
+      const post = (payload, transfer) => {
+        st.lastGrabMs = Math.round((performance.now() - t0) * 10) / 10
+        ctx.worker.postMessage({ type: 'frame', id: ++st.frameSeq, grabbedAt: now, ...payload }, transfer)
+      }
+      if (st.useBitmap) {
+        st.grabber.grabBitmap().then((got) => {
+          if (!st.alive) { got?.bitmap?.close(); return }
+          if (!got) { st.inflight = false; return }
+          post({ width: got.width, height: got.height, bitmap: got.bitmap }, [got.bitmap])
+        }).catch((e) => {
+          // 一次失败就永久退回老路。`createImageBitmap` 在某些机型/某些 track 状态下
+          // 会抛，而每帧都试一次然后 fallback 等于每帧都付一次异常的代价。
+          diagAlways(`createImageBitmap 失败，退回 getImageData：${e?.message ?? e}`)
+          st.useBitmap = false
+          st.inflight = false
+        })
+        return
+      }
+      const img = st.grabber.grab()
+      if (!img) { st.inflight = false; return }
+      const buf = img.data.buffer
+      // transfer：1280×960 的 RGBA 是 4.9MB，每秒十几次，克隆不可接受。
+      post({ width: img.width, height: img.height, buf }, [buf])
     }
 
     const onVis = () => { st.paused = document.hidden }
