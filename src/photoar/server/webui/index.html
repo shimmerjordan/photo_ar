@@ -68,7 +68,7 @@
   <div>
     <h1 style="margin:0 0 6px;font-size:1.25rem">这个账号不能用管理台</h1>
     <p class="muted" style="margin:0 0 18px;max-width:44ch">
-      管理台只有管理员能用。访客账号请在手机 App 里扫照片看视频 —— 能看哪些照片由
+      管理台只有管理员能用。访客账号请在手机浏览器里打开本站首页扫照片看视频 —— 能看哪些照片由
       管理员授权。
     </p>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -97,7 +97,7 @@
       <button role="tab" type="button" data-tab="config" id="tab-config"
               aria-controls="p-config" aria-selected="false">配置</button>
       <button role="tab" type="button" data-tab="photos" id="tab-photos"
-              aria-controls="p-photos" aria-selected="false">照片</button>
+              aria-controls="p-photos" aria-selected="false">媒体</button>
       <button role="tab" type="button" data-tab="batch" id="tab-batch"
               aria-controls="p-batch" aria-selected="false">批量</button>
     </nav>
@@ -152,7 +152,7 @@
         <div>
           <h2>素材挂载点</h2>
           <p class="note">
-            照片和视频从哪儿找。配好之后「照片」页就能直接从这些位置添加。
+            照片和视频从哪儿找。配好之后「媒体」页就能直接从这些位置添加。
           </p>
         </div>
         <div class="right">
@@ -163,11 +163,17 @@
       <div id="mounts-body"></div>
     </section>
 
-    <!-- 照片（含映射：两者本来就是同一份数据的两种看法，见 app.js 的 renderPhotos） -->
+    <!-- 媒体（照片 + 它配的那段视频；含映射，两者本来就是同一份数据的两种看法，
+         见 app.js 的 renderPhotos）。
+
+         ⚠️ 显示名叫「媒体」，而 slug 仍然是 `photos`（`data-tab`、`id`、以及
+         `/admin/photos` 这个地址）。**不要跟着改** —— 那个地址写在文档里、可能在谁的
+         收藏夹里，而 `app.py` 的 `_WEBUI_TABS` 也按它做白名单。显示名与路由分开，
+         就是为了让"这一页叫什么"能改而不动地址。 -->
     <section class="panel" id="p-photos" role="tabpanel" aria-labelledby="tab-photos" tabindex="-1" hidden>
       <div class="head">
         <div>
-          <h2>照片</h2>
+          <h2>媒体</h2>
           <p class="note">库里有什么、各自配了哪段视频。入库走 App 与批量导入。</p>
         </div>
         <div class="right">

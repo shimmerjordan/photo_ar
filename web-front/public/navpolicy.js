@@ -72,10 +72,18 @@ export function tabAfterRoleChange(current, isAdmin) {
   return allowed.includes(current) ? current : landingTab()
 }
 
-/** 页签的显示名与图标（16×16 像素风，见 `pixelicons.js`）。 */
+/**
+ * 页签的显示名与图标（16×16 像素风，见 `pixelicons.js`）。
+ *
+ * ⚠️ **label 改了不要跟着改上面那些 slug。** `Tab.PHOTOS` 的值 `'photos'` 是 URL 的
+ * 一部分（`#/photos`），也写在文档里、可能在谁的收藏夹里。显示名与路由分开，
+ * 就是为了让"这一页叫什么"能改而不动地址。
+ */
 export const TAB_META = {
   [Tab.SCAN]: { label: '扫一扫', icon: 'scan' },
-  [Tab.PHOTOS]: { label: '照片', icon: 'photo' },
+  // 「媒体」而不是「照片」：这一页管的是**照片和它配的那段视频**这一对，而
+  // 「照片」让人以为只是个相册。旁边那个「素材」是上传入口（还没入库的东西）。
+  [Tab.PHOTOS]: { label: '媒体', icon: 'photo' },
   [Tab.MEDIA]: { label: '素材', icon: 'upload' },
   [Tab.ADMIN]: { label: '管理', icon: 'admin' },
   [Tab.SETTINGS]: { label: '设置', icon: 'gear' },

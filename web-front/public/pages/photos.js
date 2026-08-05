@@ -1,5 +1,5 @@
 /**
- * 照片库。**Android `PhotosScreen` 的对译。**
+ * 媒体库：**照片 + 它配的那段视频**。
  *
  * 一屏网格，每张显示缩略图 + 标题 + 两个警示徽标（无视频 / 参考图变了）。
  * 那两个徽标不是装饰：它们各自对应一种「扫了不会有反应」的状态，而那是用户最可能
@@ -10,7 +10,7 @@ import { empty, failed, h, loading, thumb } from '../ui.js'
 import { Page } from '../navpolicy.js'
 
 export default {
-  title: '照片库',
+  title: '媒体库',
 
   async mount(el, ctx) {
     let alive = true
@@ -21,7 +21,7 @@ export default {
       el.innerHTML = ''
       if (!list.length) {
         el.appendChild(empty(
-          '照片库是空的',
+          '媒体库是空的',
           '去「素材」页挑一张打印过的照片 + 一段视频，一次传完就是一组映射。',
         ))
         return

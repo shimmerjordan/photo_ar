@@ -29,7 +29,7 @@ import { runPage, log } from '../bridge.js'
  */
 
 const PAGES = [
-  { hash: '#/photos', title: '照片库' },
+  { hash: '#/photos', title: '媒体库' },
   { hash: '#/media', title: '素材' },
   { hash: '#/admin', title: '管理' },
   { hash: '#/settings', title: '设置' },
@@ -101,7 +101,49 @@ runPage(async () => {
       (newErrors.length ? ` 错误：${newErrors.join(' | ')}` : ''))
   }
 
-  // 返回键：从详情弹回去应当回到照片库，而不是留在详情或跳到落地页。
+  // ── 设置页：版本号在、调试模式默认藏着 ──────────────────────────
+  //
+  // 这一段守的是"宾客不该看到调试入口"。它只能在真页面上验：版本号是从
+  // `/api/config` 取的（不是硬编码），而调试那一节是 `hidden` 而不是"不 append"
+  // （它必须排在「关于」上面）—— 两件都不是读源码能确认的。
+  {
+    win.location.hash = '#/settings'
+    await new Promise((r) => setTimeout(r, 1500))
+    const rows = [...view.querySelectorAll('.row2')]
+    const verRow = rows.find((r) => r.querySelector('.k')?.textContent === '版本')
+    push('设置页有版本号那一行', Boolean(verRow), { keys: rows.map((r) => r.querySelector('.k')?.textContent) })
+    const ver = verRow?.querySelector('.v')?.textContent ?? ''
+    // 它必须是服务端给的那个，而不是 '未知' —— 后者说明 /api/config 那一环断了。
+    push('版本号取到了真值', ver.length > 0 && ver !== '未知', { version: ver })
+    await log(`设置页版本号 = ${ver}`)
+
+    const heads = [...view.querySelectorAll('h2')].map((h) => h.textContent)
+    const debugSec = [...view.children].find((sec) => sec.querySelector('h2')?.textContent === '调试模式')
+    push('调试模式那一节默认藏着', Boolean(debugSec) && debugSec.hidden === true,
+      { found: Boolean(debugSec), hidden: debugSec?.hidden, heads })
+
+    // 连按解锁。**真的点 7 下**，而不是直接调 setDiagEnabled —— 要验的正是那个手势
+    // （次数、时间窗、以及"解锁之后那一节要立刻出现"这条 onDebugChange 的链路）。
+    if (verRow) {
+      for (let i = 0; i < 6; i++) verRow.click()
+      await new Promise((r) => setTimeout(r, 100))
+      push('按 6 下还不该解锁', debugSec?.hidden === true, { hidden: debugSec?.hidden })
+      verRow.click()
+      await new Promise((r) => setTimeout(r, 300))
+      push('按满 7 下解锁，那一节立刻出现', debugSec?.hidden === false, { hidden: debugSec?.hidden })
+      // 顶部那块日志面板也该出来了。
+      const panel = doc.querySelector('#diagbox, #diag, .diagbox')
+      await log(`解锁后 debugSec.hidden=${debugSec?.hidden} 日志面板=${panel ? '有' : '没找到'}`)
+      // 收摊：把它关回去，免得这次运行留下的 localStorage 影响下一次。
+      const offBtn = [...debugSec.querySelectorAll('button')].find((b) => /退出调试模式/.test(b.textContent))
+      push('解锁后按钮变成「退出调试模式」', Boolean(offBtn), { labels: [...debugSec.querySelectorAll('button')].map((b) => b.textContent) })
+      offBtn?.click()
+      await new Promise((r) => setTimeout(r, 200))
+      push('退出之后那一节又藏起来', debugSec?.hidden === true, { hidden: debugSec?.hidden })
+    }
+  }
+
+  // 返回键：从详情弹回去应当回到媒体库，而不是留在详情或跳到落地页。
   {
     win.location.hash = '#/photos'
     await new Promise((r) => setTimeout(r, 1500))
@@ -114,9 +156,9 @@ runPage(async () => {
       push('详情页显示返回按钮', back && !back.hidden)
       back?.click()
       await new Promise((r) => setTimeout(r, 1200))
-      push('返回后回到照片库', title?.textContent === '照片库', { title: title?.textContent })
+      push('返回后回到媒体库', title?.textContent === '媒体库', { title: title?.textContent })
     } else {
-      await log('照片库里没有卡片（库是空的），跳过详情往返检查')
+      await log('媒体库里没有卡片（库是空的），跳过详情往返检查')
     }
   }
 
