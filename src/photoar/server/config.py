@@ -294,7 +294,11 @@ class ServerConfig:
             models_dir=(
                 rel(str(doc["models_dir"])) if doc.get("models_dir") else None
             ),
-            bind=str(doc.get("bind", "0.0.0.0")),
+            # bind 与 port 都让环境变量优先于文件。port 一直是这样；bind 是
+            # 2026-08-05 补上的 —— 合并容器之后 entrypoint 要把后端按到回环上
+            # （`PHOTOAR_BIND=127.0.0.1`），而挂了 config.json 的部署原先会忽略它，
+            # 于是后端在容器网络里仍然是 0.0.0.0：前面那层反代就绕得过去了。
+            bind=str(os.environ.get("PHOTOAR_BIND") or doc.get("bind", "0.0.0.0")),
             port=int(os.environ.get("PHOTOAR_PORT") or doc.get("port", DEFAULT_PORT)),
             arcoreimg=str(doc.get("arcoreimg", ARCOREIMG)),
             ffmpeg=str(doc.get("ffmpeg", "ffmpeg")),

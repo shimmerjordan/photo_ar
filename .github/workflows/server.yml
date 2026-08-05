@@ -1,4 +1,9 @@
-# 后端唯一的一条流水线：单元测试 → 编镜像 → 把镜像当生产环境跑一遍 →（打 tag 时）推 GHCR。
+# 唯一的一条流水线：单元测试（Python + 网页版）→ 编镜像 → 把镜像当生产环境跑一遍
+# →（打 tag 时）推 GHCR。
+#
+# 镜像里是**两个进程**：Node 的网页版在前（唯一的监听者）、Python 的后端在
+# 127.0.0.1:8965。所以 E2E 那一步同时打三种 URI：`/`（网页版）、`/admin`（反代）、
+# `/v1/*`（反代）。只打 `/v1` 的话，合并这件事本身一个字都没被验证到。
 #
 # ════════════════════════════════════════════════════════════════════════
 # 为什么是一条而不是两条
@@ -42,7 +47,7 @@ name: server
 
 # 没有 paths 过滤，是刻意的。
 #
-# 加上 `paths: [src/**, ...]` 能让「只改了安卓」的提交跳过这条流水线，但一旦同时写了
+# 加上 `paths: [src/**, ...]` 能让只改文档的提交跳过这条流水线，但一旦同时写了
 # `tags: ["v*"]`，路径过滤对 tag 推送是否生效就变成一个说不清的行为 —— 而说不清的那个
 # 分支恰好是**发版**：打完 tag 却没有任何流水线跑起来，你要过一会儿才会发现镜像没更新。
 # 这个仓库是公开的，Actions 分钟数不计费，所以用「每次都跑」换掉那个坑是划算的。
@@ -95,9 +100,29 @@ jobs:
       - name: 单元测试
         run: pytest -q
 
+  # 网页版那 100 多条零依赖测试。单独一个 job 而不是接在 test 后面：它不需要 Python、
+  # 不需要 opencv、不需要装系统库，十几秒就跑完，与上面那十分钟并行。
+  #
+  # 只跑 `npm test`。要真浏览器的那几套（test:golden / test:e2e / test:worker）**没有**
+  # 放进 CI：它们要下 headless Chrome 并跑真的 ORB + RANSAC，而它们守的是「opencv.js
+  # 换版本了没」—— 那是一件手动的、罕见的事，值得手动跑一遍看数字，不值得每次推代码
+  # 等三分钟。`test:smoke` / `test:pages` 要一个跑着的容器 + 一个真库，CI 上没有。
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22" # 与 Dockerfile 里抠出来的那个 node 同大版本
+      # 没有 npm ci —— 这个包一个依赖都没有（package.json 里没有 dependencies）。
+      - name: 网页版单元测试
+        working-directory: web-front
+        run: npm test
+
   image:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, web]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -170,6 +195,25 @@ jobs:
           echo "未登录 /v1/ping -> $code"
           [ "$code" = "401" ] || { echo "::error::未登录的请求本该 401"; docker logs photoar-ci; exit 1; }
 
+          # ---- 合并容器的三种 URI 都在同一个端口上 ----
+          #
+          # 这三条守的是「两个进程都活着、而且前面那个的路由表是对的」。少了它们，
+          # 一个「Node 起不来但 Python 好好的」的镜像会全绿通过 —— 而那个镜像对宾客
+          # 来说是完全不可用的（`/` 连不上），对运维却看不出问题（`/v1` 正常）。
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/)
+          echo "网页版 / -> $code"
+          [ "$code" = "200" ] || { echo "::error::网页版没起来（/ 应当是 200）"; docker logs photoar-ci; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/admin)
+          echo "管理台 /admin -> $code"
+          [ "$code" = "200" ] || { echo "::error::/admin 没被反代到后端"; docker logs photoar-ci; exit 1; }
+
+          # 网页版自己的存活端点。它不碰上游也不碰识别库，所以它 200 而 `/` 500 的
+          # 组合能把「进程活着但静态目录没拷进镜像」区分出来。
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/healthz)
+          echo "存活探测 /healthz -> $code"
+          [ "$code" = "200" ] || { echo "::error::/healthz 不对"; docker logs photoar-ci; exit 1; }
+
           # 登录 → 拿 token → 打 ping。这三步串起来就覆盖了「路由表装上了、
           # 鉴权链通了、SQLite 能写」。
           tok=$(curl -s -X POST http://127.0.0.1:8964/v1/auth/login \
@@ -194,6 +238,11 @@ jobs:
           curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping >/dev/null \
             || { echo "::error::重启之后原来的会话失效了 —— /data 没持久化"; exit 1; }
           echo "重启后会话仍然有效，/data 持久化正常"
+
+          # 「两个进程都活着」不用另外数进程去证：上面 `/` 是 200 就说明 Node 在，
+          # 而这一句登录之后的 `/v1/ping` 是 200 就说明 Python 在（它走的是反代）。
+          # 试过在这里数 /proc —— slim 镜像里没有 ps，按 /proc 数又会把检查命令自己的
+          # cmdline 数进去（实测 5 而不是 2）。冗余的断言不如没有。
 
       - name: 容器日志（失败时看这里）
         if: always()

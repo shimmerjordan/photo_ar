@@ -1,8 +1,19 @@
-# photo-ar-server —— 一键部署。
+# photo-ar —— 一键部署。**一个容器、一个端口，网页版 + 管理台 + API 全在里面。**
 #
 #   cp .env.example .env && ${EDITOR} .env      # 只有 PHOTOAR_ROOTS 必须看一眼
 #   docker compose up -d
 #   docker compose logs -f photo-ar-server      # 抄走里面那行随机管理员口令
+#
+# 起来之后同一个端口按 URI 分：
+#
+#   http://<NAS>:8964/          宾客扫照片的网页版
+#   http://<NAS>:8964/admin     网页管理台
+#   http://<NAS>:8964/v1/*      后端 API（批量入库脚本打这里）
+#
+# ⚠️ **网页版要相机，而相机只在安全上下文里存在** —— `https://` 任意域名都算，
+# `http://<局域网IP>` 不算。所以对宾客开放时前面必须有一层 https（现有的
+# Cloudflare Tunnel 加一条 ingress 指到这个端口就够）。只用管理台和 API 的话
+# http 直连没问题。手机在局域网里自测见下面 WEBFRONT_TLS_CERT。
 #
 # 这份文件里已经带上了"启动前必须定下来的"每一样东西，所以**不需要 config.json**。
 # 想用配置文件（更细的参数：media 策略、self_score_samples、ffprobe 路径……）就把
@@ -37,6 +48,10 @@ services:
     #   - "44"
     ports:
       # 只监听 LAN/Tailscale。外网走已有的 cloudflared，不在这里暴露。
+      #
+      # **只有这一个端口。** 容器里其实有两个进程（Node 在前发页面/反代、Python 在后
+      # 跑识别与 API），但后者绑在容器内的 127.0.0.1:8965 上，不 EXPOSE 也打不到 ——
+      # 拓扑与理由见 docker/entrypoint.py 的模块 docstring。
       - "${PHOTOAR_PORT:-8964}:8964"
     environment:
       # ---- 必填 ----
@@ -92,7 +107,30 @@ services:
       # 慢一个量级，会撞上隧道的 125 秒超时）。见 docs/deploy.md 第 4 步。
       PHOTOAR_VIDEO_ENCODER: ${PHOTOAR_VIDEO_ENCODER:-auto}
 
+      # ---- 网页版 ----
+      #
+      # 设 0 = 只起后端（管理台与 /v1 照常，`/` 变 404）。这是**出事时的退路**：
+      # 网页那一半有问题时改这一个变量就回到已知状态，不用回滚镜像。
+      PHOTOAR_WEB: ${PHOTOAR_WEB:-1}
+      # 后端在容器内部监听的端口。不对外、也没必要改 —— 除非它跟别的什么撞了。
+      # PHOTOAR_INTERNAL_PORT: 8965
+      #
+      # 跨源隔离（COOP/COEP）。设 0 只在排查「opencv.js 加载不了」时用：require-corp
+      # 会拦掉任何缺 CORP 头的跨源资源，而浏览器控制台那条报错不会说是它拦的。
+      # 现在这份 opencv.js 是单线程构建，开着其实什么也没换来（见 web-front 里那段注释）。
+      WEBFRONT_ISOLATION: ${WEBFRONT_ISOLATION:-1}
+      #
+      # 让本进程**自己说 https**。生产形态是前面挂隧道（那边自带证书），这两个是给
+      # 「手机在局域网 / Tailscale 里自测」用的 —— 那时候手机前面没有隧道那一层，
+      # 而 http 下相机根本不存在。两个必须同时给，只给一个进程会直接退出。
+      # 路径是**容器内**的（证书目录由下面 WEBFRONT_CERT_DIR 挂到 /certs）。
+      # 证书从哪来见 web-front/tools/gen-dev-cert.sh 顶部（优先 tailscale cert 的真证书）。
+      WEBFRONT_TLS_CERT: ${WEBFRONT_TLS_CERT:-}
+      WEBFRONT_TLS_KEY: ${WEBFRONT_TLS_KEY:-}
+
       # 监听地址。0.0.0.0 = 容器内全部接口（对外仍然只有上面 ports 那一条）。
+      # ⚠️ 起了网页版时这个值**会被 entrypoint 覆盖成 127.0.0.1** —— 后端必须待在
+      # 回环上，否则同一个 docker 网络里的别人能绕过前面那层直接打 /v1。
       PHOTOAR_BIND: 0.0.0.0
       # 词汇树用 UTF-8 路径，容器里 locale 默认是 POSIX，显式设一下省事
       LANG: C.UTF-8
@@ -116,6 +154,9 @@ services:
       - /share/CloudDrive:/share/CloudDrive:ro
       # /v1/upload 的落地目录，是整份配置里唯一可写的用户目录
       - /share/Photo/_arphoto_inbox:/share/Photo/_arphoto_inbox
+      # 自测用的证书目录，只读。不用 TLS 时挂个空目录也无害；要用的话
+      # WEBFRONT_TLS_CERT/KEY 里的路径必须写成 /certs/xxx（容器内的路径）。
+      - ${WEBFRONT_CERT_DIR:-./web-front/local}:/certs:ro
     healthcheck:
       # 与 Dockerfile 里的 HEALTHCHECK 同一个脚本，不再抄一份 `python -c`
       # （抄两份迟早分叉）。没配 token 时它把 401 也算健康 —— 理由写在那个文件里。

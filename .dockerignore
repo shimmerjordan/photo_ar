@@ -11,3 +11,15 @@ docs
 *.egg-info
 build
 dist
+
+# 网页版：只有 server/ 与 public/ 进镜像（Dockerfile 里逐条 COPY），这里把它旁边那些
+# 一定不该进去的挡在构建上下文之外 —— 尤其 test/golden 里有个 3.7MB 的查询帧，
+# 而它每次构建都要被传给 dockerd。
+web-front/test
+web-front/tools
+# opencv.orig.js 是 13.3MB 的**原件备份**，只有重跑 tools/split-wasm.mjs 时才用得到。
+# 它跟着 public/ 一起进镜像的话，每次发版白传 13.3MB，而运行时一个字节都不读。
+web-front/public/vendor/opencv.orig.js
+web-front/local
+web-front/node_modules
+web-front/.impeccable

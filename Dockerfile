@@ -1,6 +1,19 @@
-# photo-ar-server —— 跑在 QNAP TS-464C2（N5095，x86-64）的 Container Station 上。
+# photo-ar —— 跑在 QNAP TS-464C2（N5095，x86-64）的 Container Station 上。
 #
-# 取舍说明：
+# **一个镜像装两半**：Python 的后端 + Node 的网页版。2026-08-05 合的，之前是两个镜像
+# 两个容器两个端口。合并的理由与 URI 怎么分见 docker/entrypoint.py 的模块 docstring；
+# 这里只说镜像层面的三件事：
+#
+# * Node 是**从官方镜像里抠出来的那一个二进制**，不是 apt 装的。Debian trixie 的
+#   `nodejs` 包是 20.x，而 web-front 声明 `engines: node >=22`。抠二进制的前提是
+#   两个基底同一个发行版（都是 trixie）—— glibc/libstdc++ 版本因此天然对齐，
+#   不需要再装任何运行时依赖。换 Python 基底的大版本时要连这一行的 tag 一起换。
+# * 网页版**没有构建步骤**：整个前端是原生 ES modules，服务端只用 Node 标准库。
+#   所以这里就是拷源码，没有 npm install、没有多阶段产物。
+# * `web-front/test/` 与 `tools/` 不进镜像（.dockerignore 里挡着）。它们要在有
+#   photo-ar 源码和 Chrome 的地方跑，容器里跑不了也不该跑。
+#
+# 后端侧的取舍说明：
 # * 基础镜像用 python:3.11-slim 而不是 alpine —— opencv 与 numpy 在 alpine 上
 #   没有 manylinux wheel，得从源码编译，N5095 上编一次要几十分钟。
 # * ⚠️ 基底**不能换成按 `x86-64-v3` 编译的发行版**（比如某些"优化版"镜像，或者自己
@@ -27,6 +40,10 @@
 # * xfeat.onnx **不进镜像**：它是几 MB 的运行时资产，进镜像等于每次发版都重传一遍，
 #   也让"换模型"必须重建镜像。由 docker/entrypoint.py 在启动时取到数据卷里
 #   （tools/fetch_models.py，幂等 + sha256 校验）。取不到不影响启动，会回退 ORB。
+
+# Node 运行时的来源。**tag 里的 trixie 必须与下面 python 那行的基底一致**（见文件头）。
+FROM node:22-trixie-slim AS nodert
+
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -71,7 +88,21 @@ COPY tools/ ./tools/
 COPY docker/ ./docker/
 RUN chmod +x ./tools/arcoreimg 2>/dev/null || true
 
-# 8964：spec §9.1 的 LAN endpoint 端口
+# ---- 网页版 ----
+#
+# Node 就一个二进制（约 120MB）。没有 npm、没有 corepack、没有 node_modules ——
+# web-front 是零依赖的，那些一个都用不上，少拷一样就少一样要跟着升级的东西。
+COPY --from=nodert /usr/local/bin/node /usr/local/bin/node
+# 只拷真正要跑的。`server/` 与 `public/` 之外的（test/ tools/ local/）由
+# .dockerignore 挡在构建上下文外，这里的路径写死是第二道 —— 两道都要，
+# 因为 .dockerignore 改一行就能悄悄把 3.7MB 的测试素材放进来。
+COPY web-front/server/ ./web-front/server/
+COPY web-front/public/ ./web-front/public/
+COPY web-front/package.json ./web-front/
+
+# 8964：spec §9.1 的 LAN endpoint 端口。合并之后**它是唯一对外的端口** ——
+# 网页版、管理台、API 全在这一个上，按 URI 分（见 docker/entrypoint.py）。
+# 后端自己退到容器内的 127.0.0.1:8965，那个端口不 EXPOSE、也打不到。
 EXPOSE 8964
 VOLUME ["/data", "/config"]
 

@@ -43,6 +43,10 @@ services:
       #   - /home/xyz/图片:/media/photos:ro
       - ./local/photos:/media/photos
       - ./local/videos:/media/videos:ro
+      # 自测证书。开发机上手机要开相机就得 https，而那时候前面没有隧道
+      # （生成：web-front/tools/gen-dev-cert.sh）。!override 会把主文件里那条
+      # 一起丢掉，所以这里要再写一遍。
+      - ${WEBFRONT_CERT_DIR:-./web-front/local}:/certs:ro
 
     environment:
       # 容器内路径，与上面挂载的右半边一一对应
