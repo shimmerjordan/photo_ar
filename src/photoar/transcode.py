@@ -38,6 +38,9 @@ from pathlib import Path
 
 TARGET_HEIGHT = 1080
 MAX_DURATION_MS = 30_000
+# `needs_transcode` 判时长时给的余量。理由写在那个函数里（一句话：分片容器的时长
+# 按片对齐，我们自己切出来的 30 秒会被报成 30067ms，不留余量就无限重转）。
+DURATION_SLACK_MS = 500
 MAX_BITRATE = "4000k"
 BUF_SIZE = "8000k"
 CRF = "23"
@@ -274,10 +277,21 @@ def needs_transcode(info: VideoInfo) -> bool:
 
     体积判据顺带覆盖了「码率过高」：时长已经单独判过，同样时长下体积就是
     平均码率，所以不需要再去读 ffprobe 那个对 VBR 不可靠的 bit_rate。
+
+    ## 时长为什么带 [DURATION_SLACK_MS] 的余量
+
+    改成分片 MP4 之后（2026-08-05，网页版要靠 MediaSource 播，见文件末尾那段），
+    `-t 30.000` 切出来的东西 ffprobe 报 **30067ms** —— 分片容器的时长是按片对齐的，
+    最后一片会带一点尾巴。不留余量的话判据变成"我们自己刚转好的片子仍然需要转码"，
+    于是每一次入库、每一次 verify 都会把同一条视频重转一遍，永远收敛不了。
+    这个循环不会报错，只会让 NAS 一直在转码。
+
+    余量取 500ms：分片是 1 秒一片，最坏情况的尾巴远小于它，而 30.5 秒与 30 秒
+    在播放体验和体积上没有区别。
     """
     return (
         info.height > TARGET_HEIGHT
-        or info.duration_ms > MAX_DURATION_MS
+        or info.duration_ms > MAX_DURATION_MS + DURATION_SLACK_MS
         or info.size_bytes > MAX_PLAYABLE_BYTES
         or not info.faststart
         or info.width % 2 != 0
@@ -338,7 +352,25 @@ def transcode(
             "-t", f"{max_duration_ms / 1000:.3f}",
             "-vf", vf, *codec,
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-            "-movflags", "+faststart",
+            # 分片 MP4（fMP4），不是普通的 +faststart。**这是网页版能不能播的前提。**
+            #
+            # 起因：安卓上 `<video>` 的请求不是浏览器自己的网络栈发的，而是平台的
+            # MediaExtractor —— 它有独立的 TLS 栈，不认自签证书，也拿不到会话 cookie。
+            # 绕开它只有一条路：让页面自己 fetch 字节、经 MediaSource 喂给播放器，
+            # 那条路走的是 Chromium 自己的 ChunkDemuxer。而 **MediaSource 只吃分片
+            # MP4** —— 普通的 moov+mdat 喂进去是 12ms 一个 sourcebuffer 错误。
+            # 真机（小米 M2012K11C / Edge for Android 150）上逐个变量测过。
+            #
+            # `empty_moov` 让 moov 排在最前，所以 `has_faststart()` 仍然为真，
+            # `needs_transcode()` 不会因此把已经合规的片子反复重转（验证过）。
+            # 分片对别的客户端无害：fMP4 仍是合法 MP4，ExoPlayer / Safari / 桌面
+            # 浏览器都照播。
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            # 分片切到 1 秒一片。**光有 frag_keyframe 不够**：它按关键帧切，而源的
+            # GOP 可以很长 —— 实测一条 30 秒的片子第一个分片 3.5MB（整个文件的四分之一），
+            # 于是 MediaSource 那条路要等 10 秒才起播。加上这一条之后首片 397KB，
+            # 总体积只多 3.7KB。AR 里认出照片到出画的那几秒，全在这个数上。
+            "-frag_duration", "1000000",
             str(dst),
         ],
         capture_output=True, text=True, check=False,
