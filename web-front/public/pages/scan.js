@@ -23,7 +23,7 @@
  * 这里只给它发一次 `reset`（清掉跟踪状态，免得回来时还锁着上一张照片）。
  */
 import { CameraError, FrameGrabber, openCamera, stopCamera } from '../camera.js'
-import { MEDIA_ERR, NETWORK_STATE, READY_STATE, diag, diagAlways, flushDiag, short } from '../diag.js'
+import { MEDIA_ERR, NETWORK_STATE, READY_STATE, diag, diagAlways, flushDiag, isDiagEnabled, short } from '../diag.js'
 import { Renderer } from '../render/gl.js'
 import {
   FULL_RECT, TTL_MS, approach, clipVertices, imageToNdc, plausible, smoothingAlpha, unitSquareH,
@@ -94,30 +94,66 @@ export default {
       raf: 0, stream: null, renderer: null, grabber: null, alive: true, stopStream: null,
     }
 
+    /**
+     * 取景器底下那一行字。**按调试模式分两套内容。**
+     *
+     * ## 为什么要分
+     *
+     * 那一行原来一直显示 `库 45 张 · 无词表·全量扫描 · 24 fps · 检测 149ms ·
+     * 跟踪 12ms · 四角已过期 380ms · 跟踪点 83 · 视频 1920×1080`。对着这行字的人是
+     * **宾客**，他要的答案只有一个："我该怎么做才能看到视频"。上面那些数字一个都不
+     * 回答这个问题，而它们挤在一起还会把真正有用的那半句（"这张照片没配视频"）盖掉。
+     *
+     * 所以非调试模式下只留**用户能据此行动**的那几条，而且说人话：
+     *
+     * | 状态 | 非调试模式 | 调试模式 |
+     * |---|---|---|
+     * | 一切正常 | （空） | 库/帧率/耗时/四角年龄/跟踪点/视频分辨率 |
+     * | 这张没配视频 | 「这张照片还没配视频」 | `无视频` |
+     * | 视频在加载 | 「视频加载中…」 | `视频加载中 rs=1` |
+     * | 视频出错 | 「视频播不了」 | `视频错误 4` |
+     * | 词表没训 | （空 —— 那只影响速度，不影响结果） | `无词表·全量扫描` |
+     *
+     * 词表那条是这里最值得说明的一个判断：它**不是**一个用户能处理的问题（要管理员去
+     * 训），也不影响识别结果（只影响耗时），所以对宾客它是纯噪音。同理"库 45 张"——
+     * 那个数字在首页已经说过了（"你有 N 张照片可扫"），在取景器里重复一遍只占地方。
+     */
     const meta = () => {
+      const debug = isDiagEnabled()
       const parts = []
-      const lib = ctx.libInfo?.()
-      if (lib) {
-        parts.push(`库 ${lib.nPhotos} 张`)
-        if (lib.skipped?.length) parts.push(`${lib.skipped.length} 张不在识别库`)
-        if (lib.hasVocab === false) parts.push('无词表·全量扫描')
-      }
-      if (st.fps.value) parts.push(`${st.fps.value} fps`)
-      if (st.detectMs) parts.push(`检测 ${st.detectMs}ms`)
-      if (st.trackMs) parts.push(`跟踪 ${st.trackMs}ms`)
-      if (st.lockedPhoto) {
-        const age = st.quadAt ? Math.round(performance.now() - st.quadAt) : null
-        parts.push(st.quad ? `贴合中 ${age}ms前` : age === null ? '无四角' : `四角已过期 ${age}ms`)
-        if (st.trackPoints) parts.push(`跟踪点 ${st.trackPoints}`)
-        const v = dom.clip
-        if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
-        else if (v.error) parts.push(`视频错误 ${v.error.code}`)
-        else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
+      const v = dom.clip
+
+      if (debug) {
+        const lib = ctx.libInfo?.()
+        if (lib) {
+          parts.push(`库 ${lib.nPhotos} 张`)
+          if (lib.skipped?.length) parts.push(`${lib.skipped.length} 张不在识别库`)
+          if (lib.hasVocab === false) parts.push('无词表·全量扫描')
+        }
+        if (st.fps.value) parts.push(`${st.fps.value} fps`)
+        if (st.detectMs) parts.push(`检测 ${st.detectMs}ms`)
+        if (st.trackMs) parts.push(`跟踪 ${st.trackMs}ms`)
+        if (st.lockedPhoto) {
+          const age = st.quadAt ? Math.round(performance.now() - st.quadAt) : null
+          parts.push(st.quad ? `贴合中 ${age}ms前` : age === null ? '无四角' : `四角已过期 ${age}ms`)
+          if (st.trackPoints) parts.push(`跟踪点 ${st.trackPoints}`)
+          if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
+          else if (v.error) parts.push(`视频错误 ${v.error.code}`)
+          else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
+          else if (v.paused) parts.push('视频已暂停')
+          else parts.push(`视频 ${v.videoWidth}×${v.videoHeight}`)
+        }
+      } else if (st.lockedPhoto) {
+        // 认出来了但看不到画面时才说话。其余时候留空 —— 该说的话在上面那条 tip 里。
+        if (!st.lockedPhoto.mediaUrl) parts.push('这张照片还没配视频')
+        else if (v.error) parts.push('视频播不了')
+        else if (v.readyState < 2) parts.push('视频加载中…')
         else if (v.paused) parts.push('视频已暂停')
-        else parts.push(`视频 ${v.videoWidth}×${v.videoHeight}`)
       }
       dom.meta.textContent = parts.join(' · ')
     }
+    // 连点三下**关掉**调试模式（开不了 —— 入口在设置页连按版本号，见 diag.js 的
+    // `bindToggle`）。绑在这条读数上：调试时手机就在手上，跑回设置页很烦。
     ctx.bindDiagToggle?.(dom.meta)
 
     // ── 视频那一环的打点 ────────────────────────────────────────────
