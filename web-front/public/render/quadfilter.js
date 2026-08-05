@@ -42,6 +42,10 @@
  *
  * `LEAD_SCALE = 0.7` 是刻意的欠补偿：速度估计自己有一个 [VEL_TAU_MS] 的滞后，
  * 补满 100% 在加速段会过冲。仿真里 0.7 比 1.0 好（滞后 -36% vs -33%）。
+ *
+ * 而 [LEAD_MAX_MS] 是硬上界。它是**真机上抓出来的**，仿真暴露不了 —— 那边观测间隔
+ * 固定 51ms，而真机上跟踪一慢观测间隔就掉到 208ms，外推量算到 234ms，结果是
+ * "平滑后的抖动比原始还大一倍"。详见那个常量。
  */
 
 /** 静止时的位置平滑时间常数（ms）。大 = 更稳。 */
@@ -66,6 +70,24 @@ export const SPEED_REF = 0.05e-3
 export const LEAD_SCALE = 0.7
 
 /**
+ * 外推量的**硬上界**（ms）。超过它就不再往前补 —— 宁可落后，不能飞出去。
+ *
+ * ## 这一条是真机上抓出来的，仿真暴露不了
+ *
+ * 外推量 = 观测的陈旧度 + 从收到它到现在 + 平滑器的 tau。中间那一项在健康状态下是
+ * 几十毫秒，但它**没有上界**：跟踪一慢下来（真机上量到观测间隔从 51ms 掉到 208ms）、
+ * 或者主线程被别的东西卡住，它就线性增长。实测那一段的外推量算到了 **234ms**，
+ * 结果是"平滑后的抖动比原始还大一倍"——视频在照片上晃。
+ *
+ * 仿真里观测间隔是固定的 51ms，所以这条路径永远走不到。**固定采样率的仿真测不出
+ * 采样率变化引起的问题** —— 这是那份仿真的已知盲区，写在这里。
+ *
+ * 120ms 的依据：健康状态下观测间隔是 51~93ms（真机，取决于跟踪耗时），而外推超过
+ * 一个观测间隔就已经是在赌下一帧了。给到约 1.5 个间隔，再多就是猜。
+ */
+export const LEAD_MAX_MS = 120
+
+/**
  * 一个四角滤波器。**有状态**，一次锁定用一个实例，丢锁就 `reset()`。
  *
  * 坐标是归一化图像坐标（0..1 是整幅相机图，可越界），8 个一组 = 四个角。
@@ -80,6 +102,7 @@ export class QuadFilter {
     this.velTau = opts.velTau ?? VEL_TAU_MS
     this.speedRef = opts.speedRef ?? SPEED_REF
     this.leadScale = opts.leadScale ?? LEAD_SCALE
+    this.leadMax = opts.leadMax ?? LEAD_MAX_MS
     this.reset()
   }
 
@@ -150,8 +173,11 @@ export class QuadFilter {
     if (!this.pos || !out || out.length !== 8) return null
     const k = this.motion
     // 要补的三段：观测本身的陈旧度、从收到它到现在、平滑器自身的一阶滞后。
-    // 乘 k 是"静止时不外推"，乘 leadScale 是刻意欠补偿。
-    const ahead = (this.obsAge + Math.max(0, nowMs - this.lastObsAt) + this.tau) * k * this.leadScale
+    // 乘 k 是"静止时不外推"，乘 leadScale 是刻意欠补偿，最后**夹到上界**。
+    // 上界那一步不是防御性编程：没有它，观测一稀疏外推量就线性增长，
+    // 真机上量到过 234ms —— 那时输出的抖动比原始观测还大一倍。
+    const raw = (this.obsAge + Math.max(0, nowMs - this.lastObsAt) + this.tau) * k * this.leadScale
+    const ahead = Math.min(raw, this.leadMax)
     for (let i = 0; i < 8; i++) out[i] = this.pos[i] + this.vel[i] * ahead
     return out
   }

@@ -7,7 +7,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  LEAD_SCALE, QuadFilter, SPEED_REF, TAU_FAST_MS, TAU_SLOW_MS, VEL_TAU_MS,
+  LEAD_MAX_MS, LEAD_SCALE, QuadFilter, SPEED_REF, TAU_FAST_MS, TAU_SLOW_MS, VEL_TAU_MS,
 } from '../public/render/quadfilter.js'
 
 /** 一个四角：左上、右上、左下、右下，都平移 (dx,dy)。 */
@@ -140,6 +140,38 @@ describe('运动', () => {
     for (const [name, e] of [['33ms', e33], ['66ms', e66]]) {
       assert.ok(e < 0.2e-3 * 88 * 0.6, `${name} 的误差 ${e.toExponential(2)} 太大`)
     }
+  })
+})
+
+describe('外推的上界', () => {
+  // 这一组是真机上抓出来的缺陷，而仿真暴露不了它（那边观测间隔固定 51ms）。
+  test('观测稀疏时外推量被夹住，不线性增长', () => {
+    const f = new QuadFilter()
+    // 先建立一个速度
+    for (let t = 0; t < 2000; t += 51) f.observe(quadAt(0.3e-3 * t), t, 90)
+    const at2000 = f.at(2000, out())[0]
+    // 然后 500ms 不来新观测（真机上跟踪变慢、或主线程被卡住时就是这样）
+    const at2500 = f.at(2500, out())[0]
+    const drift = at2500 - at2000
+    // 没有上界的话这 500ms 会被原样乘进外推量，位移 0.3e-3 × 500 × 0.7 = 105‰。
+    // 有上界之后总外推量不超过 LEAD_MAX_MS，所以多出来的位移必须很小。
+    assert.ok(drift < 0.3e-3 * LEAD_MAX_MS, `500ms 没有新观测，四角飘了 ${(drift * 1000).toFixed(1)}‰`)
+  })
+
+  test('上界要小于一个不健康的观测间隔（否则它形同不存在）', () => {
+    // 真机健康状态下观测间隔 51~93ms；不健康时量到过 208ms。
+    // 上界必须落在这两者之间，否则要么常态被夹（跟不上）、要么不健康时不生效。
+    assert.ok(LEAD_MAX_MS >= 93 && LEAD_MAX_MS < 208, `LEAD_MAX_MS=${LEAD_MAX_MS}`)
+  })
+
+  test('健康状态下上界不该生效（不能顺手把正常情况也夹了）', () => {
+    const f = new QuadFilter()
+    for (let t = 0; t < 3000; t += 51) f.observe(quadAt(0.3e-3 * t), t, 90)
+    // 观测刚到，lead ≈ (90 + 0 + 25) × 1 × 0.7 = 80.5ms < 120，不该被夹。
+    const capped = new QuadFilter({ leadMax: 1e9 })
+    for (let t = 0; t < 3000; t += 51) capped.observe(quadAt(0.3e-3 * t), t, 90)
+    assert.ok(Math.abs(f.at(3000, out())[0] - capped.at(3000, out())[0]) < 1e-6,
+      '健康状态下有没有上界应当没有区别')
   })
 })
 
