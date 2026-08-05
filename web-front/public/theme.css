@@ -1,0 +1,597 @@
+/**
+ * 星露谷风的界面系统。
+ *
+ * ## 四条硬约束，整份文件都在绕着它们转
+ *
+ * **一、点阵字体只在设计尺寸的整数倍上是清楚的。** 字体按 12×12 的格子画，字号必须是
+ * 12 的整数倍，`line-height` / `padding` / `letter-spacing` 一律整数 px。写 1.5em 或者
+ * 13px 会让字母的竖笔一根 1px 一根 2px —— 那不是"有点糊"，是看着像坏了。
+ * 所以这套界面只有两级字号：12（一切）与 24（页面标题）。层次靠颜色和间距分，不靠字号。
+ *
+ * **二、边框是九宫格贴图，不是 CSS 画的。** `border-image` 的每条边中段在原图里逐列
+ * 完全相同（切图脚本里验过），所以默认的 stretch 拉伸不产生任何插值痕迹，四角又是 1:1
+ * 显示的 —— 于是整套框在任何尺寸下都逐像素精确，连 `image-rendering` 都不需要。
+ * 用九宫格的元素**必须 `background: none`**：元素自身的背景色画在 border box 上，
+ * 会从木框圆角外面漏出四个直角。
+ *
+ * **三、像素画里没有模糊。** 没有 border-radius、没有带 blur 的 box-shadow、没有渐变。
+ * 阴影一律 `drop-shadow(x y 0 …)`（blur 为 0，硬边跟着 alpha 走），过渡一律 `steps()`。
+ *
+ * **四、前景色是继承来的，不是每处写死的。** 见下面「两种底」。
+ *
+ * ## 两种底，以及为什么前景色必须靠变量传递
+ *
+ * 桃色木框是"菜单"，深色是"世界"。这是游戏自己的分法，而这个应用刚好需要它：扫描页是
+ * 取景器，屏幕必须暗到让相机预览和贴在照片上的视频是画面里最亮的东西；其余八页是任务
+ * 界面，亮一点更好读。
+ *
+ * 于是同一个 `.p.dim`、同一个 `.row2 .k`，在深色底上和在桃色面板里需要**完全不同的颜色**。
+ * 一处一处写 `.panel .p.dim { … }` 能work，但每加一个组件就要补一条，漏掉的那条不会报错
+ * —— 只会在某个底上变成一坨看不清的字。所以颜色走 `--fg` / `--fg-dim` / `--fg-bad`
+ * 三个变量，**由容器设定、被内容继承**。加新组件时什么都不用做。
+ *
+ * 每一对前景/背景的对比度都标了实测值，全部 ≥4.5:1（大字号处标注例外）。
+ */
+
+/* ══ 令牌 ══════════════════════════════════════════════════════════════ */
+:root {
+  /* 木框六环。**与 tools/extract-art.py 的 WOOD 表同源** —— 那边改了这边要跟着改。
+     art.test.js 盯着这件事（对不上的话按钮边框和它旁边的分隔线会是两个色）。 */
+  --wood-outer: #5d1a2f;
+  --wood-dark: #843316;
+  --wood-mid: #9e471f;
+  --wood: #bc6700;
+  --wood-bevel: #c68963;
+
+  --face: #ffc699;        /* 桃色内胆 */
+  --face-night: #1b1a2e;  /* 夜色内胆 */
+  --gold: #ffc42b;
+
+  --bg: #100e1c;          /* 应用底：比夜色内胆更暗，面板才浮得起来 */
+  --bar: #331b14;         /* 木质栏（夜框的第二环） */
+  --bar-edge: #6b4522;    /* 木质栏的高光边（夜框的木环） */
+
+  /* 桃色上的字 */
+  --ink: #221122;         /* 正文 11.8:1 */
+  --ink-dim: #5a3a22;     /* 次要  6.7:1 */
+  --ink-bad: #7a1410;     /* 红    7.1:1 */
+  --ink-ok: #285c1a;      /* 绿    5.2:1 —— 星露谷的绿在桃色上要压到这么暗才够 */
+  /* 夜色上的字 */
+  --lit: #ffe7c4;         /* 正文 14.2:1 */
+  --lit-dim: #a99bb5;     /* 次要  6.5:1 */
+  --lit-bad: #ff7a6e;     /* 红    6.7:1 */
+
+  /* 当前语境的前景三色。深色底是默认；桃色容器自己覆盖。 */
+  --fg: var(--lit);
+  --fg-dim: var(--lit-dim);
+  --fg-bad: var(--lit-bad);
+  --fg-ok: var(--gold);
+  --rule: rgb(198 137 99 / 30%);   /* 分隔线：木头的浅色环压透明 */
+
+  --font: "FusionPixel", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --tabh: 50px;
+
+  /* 层级。数字之间留空是为了以后能插进去，而不是写 999。 */
+  --z-hud: 5;
+  --z-toast: 30;
+  --z-gate: 40;
+}
+
+/* 点阵中文字体。子集见 tools/make-font.py。
+   `swap`：175KB 在手机上可能要一秒，那一秒里宁可先用系统字把内容显示出来。
+   `?v=` 是给 immutable 缓存留的把手 —— **重新生成字体时必须改它**。 */
+@font-face {
+  font-family: "FusionPixel";
+  src: url("/art/pixel.woff2?v=1") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+* { box-sizing: border-box; }
+
+/* `[hidden]` 必须赢过组件自己的 display。
+   浏览器默认样式里 `[hidden]{display:none}` 的优先级极低，任何一条
+   `.field{display:block}` 都能盖掉它 —— 表现是"藏起来的东西藏不住"，
+   而 JS 那边 `el.hidden = true` 明明执行了。这一条踩过：登录门的口令框一直露着。 */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/20px var(--font);
+}
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  overflow: hidden;
+}
+/* 浏览器默认 h1 是 2em、h2 是 1.5em —— 落到 24px 和 18px。24 没问题，**18 是灾难**：
+   点阵字体在 1.5× 下每根竖笔一会儿 1px 一会儿 2px。所以先全部收回 12px，
+   要大的地方（#title / .ttl / .letter h1）自己写 24px。 */
+h1, h2, h3 { margin: 0; font-weight: 400; font-size: inherit; }
+p { margin: 0; }
+a { color: var(--gold); }
+/* `img` 那条只管 <img> 标签。CSS 背景图要单独说 —— 夜空底是 cover 缩放的，
+   不说的话浏览器会双线性插值，一屏像素画糊成水彩。 */
+img, #gate, .junimo, .warnbox::before { image-rendering: pixelated; }
+
+/* 焦点环。像素风里也得有 —— 键盘用户没有别的办法知道自己在哪。
+   实心、0 圆角、够粗，在木框的任何一种皮肤上都看得见。 */
+:focus-visible { outline: 3px solid var(--lit); outline-offset: 1px; }
+
+/* ══ 九宫格木框 ════════════════════════════════════════════════════════
+   两个尺寸不是"大图缩小"，而是同一副美术的两种落地：
+   大的（20px）给面板，木纹的层次读得出来；小的（10px）给按钮和输入框 ——
+   44px 高的按钮塞不下 20px 的边框。 */
+.panel,
+.card,
+button,
+input:not([type="file"]),
+.chip,
+.tab,
+.toast,
+.warnbox,
+.framed,
+.letter {
+  background: none;         /* 见文件头第二条 */
+  border-radius: 0;
+  border-style: solid;
+  border-color: transparent;
+  font: inherit;
+}
+
+/* 桃色容器：把前景三色切到墨色一档。加新组件时只要挂上这一类就对了。 */
+.panel,
+.card,
+.framed,
+.toast,
+.warnbox,
+.letter,
+.tab.on,
+input:not([type="file"]) {
+  --fg: var(--ink);
+  --fg-dim: var(--ink-dim);
+  --fg-bad: var(--ink-bad);
+  --fg-ok: var(--ink-ok);
+  --rule: rgb(158 71 31 / 35%);
+  color: var(--fg);
+}
+/* 夜色面板把它切回来（.panel 在上面已经被切成桃色了）。 */
+.panel.night {
+  --fg: var(--lit);
+  --fg-dim: var(--lit-dim);
+  --fg-bad: var(--lit-bad);
+  --fg-ok: var(--gold);
+  --rule: rgb(198 137 99 / 30%);
+  border-image-source: url("/art/frame-night.png");
+}
+
+.panel {
+  display: block;
+  border-width: 20px;
+  border-image: url("/art/frame.png") 20 fill;
+  padding: 0 4px 4px;
+}
+.card, .framed {
+  border-width: 10px;
+  border-image: url("/art/frame-s.png") 10 fill;
+}
+
+/* ══ 按钮：亮暗分主次 ══════════════════════════════════════════════════
+   星露谷里没有"幽灵按钮"这种东西 —— 每个能按的都是一块木头。主次靠亮暗分：
+   金色是这一屏要你做的那件事，深色是别的选择，红木是删。
+   金色而不是桃色，是因为按钮多半站在桃色面板里，同色会读成面板的一部分。 */
+button {
+  border-width: 10px;
+  border-image: url("/art/frame-gold-s.png") 10 fill;
+  --fg: var(--ink);
+  color: var(--fg);
+  min-height: 44px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  filter: drop-shadow(0 3px 0 rgb(0 0 0 / 55%));
+  transition: transform 90ms steps(3), filter 90ms steps(3);
+}
+/* 按下去是真的往下沉，阴影同时消失 —— 那是"贴到桌面上了"。 */
+button:active:not(:disabled) { transform: translateY(3px); filter: none; }
+button:disabled { filter: grayscale(60%) brightness(70%); }
+button.ghost {
+  border-image-source: url("/art/frame-night-s.png");
+  --fg: var(--lit);
+}
+button.danger { border-image-source: url("/art/frame-red-s.png"); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+/* ══ 外壳 ══════════════════════════════════════════════════════════════ */
+#app { position: fixed; inset: 0; display: flex; flex-direction: column; }
+#app[hidden] { display: none; }
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: calc(8px + env(safe-area-inset-top)) 8px 8px;
+  background: var(--bar);
+  border-bottom: 3px solid var(--bar-edge);
+}
+#topbar[hidden] { display: none; }
+#title {
+  flex: 1;
+  font-size: 24px;
+  line-height: 32px;
+  color: var(--gold);
+  /* 硬阴影，游戏里每一处标题都有。blur 为 0 才不破坏像素。 */
+  text-shadow: 0 2px 0 rgb(0 0 0 / 60%);
+}
+#back { min-width: 44px; min-height: 44px; padding: 0 6px; }
+#back[hidden] { display: none; }
+
+/* 木箭头只画了朝上那一张，四个方向靠旋转。90° 的整数倍不产生插值，像素还是像素。 */
+.arrow-l { transform: rotate(-90deg); }
+.arrow-r { transform: rotate(90deg); }
+.arrow-d { transform: rotate(180deg); }
+
+#view { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 12px 10px 20px; }
+#view.full { padding: 0; overflow: hidden; position: relative; }
+
+/* 底栏。每个页签是一块小木牌；当前那块换成桃色并且**顶出来 4px** ——
+   游戏里的页签就是这么动的，而它比一条下划线好认得多。 */
+#tabbar {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 5px 5px calc(5px + env(safe-area-inset-bottom));
+  background: var(--bar);
+  border-top: 3px solid var(--bar-edge);
+}
+.tab {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--tabh);
+  border-width: 10px;
+  border-image: url("/art/frame-night-s.png") 10 fill;
+  color: var(--lit-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 2px;
+  transition: transform 120ms steps(4);
+}
+.tab > span { white-space: nowrap; overflow: hidden; }
+.tab.on {
+  border-image-source: url("/art/frame-s.png");
+  transform: translateY(-4px);
+}
+.tab:active { transform: translateY(2px); }
+.tab.on:active { transform: translateY(-2px); }
+.ico { display: block; flex: none; }
+
+/* ══ 区块：标题在面板外面 ══════════════════════════════════════════════
+   标题压在深色底上、面板本身是桃色的一块木牌。游戏里的分组就是这个层次感，
+   而且它省掉了"标题要用哪种前景色"这个问题 —— 它根本不在面板里。 */
+.sec { margin: 0 0 14px; }
+.sec > h2 {
+  letter-spacing: 1px;      /* 整数 px：em 会产生半像素偏移 */
+  color: var(--lit-dim);
+  margin: 0 0 5px 2px;
+}
+
+.row2 { display: flex; gap: 8px; padding: 6px 2px; border-bottom: 2px solid var(--rule); }
+.row2:last-child { border-bottom: 0; }
+.row2 .k { color: var(--fg-dim); flex: none; min-width: 8em; }
+.row2 .v { flex: 1; word-break: break-all; }
+.mono { font-variant-numeric: tabular-nums; }
+.bad { color: var(--fg-bad); }
+.p { margin: 0 0 6px; }
+.p.dim { color: var(--fg-dim); }
+.p.warn { color: var(--fg-bad); }
+.note { color: var(--fg-dim); margin-top: 8px; }
+
+/* 提醒框：金木框 + 一个感叹号气泡。
+   **字体里没有 ⚠ ✓ ✗**（子集化时报了缺字），所以这三个记号只能是图 —— 写进文案里
+   会回退到系统 emoji 字体，在一屏点阵字里像贴了张贴纸。 */
+.warnbox {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  border-width: 10px;
+  border-image: url("/art/frame-gold-s.png") 10 fill;
+  padding: 4px 2px;
+  margin: 0 0 10px;
+}
+.warnbox::before {
+  content: "";
+  flex: none;
+  width: 24px;
+  height: 24px;
+  background: url("/art/bang.png") center / 24px 24px no-repeat;
+}
+
+/* ══ 三个状态各自成型 ══════════════════════════════════════════════════
+   加载 / 空 / 错误要用户做的事完全不同：等、去别处做点什么、重试。
+   配图也不同 —— 走路的 Junimo、站着的稻草人、打叉的气泡。 */
+.state {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--fg-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.state-t { color: var(--fg); }
+.state-t.bad { color: var(--fg-bad); }
+.state-h { max-width: 26em; }
+
+.junimo {
+  width: 48px;
+  height: 48px;
+  background: url("/art/junimo.png") 0 0 / 192px 48px;
+  animation: junimo-walk 640ms steps(4) infinite;
+}
+@keyframes junimo-walk { to { background-position: -192px 0; } }
+.sprite { display: block; }
+
+/* ══ 照片：一张一个木相框 ══════════════════════════════════════════════ */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.card {
+  display: block;
+  padding: 0;
+  text-align: left;
+  min-height: 0;
+  filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%));
+  transition: transform 90ms steps(3), filter 90ms steps(3);
+}
+.card:active { transform: translateY(3px); filter: none; }
+.thumb { display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover; background: #000; }
+.card-b { padding: 4px 2px 0; display: flex; flex-direction: column; gap: 3px; }
+.card-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flags { display: flex; gap: 4px; flex-wrap: wrap; }
+.badge { padding: 0 4px; background: rgb(94 26 47 / 20%); color: var(--fg-dim); }
+.badge.warn { background: rgb(255 196 43 / 55%); color: var(--ink); }
+
+/* 详情页那张大参考图也进相框 —— 它是这一页的主体，裸着挂在深色底上像张贴纸。 */
+.framed { display: block; margin: 0 0 12px; filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%)); }
+.ref { display: block; width: 100%; max-height: 42vh; object-fit: contain; background: #000; }
+.ttl { font-size: 24px; line-height: 32px; margin: 0 0 12px; color: var(--gold); }
+
+/* ══ 列表 ══════════════════════════════════════════════════════════════
+   刻意**不**给每条套木框：这一页可能有两百条，两百块木牌是两百块木牌，
+   而它要当日志读。用一圈硬边内阴影表示"一条"，密度保住。 */
+.list { display: flex; flex-direction: column; gap: 6px; }
+.item {
+  padding: 6px 8px;
+  background: rgb(255 198 153 / 7%);
+  box-shadow: inset 0 0 0 2px var(--rule);
+}
+.item.bad { box-shadow: inset 0 0 0 2px rgb(255 122 110 / 45%); }
+.item-h { display: flex; justify-content: space-between; gap: 8px; }
+.item-h .ok { color: var(--gold); }
+.item-h .miss, .item-h .when { color: var(--fg-dim); }
+.item-b { margin-top: 2px; }
+.item-m { color: var(--fg-dim); }
+.item-hint { color: var(--gold); margin-top: 2px; }
+
+/* ══ 表单 ══════════════════════════════════════════════════════════════ */
+input:not([type="file"]) {
+  border-width: 10px;
+  border-image: url("/art/frame-s.png") 10 fill;
+  min-height: 44px;
+  padding: 0 4px;
+  width: 100%;
+}
+input::placeholder { color: var(--ink-dim); opacity: 1; }   /* 占位符也要 4.5:1 */
+input:focus { border-image-source: url("/art/frame-gold-s.png"); }
+label { display: block; }
+.field, .file { display: block; margin-bottom: 10px; }
+/* `:first-child` 是必须的：一个 .file 里还有「选择文件」木牌和文件名两个 span，
+   不限定的话它们会一起吃到"标签文字"的样式。 */
+.field > span:first-child, .file > span:first-child { display: block; color: var(--fg-dim); margin-bottom: 4px; }
+.file { padding: 8px; background: rgb(94 26 47 / 8%); box-shadow: inset 0 0 0 2px var(--rule); cursor: pointer; }
+
+/* 原生的 `<input type=file>` 是这一屏唯一没法用 CSS 改的东西 —— 浏览器画的那个
+   「Choose File」按钮带着系统字体和圆角，在一屏点阵字里像贴了张便利贴。
+   做法：把真 input 收起来（**留在无障碍树里**，只是看不见），用一块木牌当可见的触发点。
+   `<label for=…>` 让点木牌等于点 input，不需要任何 JS。 */
+.file input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.pick {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 8px;
+  border: 10px solid transparent;
+  border-image: url("/art/frame-night-s.png") 10 fill;
+  color: var(--lit);
+  background: none;
+}
+/* 键盘焦点落在被藏起来的 input 上，所以焦点环要画在木牌上。 */
+.file:focus-within .pick { outline: 3px solid var(--lit); outline-offset: 1px; }
+.fname { display: block; margin-top: 4px; color: var(--fg-dim); word-break: break-all; }
+
+/* 一排木牌而不是下拉框：下拉会把选项藏起来，于是大多数人不知道有得选。 */
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.chip {
+  min-height: 38px;
+  padding: 0 6px;
+  border-width: 10px;
+  border-image: url("/art/frame-night-s.png") 10 fill;
+  color: var(--lit-dim);
+}
+.chip.on { border-image-source: url("/art/frame-gold-s.png"); color: var(--ink); }
+
+.steps { margin-top: 8px; max-height: 30vh; overflow-y: auto; }
+.step { padding: 2px 0; color: var(--fg-dim); border-bottom: 2px solid var(--rule); }
+.step.ok { color: var(--fg-ok); }
+.step.warn { color: var(--fg); }
+.step.bad { color: var(--fg-bad); }
+
+/* ══ 进度条：木槽 + 金条 ══════════════════════════════════════════════ */
+#bar, .bar2 {
+  height: 10px;
+  flex: none;
+  padding: 2px;
+  background: var(--wood-outer);
+  box-shadow: inset 0 0 0 2px var(--wood-dark);
+  overflow: hidden;
+}
+#bar[hidden] { display: none; }
+#bar > i, .bar2 > i {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--gold);
+  transform: scaleX(0);
+  transform-origin: left center;
+  /* 动 transform 而不是 width：这条在相机预览之上、加载期间每 200ms 更新一次。 */
+  transition: transform 180ms linear;
+}
+#bar.indeterminate > i { animation: sweep 1100ms steps(12) infinite; transition: none; }
+@keyframes sweep {
+  0% { transform: scaleX(.35) translateX(-120%); }
+  100% { transform: scaleX(.35) translateX(320%); }
+}
+
+#boot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  color: var(--fg-dim);
+}
+#boot[hidden] { display: none; }
+
+/* ══ 扫描页 ════════════════════════════════════════════════════════════ */
+.gl { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+/* 这两个 video 必须留在布局里、只是看不见：iOS 14 起 Safari 不为 display:none 的
+   视频产帧，纹理会冻在第一帧。 */
+.offscreen { position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; z-index: -1; }
+
+/* HUD 是钉在底部的一块深色木牌 —— 游戏里的快捷栏就在这个位置。
+   不用渐变遮罩：像素画里没有渐变，而一块实心木头反而让文字更好读。 */
+#hud {
+  position: absolute;
+  inset: auto 6px calc(6px + env(safe-area-inset-bottom)) 6px;
+  z-index: var(--z-hud);
+  border: 20px solid transparent;
+  border-image: url("/art/frame-night.png") 20 fill;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 2px 2px;
+}
+#tip { min-height: 40px; }
+#tip b { color: var(--gold); font-weight: 400; }
+/* 认出来了：右上角"啪"地钉上一颗星，压在木框上。识别成功是这个应用唯一值得庆祝的时刻。
+   **绝对定位、不进文字流**：放进流里的话，那 32px 要么在没命中时空占一格把整段文字
+   往右挤，要么在命中那一刻把文字推走 —— 而那正是用户在读它的时候。 */
+#hud::after {
+  content: "";
+  position: absolute;
+  top: -14px;
+  right: -6px;
+  width: 32px;
+  height: 32px;
+  background: url("/art/star.png") center / 32px 32px no-repeat;
+  image-rendering: pixelated;
+  transform: scale(0);
+  transition: transform 200ms steps(4);
+}
+#hud.hit::after { transform: scale(1); }
+#meta { color: var(--fg-dim); display: flex; gap: 10px; flex-wrap: wrap; }
+.gate-inline {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: var(--bg);
+}
+.player { display: block; width: 100%; max-height: 60vh; background: #000; }
+
+/* ══ 登录门：夜空底 + 一封信 ══════════════════════════════════════════
+   宾客扫码打开这个页面，第一眼看到的就是这一屏。所以它是唯一一处**为了好看**
+   而存在的设计 —— 其余每一页都是在办事。 */
+#gate {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-gate);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 20px 14px calc(20px + env(safe-area-inset-bottom));
+  background: var(--bg) url("/art/nightsky.png") center / cover no-repeat;
+}
+#gate[hidden] { display: none; }
+.letter {
+  width: 100%;
+  max-width: 26em;
+  border-width: 16px;
+  border-image: url("/art/letter.png") 16 fill;
+  padding: 4px 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  filter: drop-shadow(0 4px 0 rgb(0 0 0 / 45%));
+}
+.letter h1 {
+  font-size: 24px;
+  line-height: 32px;
+  color: #7a3b12;                /* 羊皮纸上的棕，6.9:1 */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.letter .field { margin: 0; }
+.letter .err { color: var(--fg-bad); }
+.letter .actions { margin-top: 2px; }
+
+/* ══ toast：只用于「做完了」。失败留在页面上。 ════════════════════════ */
+#toasts {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--tabh) + 24px);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.toast {
+  border-width: 10px;
+  border-image: url("/art/frame-gold-s.png") 10 fill;
+  padding: 0 6px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%));
+}
+
+/* ══ 少动 ══════════════════════════════════════════════════════════════
+   按下去沉一格是**状态反馈**，不是装饰，所以留着。停掉的是循环动画。 */
+@media (prefers-reduced-motion: reduce) {
+  .junimo { animation: none; }
+  #bar.indeterminate > i { animation: none; transform: scaleX(1); opacity: .5; }
+  .tab, .card, button, #hud::after { transition: none; }
+}

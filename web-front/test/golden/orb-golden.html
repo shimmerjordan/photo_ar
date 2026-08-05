@@ -1,0 +1,372 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ORB 跨语言 golden</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log, loadOpenCv } from '../bridge.js'
+import { resizedSize } from '../../public/recognize/pyparity.js'
+import { OrbExtractor, _setOpenCv } from '../../public/recognize/orb.js'
+import { matchHamming, ransacPair, normalizedQuad } from '../../public/recognize/verify.js'
+
+/**
+ * ## 这份测试测什么
+ *
+ * 一条性质：**浏览器算出来的 ORB 描述子，能不能和库里 `desc.bin`（服务端算的）配上。**
+ *
+ * 四个 case 由弱到强：
+ *
+ * | case | 问的问题 |
+ * |---|---|
+ * | `rgba_equiv` | canvas 的 RGBA 转灰度 == 服务端的 BGR 转灰度？（成立才能免掉手工重排通道） |
+ * | `orb_gray`   | 同一段灰度字节，两侧的 ORB 输出一样吗？（算法一致性的最小构造） |
+ * | `extract`    | 走完整 `features.extract` 契约（resize → 灰度 → ORB → top-N）后还一样吗？ |
+ * | `cross_match`| **端到端**：服务端算的参考描述子 + 浏览器算的查询描述子 → 内点数够不够过门槛？ |
+ *
+ * ## 两次修正过的判据（都记下来，免得后人再走一遍）
+ *
+ * **第一版**把描述子数组整体逐字节比 —— 红了，而原因不是描述子不同，是
+ * `detectAndCompute` 返回关键点的**顺序**在两侧不同（orb_gray 那 300 个点里第一个分别是
+ * (310,400) 和 (309,120)，值都对、位置在对方数组里）。整条识别管线没有任何一步依赖数组
+ * 顺序（匹配是集合操作、RANSAC 用坐标、词量化逐个独立），所以顺序不该进判据。改成按
+ * **(x,y,octave)** 配对再比同位描述子。
+ *
+ * **第二版**要求同位描述子逐位相同 —— 还是红，实测 4000 个里 85 个各差 1 个字节。根因是
+ * `angle`：wasm 与原生的 `fastAtan2` 有末位差异，而 rBRIEF 的采样点要按 angle 旋转，
+ * 于是落在整数像素边界上的少数采样点跳了一格、翻了那一位。这**不是可以修的东西**
+ * （除非放弃 wasm），所以判据改成"Hamming 距离必须远小于匹配的判别尺度"，并让
+ * `cross_match` 用真实的内点数回答"到底有没有影响"。
+ */
+
+function matFromBytes(cv, h, w, channels, bytes) {
+  const type = channels === 1 ? cv.CV_8UC1 : channels === 3 ? cv.CV_8UC3 : cv.CV_8UC4
+  const m = new cv.Mat(h, w, type)
+  m.data.set(bytes)
+  return m
+}
+
+function bytesOf(mat) {
+  if (!mat.isContinuous()) throw new Error('Mat 不连续，直接读 data 会串行')
+  return mat.data.slice(0, mat.rows * mat.cols * mat.channels())
+}
+
+async function sha16(bytes) {
+  const d = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
+}
+
+function b64Bytes(b64) {
+  const s = atob(b64)
+  const out = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)
+  return out
+}
+
+function b64F32(b64) {
+  const b = b64Bytes(b64)
+  return new Float32Array(b.buffer, b.byteOffset, b.length / 4)
+}
+
+const POPCOUNT = new Uint8Array(256)
+for (let i = 0; i < 256; i++) POPCOUNT[i] = (i & 1) + POPCOUNT[i >> 1]
+
+const keyOf = (x, y, octave) => `${x}|${y}|${octave}`
+
+/** 直接用 KeyPointVector 拿全部关键点（不排序、不截断），给 orb_gray 那个最小构造用。 */
+function detectRaw(cv, orb, gray) {
+  const kps = new cv.KeyPointVector()
+  const desc = new cv.Mat()
+  const noMask = new cv.Mat()
+  orb.detectAndCompute(gray, noMask, kps, desc)
+  const n = kps.size()
+  const rows = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const k = kps.get(i)
+    rows[i] = { x: k.pt.x, y: k.pt.y, angle: k.angle, response: k.response, octave: k.octave, size: k.size }
+  }
+  noMask.delete(); kps.delete()
+  return { rows, desc }
+}
+
+/**
+ * 按 (x,y,octave) 配对两侧关键点，统计描述子的 Hamming 距离分布与 angle 偏差。
+ *
+ * 返回的每一项都是**可观测量**：顺序差异、集合差异、Hamming 直方图、angle 最大偏差。
+ * 判据由调用方定，这里只负责如实算出来。
+ */
+function pairStats(mine, mineDesc, cols, want) {
+  const wantIdx = new Map()
+  for (let i = 0; i < want.count; i++) {
+    wantIdx.set(keyOf(want.pts[i * 2], want.pts[i * 2 + 1], want.octaves[i]), i)
+  }
+  const hist = new Map()
+  let paired = 0, orderDiff = 0, maxHam = 0, sumHam = 0, nonZero = 0
+  let maxAngleDiff = 0, maxRespDiff = 0
+  let worst = null
+  const unmatched = []
+  for (let i = 0; i < mine.length; i++) {
+    const m = mine[i]
+    const j = wantIdx.get(keyOf(m.x, m.y, m.octave))
+    if (j === undefined) {
+      if (unmatched.length < 5) unmatched.push({ i, x: m.x, y: m.y, octave: m.octave })
+      continue
+    }
+    paired++
+    if (j !== i) orderDiff++
+    maxAngleDiff = Math.max(maxAngleDiff, Math.abs(m.angle - want.angles[j]))
+    maxRespDiff = Math.max(maxRespDiff, Math.abs(m.response - want.responses[j]))
+    let ham = 0
+    for (let b = 0; b < cols; b++) ham += POPCOUNT[mineDesc[i * cols + b] ^ want.desc[j * cols + b]]
+    hist.set(ham, (hist.get(ham) ?? 0) + 1)
+    sumHam += ham
+    if (ham > 0) nonZero++
+    if (ham > maxHam) {
+      maxHam = ham
+      worst = { mineIdx: i, wantIdx: j, x: m.x, y: m.y, octave: m.octave, hamming: ham,
+                angle: m.angle, wantAngle: want.angles[j] }
+    }
+  }
+  return {
+    mineCount: mine.length, wantCount: want.count, paired, orderDiff,
+    setDiff: mine.length - paired,
+    descIdentical: paired - nonZero,
+    descDiffering: nonZero,
+    maxHamming: maxHam,
+    meanHamming: paired ? Number((sumHam / paired).toFixed(4)) : 0,
+    hamHistogram: Object.fromEntries([...hist.entries()].sort((a, b) => a[0] - b[0])),
+    maxAngleDiffDeg: Number(maxAngleDiff.toPrecision(4)),
+    maxResponseDiff: Number(maxRespDiff.toPrecision(4)),
+    worst,
+    unmatchedSample: unmatched,
+  }
+}
+
+function unpackWant(e) {
+  return {
+    count: e.count,
+    pts: b64F32(e.ptsB64),
+    angles: b64F32(e.anglesB64),
+    responses: b64F32(e.responsesB64),
+    octaves: e.octaves,
+    desc: b64Bytes(e.descB64),
+  }
+}
+
+async function gunzip(resp) {
+  const ds = new DecompressionStream('gzip')
+  const buf = await new Response(resp.body.pipeThrough(ds)).arrayBuffer()
+  return new Uint8Array(buf)
+}
+
+/**
+ * 描述子 Hamming 距离的**原则性**上限：256 位里 16 位（6.25%）。
+ *
+ * 不是照着实测结果定的。定它的依据是匹配的判别尺度：ORB 真匹配的 Hamming 距离典型落在
+ * 20~60，而这里量的是"同一块纹理在两侧的差异"。它必须**远小于**那个尺度，否则一次
+ * 真匹配就可能被挤到假匹配那一侧。16 位留了接近 2 个数量级的余量给"匹配仍然成立"，
+ * 同时又足够紧 —— 真出现了系统性失配（比如换了 OpenCV 大版本、或者预处理写歪了），
+ * 距离会是 100 以上，一眼分得开。
+ */
+const MAX_ACCEPTABLE_HAMMING = 16
+
+/** angle 的容许偏差（度）。wasm/原生的 fastAtan2 末位差异应当在这个量级以内；
+ *  超了就说明不是末位问题，而是某一侧的 patch 或方向算法本身不同。 */
+const MAX_ACCEPTABLE_ANGLE_DEG = 0.05
+
+runPage(async () => {
+  const cv = await loadOpenCv('/public/vendor/opencv.js')
+  _setOpenCv(cv)               // 让产品代码用这一份，不重复下 13MB
+  await log('opencv.js 就绪')
+
+  const expect = await (await fetch('./expect.json')).json()
+  const raw = new Uint8Array(await (await fetch('./input-bgr.bin')).arrayBuffer())
+  const { h: H, w: W } = expect.input
+
+  const checks = []
+  const metrics = {}
+  const push = (name, ok, detail) => checks.push({ name, ok, ...(ok ? {} : { detail }) })
+
+  const inSha = await sha16(raw)
+  push('input 字节一致', inSha === expect.input.sha, { got: inSha, want: expect.input.sha })
+  if (raw.length !== H * W * 3) return { ok: false, error: `input 长度 ${raw.length} != ${H * W * 3}` }
+
+  const bgr = matFromBytes(cv, H, W, 3, raw)
+
+  // ── rgba_equiv ───────────────────────────────────────────────────────
+  {
+    const rgba = new cv.Mat(), g1 = new cv.Mat(), g2 = new cv.Mat()
+    cv.cvtColor(bgr, rgba, cv.COLOR_BGR2RGBA)
+    cv.cvtColor(bgr, g1, cv.COLOR_BGR2GRAY)
+    cv.cvtColor(rgba, g2, cv.COLOR_RGBA2GRAY)
+    const a = bytesOf(g1), b = bytesOf(g2)
+    let diff = 0
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++
+    push('RGBA2GRAY == BGR2GRAY', diff === 0, { diffPixels: diff })
+    const gSha = await sha16(a)
+    push('灰度图与 Python 逐字节一致', gSha === expect.rgba_equiv.graySha,
+      { got: gSha, want: expect.rgba_equiv.graySha })
+    rgba.delete(); g1.delete(); g2.delete()
+  }
+
+  // ── orb_gray ─────────────────────────────────────────────────────────
+  {
+    const e = expect.orb_gray
+    const want = unpackWant(e)
+    const gray = new cv.Mat()
+    cv.cvtColor(bgr, gray, cv.COLOR_BGR2GRAY)
+    let orb
+    try { orb = new cv.ORB(e.nfeatures, e.scaleFactor, e.nlevels) }
+    catch { orb = new cv.ORB(e.nfeatures, e.scaleFactor, e.nlevels, 31, 0, 2, cv.ORB_HARRIS_SCORE ?? 0, 31, 20) }
+    const { rows, desc } = detectRaw(cv, orb, gray)
+
+    push('orb_gray 关键点数一致', rows.length === e.count, { got: rows.length, want: e.count })
+    const s = pairStats(rows, bytesOf(desc), desc.cols, want)
+    metrics.orb_gray = s
+    push('orb_gray 关键点集合完全一致', s.setDiff === 0 && s.paired === e.count, s)
+    push(`orb_gray Hamming ≤ ${MAX_ACCEPTABLE_HAMMING}（实测 max=${s.maxHamming}）`,
+      s.maxHamming <= MAX_ACCEPTABLE_HAMMING, s)
+    push(`orb_gray angle 偏差 ≤ ${MAX_ACCEPTABLE_ANGLE_DEG}°（实测 ${s.maxAngleDiffDeg}）`,
+      s.maxAngleDiffDeg <= MAX_ACCEPTABLE_ANGLE_DEG, s)
+    push('orb_gray response 逐位一致', s.maxResponseDiff === 0, s)
+    gray.delete(); desc.delete(); orb.delete()
+  }
+
+  // ── extract：走产品代码 OrbExtractor ─────────────────────────────────
+  {
+    const e = expect.extract
+    const want = unpackWant(e)
+    const rs = resizedSize(H, W, e.longEdge)
+    push('resize 尺寸与 Python 一致', rs && rs.h === e.resizedH && rs.w === e.resizedW,
+      { got: rs, want: { h: e.resizedH, w: e.resizedW } })
+
+    // 产品代码只接 RGBA/BGR/灰度的 Mat，这里给它 BGR（与服务端同序），这样这一条同时
+    // 覆盖了 OrbExtractor 里的 resize 分支与 cvtColor 分支。
+    const ex = new OrbExtractor({ longEdge: e.longEdge, nFeatures: e.nfeatures })
+    const got = ex.extract(bgr)
+    push('extract 特征数一致', got.count === e.count, { got: got.count, want: e.count })
+
+    // 产品代码不吐 angle/octave（运行时不需要），所以这里为了配对再单独检一次。
+    const small = new cv.Mat()
+    cv.resize(bgr, small, new cv.Size(e.resizedW, e.resizedH), 0, 0,
+      rs.scale < 1 ? cv.INTER_AREA : cv.INTER_LINEAR)
+    const smallSha = await sha16(bytesOf(small))
+    push('resize 后像素逐字节一致', smallSha === e.resizedSha, { got: smallSha, want: e.resizedSha })
+
+    const gray = new cv.Mat()
+    cv.cvtColor(small, gray, cv.COLOR_BGR2GRAY)
+    let orb2
+    try { orb2 = new cv.ORB(e.nfeatures, expect.orb_gray.scaleFactor, expect.orb_gray.nlevels) }
+    catch { orb2 = new cv.ORB(e.nfeatures, expect.orb_gray.scaleFactor, expect.orb_gray.nlevels, 31, 0, 2, cv.ORB_HARRIS_SCORE ?? 0, 31, 20) }
+    const { rows, desc } = detectRaw(cv, orb2, gray)
+    const idx = rows.map((_, i) => i).sort((a, b) => rows[b].response - rows[a].response).slice(0, e.nfeatures)
+    const cols = desc.cols
+    const all = bytesOf(desc)
+    const picked = new Uint8Array(idx.length * cols)
+    const pickedRows = idx.map((s, d) => {
+      picked.set(all.subarray(s * cols, s * cols + cols), d * cols)
+      return rows[s]
+    })
+
+    // 先确认产品代码 OrbExtractor 的输出与这段本地复现完全一致 —— 否则下面的统计量
+    // 描述的是这段复现代码，而不是产品代码。
+    let prodMismatch = 0
+    for (let i = 0; i < Math.min(got.count, idx.length); i++) {
+      if (got.pts[i * 2] !== pickedRows[i].x || got.pts[i * 2 + 1] !== pickedRows[i].y) prodMismatch++
+    }
+    push('OrbExtractor 与本地复现一致', prodMismatch === 0, { mismatched: prodMismatch })
+
+    const s = pairStats(pickedRows, picked, cols, want)
+    metrics.extract = s
+    push(`extract 集合差异 ≤ 0.1%（实测 ${s.setDiff}/${s.mineCount}）`,
+      s.setDiff <= Math.ceil(s.mineCount * 0.001), s)
+    push('extract 顺序一致（response 排序后）', s.orderDiff === 0, s)
+    push(`extract Hamming ≤ ${MAX_ACCEPTABLE_HAMMING}（实测 max=${s.maxHamming}, mean=${s.meanHamming}）`,
+      s.maxHamming <= MAX_ACCEPTABLE_HAMMING, s)
+    push(`extract angle 偏差 ≤ ${MAX_ACCEPTABLE_ANGLE_DEG}°（实测 ${s.maxAngleDiffDeg}）`,
+      s.maxAngleDiffDeg <= MAX_ACCEPTABLE_ANGLE_DEG, s)
+
+    ex.delete(); small.delete(); gray.delete(); desc.delete(); orb2.delete()
+  }
+
+  // ── cross_match：端到端，这一条才是真判据 ────────────────────────────
+  {
+    const e = expect.cross_match
+    const frameBytes = await gunzip(await fetch('./frame-bgr.bin.gz'))
+    const need = e.frameH * e.frameW * 3
+    push('查询帧解压后长度正确', frameBytes.length === need, { got: frameBytes.length, want: need })
+    const frameSha = await sha16(frameBytes)
+    push('查询帧字节与 Python 一致', frameSha === e.frameSha, { got: frameSha, want: e.frameSha })
+
+    const frame = matFromBytes(cv, e.frameH, e.frameW, 3, frameBytes)
+    const ex = new OrbExtractor({ longEdge: e.queryLongEdge, nFeatures: e.queryNFeatures })
+    const t0 = performance.now()
+    const query = ex.extract(frame)
+    const tExtract = performance.now() - t0
+    push('查询侧特征数一致', query.count === e.queryCount, { got: query.count, want: e.queryCount })
+
+    // 参考侧**直接用服务端算的那份**，模拟从 desc.bin 读到的一条 slot。
+    const ref = {
+      count: e.refCount,
+      pts: b64F32(e.refPtsB64),
+      desc: b64Bytes(e.refDescB64),
+      descCols: 32,
+    }
+
+    const t1 = performance.now()
+    const m = matchHamming(query, ref)
+    const tMatch = performance.now() - t1
+    const t2 = performance.now()
+    const r = ransacPair(m.src, m.dst, e.minInliers)
+    const tRansac = performance.now() - t2
+
+    metrics.cross_match = {
+      matchCount: { got: m.count, python: e.matchCount },
+      inliers: { got: r.inliers, python: e.inliers, minInliers: e.minInliers },
+      det: { got: Number(r.det.toPrecision(9)), python: e.det },
+      ok: { got: r.ok, python: e.ok },
+      timingMs: {
+        extract: Number(tExtract.toFixed(1)),
+        match: Number(tMatch.toFixed(1)),
+        ransac: Number(tRansac.toFixed(1)),
+        total: Number((tExtract + tMatch + tRansac).toFixed(1)),
+      },
+    }
+
+    // 硬判据：必须**认出来**，且内点数过门槛。这是唯一真正要紧的性质。
+    push('cross_match 判定为命中', r.ok === true && r.inliers >= e.minInliers, metrics.cross_match)
+    // 诊断判据：与服务端的内点数差异。给 20% 是因为两侧描述子有极小差异（见上面 angle
+    // 那段），配对会差几对，而 RANSAC 是随机算法 —— 但差异**大到 20% 以上**就不是这两个
+    // 原因能解释的了，那说明有系统性问题。
+    const rel = Math.abs(r.inliers - e.inliers) / e.inliers
+    push(`cross_match 内点数相对差 ≤ 20%（实测 ${(rel * 100).toFixed(1)}%：${r.inliers} vs ${e.inliers}）`,
+      rel <= 0.2, metrics.cross_match)
+    // 行列式必须落在同一个区间里。它和内点数是两条独立判定，都得过。
+    push('cross_match 行列式在区间内', r.det >= e.detMin && r.det <= e.detMax,
+      { det: r.det, detMin: e.detMin, detMax: e.detMax })
+
+    // 顺带把四个角算出来 —— 路线 A 的贴合全部输入就是它。
+    const quad = normalizedQuad(r.h, [e.refLongEdge, Math.round(e.refLongEdge * 468 / 708)],
+      [e.queryLongEdge, Math.round(e.queryLongEdge * e.frameH / e.frameW)])
+    metrics.quad = quad
+    push('normalizedQuad 给出了四个角', Array.isArray(quad) && quad.length === 8, { quad })
+
+    ex.delete(); frame.delete()
+  }
+
+  bgr.delete()
+
+  const failed = checks.filter((c) => !c.ok)
+  document.getElementById('out').textContent = JSON.stringify({ checks, metrics }, null, 1)
+  return {
+    ok: failed.length === 0,
+    cv2Version: expect.cv2Version,
+    opencvVersion: cv.getBuildInformation ? /OpenCV\s+([0-9.]+)/.exec(cv.getBuildInformation())?.[1] : 'n/a',
+    crossOriginIsolated: self.crossOriginIsolated === true,
+    passed: checks.length - failed.length,
+    total: checks.length,
+    metrics,
+    checks: checks.map((c) => ({ name: c.name, ok: c.ok })),
+    failures: failed,
+  }
+})
+</script>

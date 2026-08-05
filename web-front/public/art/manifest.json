@@ -1,0 +1,119 @@
+{
+  "arrow.png": {
+    "size": [
+      20,
+      22
+    ]
+  },
+  "bang.png": {
+    "size": [
+      48,
+      48
+    ]
+  },
+  "chest.png": {
+    "size": [
+      48,
+      96
+    ]
+  },
+  "cross.png": {
+    "size": [
+      48,
+      48
+    ]
+  },
+  "frame-gold-s.png": {
+    "slice": 10,
+    "size": [
+      40,
+      40
+    ],
+    "face": "#FFECC4"
+  },
+  "frame-night-s.png": {
+    "slice": 10,
+    "size": [
+      40,
+      40
+    ],
+    "face": "#1B1A2E"
+  },
+  "frame-night.png": {
+    "slice": 20,
+    "size": [
+      80,
+      80
+    ],
+    "face": "#1B1A2E"
+  },
+  "frame-red-s.png": {
+    "slice": 10,
+    "size": [
+      40,
+      40
+    ],
+    "face": "#FFD6C8"
+  },
+  "frame-s.png": {
+    "slice": 10,
+    "size": [
+      40,
+      40
+    ],
+    "face": "#FFC699"
+  },
+  "frame.png": {
+    "slice": 20,
+    "size": [
+      80,
+      80
+    ],
+    "face": "#FFC699"
+  },
+  "junimo.png": {
+    "size": [
+      192,
+      48
+    ],
+    "frames": 4,
+    "frame": 48
+  },
+  "letter.png": {
+    "size": [
+      320,
+      180
+    ],
+    "slice": 16
+  },
+  "nightsky.png": {
+    "size": [
+      224,
+      352
+    ]
+  },
+  "query.png": {
+    "size": [
+      48,
+      48
+    ]
+  },
+  "scarecrow.png": {
+    "size": [
+      48,
+      96
+    ]
+  },
+  "star.png": {
+    "size": [
+      32,
+      32
+    ]
+  },
+  "tv.png": {
+    "size": [
+      48,
+      96
+    ]
+  }
+}

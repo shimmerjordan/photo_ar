@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">
+  <!-- 16×16 像素风，与 pixelicons.js 同一套约束：直角、有限饱和色、主色沿用琥珀
+       #FFC46B。画的是"一张照片 + 一个播放三角"，也就是这个页面做的那件事。
+       用 SVG 而不是 PNG：一个文件覆盖所有倍率，且不需要一个生成脚本
+       那种"手维护两份"的风险。 -->
+  <rect width="16" height="16" fill="#0B0C10"/>
+  <!-- 照片外框（2px 边，像素风靠硬边分层而不是阴影） -->
+  <rect x="2" y="3" width="12" height="10" fill="#FFC46B"/>
+  <rect x="3" y="4" width="10" height="8" fill="#0B0C10"/>
+  <!-- 播放三角，逐行画出来保证每格都落在像素上 -->
+  <rect x="6" y="6" width="1" height="4" fill="#FFC46B"/>
+  <rect x="7" y="7" width="1" height="2" fill="#FFC46B"/>
+  <rect x="8" y="7" width="1" height="2" fill="#FFC46B"/>
+  <rect x="9" y="8" width="1" height="1" fill="#FFC46B"/>
+</svg>

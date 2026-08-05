@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>各页挂载冒烟</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log } from '../bridge.js'
+
+/**
+ * **登录之后把每一页都挂一遍**，看有没有页面在挂载时抛异常。
+ *
+ * ## 为什么单独一个测试
+ *
+ * `page-smoke` 只验到登录门 —— 而这套多页结构最可能的失败是「登录之后某一页挂载时抛」，
+ * 它在页面上的表现是**一片空白**：外壳还在、底栏还在、控制台里一行 `TypeError`，
+ * 而 HTTP 全是 200。八个页面里任何一个漏了 null 检查都会这样。
+ *
+ * ## 做法
+ *
+ * harness 用 `--cookie` 注入一个真会话，于是 iframe 里的页面是**已登录**状态。
+ * 然后逐个改 `location.hash` 切页，检查：
+ *
+ *   1. `#view` 里真的长出了东西（不是空的）
+ *   2. 没有新的 window.onerror / unhandledrejection
+ *   3. 标题变了（说明 shell 真的换了页，而不是停在原处）
+ *
+ * 扫描页**跳过**：它要开相机，而无头环境里 `getUserMedia` 会失败 —— 那条失败路径
+ * 由 `camera.js` 自己处理并显示文案，不是这个测试要验的东西。
+ */
+
+const PAGES = [
+  { hash: '#/photos', title: '照片库' },
+  { hash: '#/media', title: '素材' },
+  { hash: '#/admin', title: '管理' },
+  { hash: '#/settings', title: '设置' },
+  { hash: '#/history', title: '识别历史' },
+  { hash: '#/cache', title: '本机缓存' },
+]
+
+runPage(async () => {
+  const checks = []
+  const push = (name, ok, detail) => checks.push({ name, ok, ...(ok ? {} : { detail }) })
+
+  const frame = document.createElement('iframe')
+  frame.style.cssText = 'width:390px;height:844px;border:0'
+  frame.allow = 'camera'
+  frame.src = '/index.html'
+  document.body.appendChild(frame)
+  await new Promise((r) => {
+    frame.onload = () => r()
+    setTimeout(r, 20_000)
+  })
+
+  const win = frame.contentWindow
+  const doc = frame.contentDocument
+  push('iframe 的 DOM 可读', Boolean(doc))
+  if (!doc) return { ok: false, checks, failures: checks }
+
+  // 收集 iframe 里的错误。**在切页之前挂**，否则第一页的错会漏掉。
+  const errors = []
+  win.addEventListener('error', (e) => errors.push(`onerror: ${e.message}`))
+  win.addEventListener('unhandledrejection', (e) => errors.push(`rejection: ${e.reason?.message ?? e.reason}`))
+
+  // 等外壳装好（登录门隐藏 + 底栏有按钮）。库包与引擎要加载，给足时间。
+  const app = doc.getElementById('app')
+  const tabbar = doc.getElementById('tabbar')
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    if (app && !app.hidden && tabbar?.children.length) break
+    await new Promise((r) => setTimeout(r, 400))
+  }
+  const gateHidden = doc.getElementById('gate')?.hidden
+  push('已登录（登录门隐藏了）', Boolean(gateHidden),
+    { note: '没登录说明 --cookie 没生效或会话过期了' })
+  push('底栏渲染了页签', tabbar?.children.length > 0, { n: tabbar?.children.length })
+  await log(`底栏 ${tabbar?.children.length} 个页签：` +
+    [...(tabbar?.children ?? [])].map((b) => b.dataset.tab).join(','))
+
+  // 管理员应当看到全部五个页签（`navpolicy.ADMIN_TABS`）。少一个说明分权算错了。
+  push('管理员看到 5 个页签', tabbar?.children.length === 5, { n: tabbar?.children.length })
+
+  const view = doc.getElementById('view')
+  const title = doc.getElementById('title')
+
+  for (const p of PAGES) {
+    const before = errors.length
+    win.location.hash = p.hash
+    // 等这一页挂完：标题变成预期值，且 view 里有内容。
+    let ok = false
+    const dl = Date.now() + 15_000
+    while (Date.now() < dl) {
+      if (title?.textContent === p.title && view?.children.length > 0) { ok = true; break }
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    // 再等一拍让异步加载（列表、详情）把内容填进去或者报错。
+    await new Promise((r) => setTimeout(r, 1200))
+    const newErrors = errors.slice(before)
+    push(`${p.hash} 挂载并渲染出内容`, ok, { title: title?.textContent, kids: view?.children.length })
+    push(`${p.hash} 没有 JS 错误`, newErrors.length === 0, { errors: newErrors })
+    await log(`${p.hash} → title="${title?.textContent}" kids=${view?.children.length}` +
+      (newErrors.length ? ` 错误：${newErrors.join(' | ')}` : ''))
+  }
+
+  // 返回键：从详情弹回去应当回到照片库，而不是留在详情或跳到落地页。
+  {
+    win.location.hash = '#/photos'
+    await new Promise((r) => setTimeout(r, 1500))
+    const card = doc.querySelector('#view .card')
+    if (card) {
+      card.click()
+      await new Promise((r) => setTimeout(r, 1500))
+      push('点卡片进详情', title?.textContent === '照片详情', { title: title?.textContent })
+      const back = doc.getElementById('back')
+      push('详情页显示返回按钮', back && !back.hidden)
+      back?.click()
+      await new Promise((r) => setTimeout(r, 1200))
+      push('返回后回到照片库', title?.textContent === '照片库', { title: title?.textContent })
+    } else {
+      await log('照片库里没有卡片（库是空的），跳过详情往返检查')
+    }
+  }
+
+  push('全程没有累积 JS 错误', errors.length === 0, { errors })
+
+  const failed = checks.filter((c) => !c.ok)
+  document.getElementById('out').textContent = JSON.stringify(checks, null, 1)
+  return { ok: failed.length === 0, passed: checks.length - failed.length, total: checks.length, failures: failed }
+})
+</script>

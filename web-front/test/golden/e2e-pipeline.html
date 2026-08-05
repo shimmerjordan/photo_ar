@@ -1,0 +1,199 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>整条识别链端到端</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log, loadOpenCv } from '../bridge.js'
+import { _setOpenCv } from '../../public/recognize/orb.js'
+import { unpack, wordsOf, queryIndex, candidateDocs } from '../../public/recognize/library.js'
+import { Pipeline, SCANNING, LOCKED, MAX_TRACK_MISSES } from '../../public/recognize/pipeline.js'
+import { plausible, unitSquareH, clipVertices, FULL_RECT, videoCrop, quadUv, imageToNdc } from '../../public/render/screenquad.js'
+
+/**
+ * 从「PARL 包」一路走到「屏幕顶点」，中间一步不跳。
+ *
+ * 这一条覆盖的是前面每个单测都覆盖不到的东西：**各层之间的接线**。单测能证明
+ * `unpack` 自洽、`Pipeline` 自洽、`clipVertices` 自洽，但证明不了 unpack 出来的
+ * pts 单位和 Pipeline 期望的一致、或者 Pipeline 给的 quad 方向和 clipVertices 期望的
+ * 一致 —— 而那类错**全都不报错**（视频贴在错的位置，看起来像"贴合不准"）。
+ *
+ * ## 为什么在这里手工拼 PARL 包
+ *
+ * `server/library.js` 的 `pack()` 只能打包**库里已有**的照片，而这份 golden 的参考图是
+ * 合成的（`make_golden.py` 的 `synth_bgr`），不在任何真实库里。手工拼一份的额外好处是
+ * 它成了格式契约的**双向**检查：Node 那边写、这边读，两边对同一份布局说明各自实现一次，
+ * 拼错了 `unpack` 立刻抛（它会校验总长度）。
+ */
+
+function b64Bytes(b64) {
+  const s = atob(b64)
+  const out = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)
+  return out
+}
+function b64F32(b64) {
+  const b = b64Bytes(b64)
+  return new Float32Array(b.buffer, b.byteOffset, b.length / 4)
+}
+async function gunzip(resp) {
+  const buf = await new Response(resp.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()
+  return new Uint8Array(buf)
+}
+
+/** 按 `server/library.js` 的 pack() 布局拼一个只含一张照片、无词表的包。 */
+function buildParl({ id, pts, desc, aspect, mediaUrl }) {
+  const count = pts.length / 2
+  const json = new TextEncoder().encode(JSON.stringify({
+    photos: [{ id, doc: 0, count, aspect, title: 'golden', mediaUrl, thumbUrl: null }],
+    nRoot: 0, flatLen: 0, nnz: 0, skipped: [], libraryMtimeMs: 0,
+  }))
+  const total = 32 + json.length + count * 2 * 4 + count * 32
+  const buf = new ArrayBuffer(total)
+  const dv = new DataView(buf)
+  const u8 = new Uint8Array(buf)
+  for (const [i, c] of [...'PARL'].entries()) dv.setUint8(i, c.charCodeAt(0))
+  dv.setUint32(4, 1, true)      // version
+  dv.setUint32(8, 1, true)      // nPhotos
+  dv.setUint32(12, 0, true)     // nWords = 0 → 浏览器全量扫描
+  dv.setUint32(16, 0, true)     // nNodes
+  dv.setUint32(20, 32, true)    // descDim
+  dv.setUint32(24, 640, true)   // refLongEdge
+  dv.setUint32(28, json.length, true)
+  u8.set(json, 32)
+  let p = 32 + json.length
+  new Uint8Array(buf, p, count * 2 * 4).set(new Uint8Array(pts.buffer, pts.byteOffset, count * 2 * 4))
+  p += count * 2 * 4
+  u8.set(desc, p)
+  return buf
+}
+
+runPage(async () => {
+  const cv = await loadOpenCv('/public/vendor/opencv.js')
+  _setOpenCv(cv)
+  const expect = await (await fetch('./expect.json')).json()
+  const e = expect.cross_match
+
+  const checks = []
+  const metrics = {}
+  const push = (name, ok, detail) => checks.push({ name, ok, ...(ok ? {} : { detail }) })
+
+  // ── 1. PARL 往返 ─────────────────────────────────────────────────────
+  const refPts = b64F32(e.refPtsB64)
+  const refDesc = b64Bytes(e.refDescB64)
+  const parl = buildParl({
+    id: 'goldenphoto', pts: refPts, desc: refDesc,
+    aspect: 708 / 468, mediaUrl: '/v1/photo/goldenphoto/media',
+  })
+  const lib = unpack(parl)
+  push('unpack 出一张照片', lib.photos.length === 1, { got: lib.photos.length })
+  push('unpack 的参考点数与服务端一致', lib.photos[0].count === e.refCount,
+    { got: lib.photos[0].count, want: e.refCount })
+  push('unpack 的 refLongEdge = 640', lib.refLongEdge === 640, { got: lib.refLongEdge })
+  // 描述子必须逐字节还原 —— 差一个字节就是另一个特征空间。
+  let descOk = true
+  for (let i = 0; i < refDesc.length; i++) if (lib.photos[0].desc[i] !== refDesc[i]) { descOk = false; break }
+  push('unpack 的描述子逐字节还原', descOk)
+  let ptsOk = true
+  for (let i = 0; i < refPts.length; i++) if (lib.photos[0].pts[i] !== refPts[i]) { ptsOk = false; break }
+  push('unpack 的关键点逐位还原', ptsOk)
+
+  // 布局长度检查必须是**真的**在查。故意多喂一个字节，unpack 应当抛。
+  let caught = false
+  try {
+    const bad = new ArrayBuffer(parl.byteLength + 1)
+    new Uint8Array(bad).set(new Uint8Array(parl))
+    unpack(bad)
+  } catch { caught = true }
+  push('长度对不上时 unpack 抛错（不静默错位）', caught)
+
+  // ── 2. 无词表时候选集 = 全部 ────────────────────────────────────────
+  {
+    const docs = candidateDocs(lib, new Uint8Array(32), 1, 20)
+    push('无词表时候选集是全库（服务端同一条退化路径）',
+      docs.length === 1 && docs[0] === 0, { docs })
+  }
+
+  // ── 3. 检测：真的命中，且四角与服务端算的一致 ────────────────────────
+  const frameBytes = await gunzip(await fetch('./frame-bgr.bin.gz'))
+  // 相机帧是 RGBA（canvas 的形状），而 golden 存的是 BGR。转一次 —— 这一步也顺带
+  // 覆盖了 Pipeline 走 COLOR_RGBA2GRAY 的那条分支。
+  const n = e.frameH * e.frameW
+  const rgba = new Uint8ClampedArray(n * 4)
+  for (let i = 0; i < n; i++) {
+    rgba[i * 4] = frameBytes[i * 3 + 2]     // R ← B 的位置
+    rgba[i * 4 + 1] = frameBytes[i * 3 + 1]
+    rgba[i * 4 + 2] = frameBytes[i * 3]
+    rgba[i * 4 + 3] = 255
+  }
+  const frame = { width: e.frameW, height: e.frameH, data: rgba }
+
+  const pipe = new Pipeline(lib)
+  push('初始状态是 SCANNING', pipe.state === SCANNING, { state: pipe.state })
+
+  const t0 = performance.now()
+  const hit = pipe.push(frame)
+  const detectMs = performance.now() - t0
+  metrics.detect = { ms: Math.round(detectMs), inliers: hit.inliers, reason: hit.reason, quad: hit.quad }
+
+  push('检测命中', hit.reason === 'ok' && hit.photoId === 'goldenphoto', metrics.detect)
+  push(`内点数与服务端相当（${hit.inliers} vs ${e.inliers}）`,
+    Math.abs((hit.inliers ?? 0) - e.inliers) / e.inliers <= 0.2, metrics.detect)
+  push('命中后进入 LOCKED', pipe.state === LOCKED, { state: pipe.state })
+  push('四角通过 plausible', plausible(hit.quad), { quad: hit.quad })
+  // 四角必须落在画面里（这一帧照片占 fill=0.4、居中），越界说明尺度弄反了 ——
+  // §35.3 点名的"两侧长边不一样，弄混就差一倍"正是这种表现。
+  const inRange = hit.quad?.every((v) => v > -0.2 && v < 1.2)
+  push('四角落在画面内（尺度没弄反）', Boolean(inRange), { quad: hit.quad })
+
+  // ── 4. 跟踪：同一帧再喂一次，应当走跟踪那条路且快一个数量级 ──────────
+  const t1 = performance.now()
+  const tracked = pipe.push(frame)
+  const trackMs = performance.now() - t1
+  metrics.track = { ms: Math.round(trackMs), inliers: tracked.inliers, reason: tracked.reason }
+  push('第二帧走跟踪并成功', tracked.reason === 'ok' && pipe.state === LOCKED, metrics.track)
+  push(`跟踪比检测快 ≥5 倍（${Math.round(detectMs)}ms → ${Math.round(trackMs)}ms）`,
+    detectMs / trackMs >= 5, metrics)
+  push('跟踪也给出四角', plausible(tracked.quad), { quad: tracked.quad })
+
+  // ── 5. 连续喂空白帧应当放手回到 SCANNING ────────────────────────────
+  {
+    const blank = { width: e.frameW, height: e.frameH, data: new Uint8ClampedArray(n * 4).fill(128) }
+    let gaveUp = false
+    for (let i = 0; i < MAX_TRACK_MISSES + 2; i++) {
+      const r = pipe.push(blank)
+      if (r.gaveUp) { gaveUp = true; break }
+    }
+    // 放手必须是**连续**失败才发生（单帧掉点是常态：遮挡、反光、运动模糊）。
+    push('连续跟踪失败后放手回到检测', gaveUp && pipe.state === SCANNING,
+      { gaveUp, state: pipe.state })
+  }
+
+  // ── 6. 接到渲染层：四角 → NDC → 单应 → 裁剪空间顶点 ────────────────
+  {
+    const ndc = imageToNdc(hit.quad, e.frameW / e.frameH, 9 / 19.5, new Float32Array(8))
+    const h = unitSquareH(ndc)
+    push('四角能解出单应矩阵', Boolean(h), { ndc })
+    const clip = new Float32Array(16)
+    // 面片恒等于整张照片；比例差异裁在源那一侧（videoCrop），见 screenquad.js。
+    const ok = clipVertices(h, FULL_RECT, clip)
+    push('clipVertices 接受这块几何', ok, { clip: [...clip] })
+    const ws = [clip[3], clip[7], clip[11], clip[15]]
+    push('四个 w 同号且为正（GL 能正常裁剪）', ws.every((w) => w > 0), { ws })
+    metrics.clipW = ws.map((w) => Number(w.toFixed(4)))
+  }
+
+  pipe.delete()
+
+  const failed = checks.filter((c) => !c.ok)
+  document.getElementById('out').textContent = JSON.stringify({ metrics, checks }, null, 1)
+  return {
+    ok: failed.length === 0,
+    passed: checks.length - failed.length,
+    total: checks.length,
+    metrics,
+    checks: checks.map((c) => ({ name: c.name, ok: c.ok })),
+    failures: failed,
+  }
+})
+</script>

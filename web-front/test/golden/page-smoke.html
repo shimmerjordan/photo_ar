@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>页面冒烟</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log } from '../bridge.js'
+
+/**
+ * 冒烟：**真的把 index.html 装进 iframe 跑一遍**，看它有没有起来。
+ *
+ * `curl` 拿到 200 只证明服务器发出了字节。这个页面的加载链是 index.html → app.js →
+ * 六个 ESM 模块 → `/api/config` → `/api/lib` → Worker → opencv.js，**任何一步的语法错、
+ * 路径错、MIME 错都会让页面停在"正在准备…"**，而 HTTP 状态码全是 200。第一次跑真机
+ * 之前，这是唯一能把"服务器活着"和"页面活着"分开的检查。
+ *
+ * 用 iframe 而不是直接跳转：harness 靠这个页面回报结果，跳走就没人回报了。
+ *
+ * 需要一个跑着的 web-front，地址由 `?base=` 给（默认 127.0.0.1:8964）。
+ */
+runPage(async () => {
+  const checks = []
+  const push = (name, ok, detail) => checks.push({ name, ok, ...(ok ? {} : { detail }) })
+
+  // 全部走**同源**：harness 的静态回落到 public/，`/api/*` 与 `/v1/*` 由它代理给真的
+  // web-front（`--proxy`）。同源是必须的 —— 跨源既读不到 iframe 的 DOM，也加载不了
+  // ESM（那需要 CORS 头，而生产环境不该为测试开）。
+  // 全部模块都要能取到。**逐个列出来而不是只测入口**：ESM 的加载失败只在浏览器控制台
+  // 里报一行 404，而页面表现是停在"正在准备"——两者看起来一样。
+  for (const p of ['/index.html', '/app.js', '/api.js', '/shell.js', '/navpolicy.js',
+                   '/ui.js', '/pixelicons.js', '/printsize.js', '/diag.js', '/camera.js',
+                   '/pages/scan.js', '/pages/photos.js', '/pages/detail.js', '/pages/play.js',
+                   '/pages/media.js', '/pages/history.js', '/pages/admin.js',
+                   '/pages/settings.js', '/pages/cache.js',
+                   '/recognize/worker.js', '/recognize/pipeline.js', '/recognize/verify.js',
+                   '/recognize/library.js', '/recognize/orb.js', '/recognize/consts.js',
+                   '/recognize/pyparity.js', '/recognize/wasmcache.js',
+                   '/render/gl.js', '/render/screenquad.js', '/favicon.svg']) {
+    const r = await fetch(p)
+    push(`GET ${p}`, r.ok, { status: r.status })
+  }
+
+  // 代理是不是真的通到了 web-front。不通的话下面 iframe 里的失败会被归到"页面坏了"，
+  // 而实际原因是这个 harness 没连上服务 —— 两件事必须分开。
+  {
+    const r = await fetch('/api/config')
+    push('/api/config 经代理可达（说明真 web-front 在跑）', r.ok, { status: r.status })
+  }
+
+  const frame = document.createElement('iframe')
+  frame.style.cssText = 'width:390px;height:844px;border:0'
+  // 给相机权限，否则 iframe 里的 getUserMedia 会被 Permissions-Policy 拦掉，
+  // 而那与页面本身是否健康无关。
+  frame.allow = 'camera'
+  frame.src = '/index.html'
+  document.body.appendChild(frame)
+
+  const loaded = await new Promise((r) => {
+    frame.onload = () => r(true)
+    frame.onerror = () => r(false)
+    setTimeout(() => r(false), 20_000)
+  })
+  push('index.html 装进 iframe', loaded)
+
+  let doc = null
+  try {
+    doc = frame.contentDocument
+  } catch { /* 不该发生：同源。真发生了下面那条会说明 */ }
+  push('能读到 iframe 的 DOM', Boolean(doc),
+    { note: '读不到说明不同源 —— harness 的静态回落或代理没生效' })
+
+  if (doc) {
+    // 等 app.js 跑起来。它做的第一件可见的事就是把 #tip 从"正在准备…"改掉，
+    // 或者（未登录时）把登录门留在原处。两种都算"活着"。
+    const deadline = Date.now() + 15_000
+    let tip = ''
+    let gateVisible = null
+    while (Date.now() < deadline) {
+      tip = doc.getElementById('tip')?.textContent?.trim() ?? ''
+      gateVisible = doc.getElementById('gate') ? !doc.getElementById('gate').hidden : null
+      if (tip && tip !== '正在准备…') break
+      if (gateVisible && doc.getElementById('name')) break
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    await log(`tip="${tip}" gateVisible=${gateVisible}`)
+    push('登录门渲染了（模块都加载了）', Boolean(gateVisible), { gateVisible })
+    push('登录门的输入框在', Boolean(doc.getElementById('name')))
+    // 外壳的骨架必须在 DOM 里 —— 缺一个 id，`shell.js` 会在挂载时静默拿到 null
+    // 然后在第一次渲染时抛，而那时页面已经白屏了。
+    for (const id of ['app', 'topbar', 'title', 'back', 'view', 'tabbar', 'bar', 'boot']) {
+      push(`外壳有 #${id}`, Boolean(doc.getElementById(id)))
+    }
+    // WebGL 能不能开。开不出来的话扫描页永远是黑的，而没有任何报错。
+    // 扫描页是动态挂载的，所以这里自己建一个 canvas 试。
+    const probe = doc.createElement('canvas')
+    push('WebGL 上下文能开', Boolean(probe.getContext('webgl')), { note: '无头环境靠 SwiftShader' })
+  }
+
+  const failed = checks.filter((c) => !c.ok)
+  document.getElementById('out').textContent = JSON.stringify(checks, null, 1)
+  return { ok: failed.length === 0, passed: checks.length - failed.length, total: checks.length, failures: failed }
+})
+</script>

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#331b14">
+<title>photo-ar</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<!-- 字体压在关键路径上：登录门是第一屏，而它整屏都是字。不预载的话会先看到一屏
+     系统字、字体到了再整体跳一下 —— 点阵字与系统字的字宽差得远，那一跳很难看。 -->
+<link rel="preload" href="/art/pixel.woff2?v=1" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/art/letter.png" as="image">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+
+<!-- 登录门。一封摊在夜空下的信 —— 宾客扫码打开这个页面，第一眼看到的就是这一屏。 -->
+<section id="gate">
+  <div class="letter">
+    <h1><img src="/art/star.png" width="32" height="32" alt="" aria-hidden="true">photo-ar</h1>
+    <p id="gate-msg">举起手机对着一张打印出来的照片，视频就贴在照片上播起来。识别全部在你这台手机上完成，照片和视频不经过任何第三方。</p>
+    <!-- label 自己就是 .field（与 pages/media.js 的表单同一个结构）。包一层 div 再放
+         label 的话，`.field > span` 就选不中里面那个 span 了 —— 表现是标签和输入框挤在
+         同一行，而另一处结构不同的表单看着是对的，于是很难想到是选择器的问题。 -->
+    <label class="field" for="name"><span>你的名字</span>
+      <input id="name" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="管理员给你登记的名字">
+    </label>
+    <label class="field" id="pw-field" for="pw" hidden><span>口令（管理员才需要）</span>
+      <input id="pw" type="password" autocomplete="current-password">
+    </label>
+    <p id="gate-err" class="err" hidden></p>
+    <div class="actions">
+      <button id="enter">进入</button>
+      <button id="toggle-pw" class="ghost">我是管理员</button>
+    </div>
+  </div>
+</section>
+
+<div id="app" hidden>
+  <header id="topbar">
+    <button id="back" class="ghost" hidden aria-label="返回">
+      <img src="/art/arrow.png" width="20" height="22" class="arrow-l" alt="" aria-hidden="true">
+    </button>
+    <h1 id="title"></h1>
+  </header>
+  <div id="bar" role="progressbar" aria-label="加载识别引擎" aria-valuemin="0" aria-valuemax="100" hidden><i></i></div>
+  <!-- div 而不是 p：里面要放 Junimo 那个 div，而 <p> 装不下块级元素（解析器会把
+       它提前闭合，于是那只 Junimo 跑到 p 外面去）。 -->
+  <div id="boot" hidden></div>
+  <main id="view"></main>
+  <nav id="tabbar" aria-label="主导航"></nav>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

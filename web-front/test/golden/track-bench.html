@@ -1,0 +1,202 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>跟踪成本：光流 vs 重新匹配</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log, loadOpenCv } from '../bridge.js'
+import { OrbExtractor, _setOpenCv } from '../../public/recognize/orb.js'
+import { matchHamming, ransacPair } from '../../public/recognize/verify.js'
+
+/**
+ * ## 为什么要量这个
+ *
+ * `orb-golden.html` 量到单候选精排在这台机器上是 **56ms 提特征 + 45.6ms 匹配 + 9.7ms
+ * RANSAC = 111ms**。两个后果：
+ *
+ * - **全库检测**（Top-20 候选）≈ 56 + 20×55 = 1.16s。首帧等一秒多，可以接受
+ *   —— 用户正在举起手机对准。
+ * - **每帧都这样做不行**。锁定之后要 20+ FPS 才谈得上"贴住"，而 111ms 是 9 FPS，
+ *   且那是桌面数字，手机上还要乘 2~4。
+ *
+ * Android 那条第二条贴合路是靠服务端每 400ms 一发来"跟踪"的，真机实测往返 1~2.5s，
+ * 表现是四个角一到手就过期（`ScreenQuad.TTL_MS` 被迫从 1.2s 一路放到 4s）。搬到浏览器
+ * 如果还是每帧重跑一次匹配，只是把"网络慢"换成"CPU 慢"，没有解决问题。
+ *
+ * 标准解法是 **detect-then-track**：命中那一帧拿到内点，之后每帧用光流把这些点推到
+ * 新位置，重新解单应矩阵。跟踪帧不提特征、不做 4000×300 的匹配。
+ *
+ * 这个 bench 就量一件事：**光流 + findHomography 到底多快**，够不够撑起 20+ FPS。
+ * 不量就写，等于把整个架构押在一个猜测上。
+ */
+
+function matFromBytes(cv, h, w, channels, bytes) {
+  const type = channels === 1 ? cv.CV_8UC1 : channels === 3 ? cv.CV_8UC3 : cv.CV_8UC4
+  const m = new cv.Mat(h, w, type)
+  m.data.set(bytes)
+  return m
+}
+
+function b64Bytes(b64) {
+  const s = atob(b64)
+  const out = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)
+  return out
+}
+function b64F32(b64) {
+  const b = b64Bytes(b64)
+  return new Float32Array(b.buffer, b.byteOffset, b.length / 4)
+}
+
+async function gunzip(resp) {
+  const buf = await new Response(resp.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()
+  return new Uint8Array(buf)
+}
+
+/** 中位数比均值抗第一次调用的预热开销 —— 而预热恰恰不是稳态跟踪的成本。 */
+function median(xs) {
+  const s = [...xs].sort((a, b) => a - b)
+  return s[Math.floor(s.length / 2)]
+}
+
+const REPEAT = 12
+
+runPage(async () => {
+  const cv = await loadOpenCv('/public/vendor/opencv.js')
+  _setOpenCv(cv)
+  const expect = await (await fetch('./expect.json')).json()
+  const e = expect.cross_match
+
+  const frameBytes = await gunzip(await fetch('./frame-bgr.bin.gz'))
+  const frame = matFromBytes(cv, e.frameH, e.frameW, 3, frameBytes)
+
+  // 提一次特征拿到查询点，并跑一次匹配拿到内点 —— 这就是"命中那一帧"的产物。
+  const ex = new OrbExtractor({ longEdge: e.queryLongEdge, nFeatures: e.queryNFeatures })
+  const query = ex.extract(frame)
+  const ref = { count: e.refCount, pts: b64F32(e.refPtsB64), desc: b64Bytes(e.refDescB64), descCols: 32 }
+  const m = matchHamming(query, ref)
+  const r0 = ransacPair(m.src, m.dst, e.minInliers)
+  await log(`命中帧：配对 ${m.count}，内点 ${r0.inliers}`)
+
+  // 跟踪用的灰度图。光流在**缩放后**的空间里跑（和 ORB 同一个坐标系），所以这里复现
+  // 一次 orb.js 内部那步 resize —— 跟踪帧不需要提特征，但需要同一个坐标系。
+  const rs = { w: e.queryLongEdge, h: Math.round(e.frameH * e.queryLongEdge / e.frameW) }
+  const small = new cv.Mat()
+  cv.resize(frame, small, new cv.Size(rs.w, rs.h), 0, 0, cv.INTER_AREA)
+  const gray0 = new cv.Mat()
+  cv.cvtColor(small, gray0, cv.COLOR_BGR2GRAY)
+
+  // 第二帧：把画面整体挪 3 像素 + 轻微旋转，模拟手抖一帧的量。用 warpAffine 造，
+  // 这样"真值位移"是已知的，能顺带验证光流算出来的位移对不对（而不只是快不快）。
+  const shift = cv.matFromArray(2, 3, cv.CV_64F, [
+    Math.cos(0.004), -Math.sin(0.004), 3.0,
+    Math.sin(0.004), Math.cos(0.004), 1.5,
+  ])
+  const gray1 = new cv.Mat()
+  cv.warpAffine(gray0, gray1, shift, new cv.Size(rs.w, rs.h), cv.INTER_LINEAR, cv.BORDER_REPLICATE)
+
+  // 内点的查询侧坐标 —— 跟踪的起点就是它们。
+  const inl = []
+  {
+    const sm = new cv.Mat(m.count, 1, cv.CV_32FC2); sm.data32F.set(m.src)
+    const dm = new cv.Mat(m.count, 1, cv.CV_32FC2); dm.data32F.set(m.dst)
+    const mask = new cv.Mat()
+    const H = cv.findHomography(sm, dm, cv.RANSAC, 3.0, mask, 200, 0.995)
+    for (let i = 0; i < mask.data.length; i++) {
+      if (mask.data[i]) inl.push(m.src[i * 2], m.src[i * 2 + 1], m.dst[i * 2], m.dst[i * 2 + 1])
+    }
+    sm.delete(); dm.delete(); mask.delete(); H?.delete()
+  }
+  const nInl = inl.length / 4
+  await log(`拿到 ${nInl} 个内点当跟踪种子`)
+
+  const prevPts = new cv.Mat(nInl, 1, cv.CV_32FC2)
+  const refPts = new Float32Array(nInl * 2)
+  for (let i = 0; i < nInl; i++) {
+    prevPts.data32F[i * 2] = inl[i * 4]
+    prevPts.data32F[i * 2 + 1] = inl[i * 4 + 1]
+    refPts[i * 2] = inl[i * 4 + 2]
+    refPts[i * 2 + 1] = inl[i * 4 + 3]
+  }
+
+  // ── 量：光流 ──────────────────────────────────────────────────────
+  const flowMs = []
+  const homoMs = []
+  let lastOk = 0
+  let lastErr = 0
+  for (let rep = 0; rep < REPEAT; rep++) {
+    const nextPts = new cv.Mat()
+    const status = new cv.Mat()
+    const err = new cv.Mat()
+    const t0 = performance.now()
+    cv.calcOpticalFlowPyrLK(gray0, gray1, prevPts, nextPts, status, err,
+      new cv.Size(21, 21), 3)
+    flowMs.push(performance.now() - t0)
+
+    // 光流跟丢的点必须剔掉。留着它们会把一堆随机坐标喂给 RANSAC —— 而 RANSAC 在
+    // 外点过多时会拟合出一个"数值正常但几何错"的矩阵，表现是视频突然跳到别处。
+    const good = []
+    for (let i = 0; i < nInl; i++) {
+      if (status.data[i]) good.push(nextPts.data32F[i * 2], nextPts.data32F[i * 2 + 1], refPts[i * 2], refPts[i * 2 + 1])
+    }
+    const ng = good.length / 4
+    lastOk = ng
+
+    const src = new Float32Array(ng * 2)
+    const dst = new Float32Array(ng * 2)
+    for (let i = 0; i < ng; i++) {
+      src[i * 2] = good[i * 4]; src[i * 2 + 1] = good[i * 4 + 1]
+      dst[i * 2] = good[i * 4 + 2]; dst[i * 2 + 1] = good[i * 4 + 3]
+    }
+    const t1 = performance.now()
+    const rr = ransacPair(src, dst, 4)
+    homoMs.push(performance.now() - t1)
+    lastErr = rr.inliers
+
+    nextPts.delete(); status.delete(); err.delete()
+  }
+
+  // ── 对照：跟踪帧如果重新走一遍全套精排 ──────────────────────────
+  const fullMs = []
+  for (let rep = 0; rep < 5; rep++) {
+    const t0 = performance.now()
+    const q = ex.extract(frame)
+    const mm = matchHamming(q, ref)
+    ransacPair(mm.src, mm.dst, e.minInliers)
+    fullMs.push(performance.now() - t0)
+  }
+
+  const flow = median(flowMs)
+  const homo = median(homoMs)
+  const track = flow + homo
+  const full = median(fullMs)
+
+  const metrics = {
+    seedInliers: nInl,
+    flowSurvived: lastOk,
+    homographyInliers: lastErr,
+    trackFrameMs: { flow: +flow.toFixed(2), homography: +homo.toFixed(2), total: +track.toFixed(2) },
+    trackFps: +(1000 / track).toFixed(1),
+    fullPipelineMs: +full.toFixed(1),
+    speedup: +(full / track).toFixed(1),
+    note: '桌面 headless Chrome + SwiftShader，单线程 wasm。手机上按 2~4 倍慢外推。',
+  }
+
+  const checks = [
+    // 光流必须跟住绝大多数点。跟丢太多说明窗口/层数选错了，而那会让单应矩阵越解越飘。
+    { name: `光流保住 ≥80% 的种子点（${lastOk}/${nInl}）`, ok: lastOk >= nInl * 0.8 },
+    // 重解出来的矩阵仍要有足够内点，否则跟踪等于没跟上。
+    { name: `重解单应仍有 ≥${Math.ceil(nInl * 0.6)} 内点（实测 ${lastErr}）`, ok: lastErr >= nInl * 0.6 },
+    // 架构判据：跟踪帧必须比全套精排快一个数量级以上，否则分层没意义。
+    { name: `跟踪帧比全套精排快 ≥8 倍（实测 ${metrics.speedup}×）`, ok: full / track >= 8 },
+    // 20 FPS 是"贴得住"的下限。桌面上必须有很大余量，才可能在手机上还够。
+    { name: `跟踪帧 ≥60 FPS（桌面，实测 ${metrics.trackFps}）`, ok: 1000 / track >= 60 },
+  ]
+
+  prevPts.delete(); small.delete(); gray0.delete(); gray1.delete(); shift.delete(); frame.delete(); ex.delete()
+
+  document.getElementById('out').textContent = JSON.stringify({ metrics, checks }, null, 1)
+  const failed = checks.filter((c) => !c.ok)
+  return { ok: failed.length === 0, metrics, checks, failures: failed }
+})
+</script>

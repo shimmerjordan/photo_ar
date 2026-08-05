@@ -1,0 +1,29 @@
+{
+  "name": "photoar-web-front",
+  "version": "0.1.0",
+  "private": true,
+  "description": "photo-ar 的网页版：识别与贴合全部在浏览器里，服务端只发库和视频",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "//test": "显式列 *.test.js。`node --test test/` 不行 —— Node 的默认匹配里有一条 `test/**/*.js`，会把 harness.js 与 bridge.js（工具，不是测试）也当测试跑，而 harness 没参数时 exit(2)。",
+    "test": "node --test test/*.test.js",
+    "test:golden": "node test/harness.js test/golden/orb-golden.html --timeout 300000",
+    "test:bench": "node test/harness.js test/golden/track-bench.html --timeout 300000",
+    "golden:regen": "python3 test/golden/make_golden.py",
+    "//wasm": "换了 vendor/opencv.js 之后必跑：抽出独立 .wasm（浏览器的 code cache 只认 URL）、把内容哈希写进它的 URL、并预压 brotli（11.4MB → 2.43MB，q=11 要 21 秒）。产物四个都提交进仓库。跑完必须再跑 test:golden。",
+    "wasm:split": "node tools/split-wasm.mjs",
+    "//art": "换皮那一套的三个生成器。产物都提交进仓库 —— 部署机上没有星露谷素材包，也没有 PIL。",
+    "art:regen": "python3 tools/extract-art.py",
+    "font:regen": "python3 tools/make-font.py",
+    "shot": "node tools/shot.mjs",
+    "test:smoke": "node test/harness.js test/golden/page-smoke.html --proxy ${WEBFRONT_BASE:-http://127.0.0.1:8964}",
+    "test:e2e": "node test/harness.js test/golden/e2e-pipeline.html --timeout 300000",
+    "test:worker": "node test/harness.js test/golden/worker-smoke.html --timeout 240000",
+    "test:browser": "npm run test:golden && npm run test:e2e && npm run test:worker",
+    "test:pages": "node test/harness.js test/golden/pages-smoke.html --proxy ${WEBFRONT_BASE:-http://127.0.0.1:8964} --cookie \"$WEBFRONT_COOKIE\" --timeout 240000"
+  }
+}

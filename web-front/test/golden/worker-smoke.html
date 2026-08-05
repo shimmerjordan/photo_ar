@@ -1,0 +1,258 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>识别 Worker 冒烟</title>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runPage, log } from '../bridge.js'
+import { buildParl, b64Bytes, b64F32 } from '../parl.js'
+
+/**
+ * **真的把识别 Worker 起起来**：建 Worker → init（含 13MB opencv.js）→ 喂一帧 → 收结果。
+ *
+ * ## 这个测试是为什么加的
+ *
+ * 第一版的 `page-smoke` 只验到"登录门渲染了"就停了，于是漏掉了一个致命 bug：
+ * **module worker（`new Worker(url, {type:'module'})`）里禁止 `importScripts()`** ——
+ * 规范硬禁，报错是
+ * `Module scripts don't support importScripts()`。而 `orb.js` 里给 Worker 准备的正是
+ * `importScripts` 那条路。
+ *
+ * 那个 bug 在页面上的表现是：登录进去、库也拿到了，然后**永远停在"正在加载识别引擎"**
+ * —— 而 HTTP 全是 200、页面也没崩。也就是说不把 Worker 真的起一遍，任何检查都发现不了。
+ *
+ * 所以这里从 `new Worker` 一路走到 `type:'result'`，中间不跳。
+ */
+
+async function gunzip(resp) {
+  const buf = await new Response(resp.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()
+  return new Uint8Array(buf)
+}
+
+/** 等 Worker 的某一类消息，超时就把**最后收到的**消息一起报出来（否则只知道"超时了"）。 */
+function waitFor(worker, type, ms, label) {
+  return new Promise((resolve, reject) => {
+    const seen = []
+    const onMsg = (ev) => {
+      seen.push(ev.data?.type)
+      if (ev.data?.type === type) {
+        worker.removeEventListener('message', onMsg)
+        resolve(ev.data)
+      } else if (ev.data?.type === 'error') {
+        worker.removeEventListener('message', onMsg)
+        reject(new Error(`Worker 报错：${ev.data.message}`))
+      }
+    }
+    worker.addEventListener('message', onMsg)
+    setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）。收到过：${seen.join(',') || '（什么都没有）'}`)), ms)
+  })
+}
+
+runPage(async () => {
+  const checks = []
+  const metrics = {}
+  const push = (name, ok, detail) => checks.push({ name, ok, ...(ok ? {} : { detail }) })
+  const expect = await (await fetch('/test/golden/expect.json')).json()
+  const e = expect.cross_match
+
+  const parl = buildParl({
+    pts: b64F32(e.refPtsB64),
+    desc: b64Bytes(e.refDescB64),
+    aspect: 708 / 468,
+    mediaUrl: '/v1/photo/goldenphoto/media',
+  })
+
+  // 路径与产品代码一致（`app.js` 里就是这两个字面量）。写死是刻意的：如果哪天
+  // Worker 的路径或类型变了，这个测试要跟着红，而不是"聪明地"跟着变。
+  const worker = new Worker('/recognize/worker.js', { type: 'module' })
+  let fatal = null
+  worker.onerror = (ev) => { fatal = ev.message ?? 'worker onerror' }
+
+  // 收集进度消息。UI 的进度条全靠它 —— 而"进度条不动"与"加载卡住"在页面上无从区分，
+  // 所以这里要验的不只是"有进度"，还有**它到底涨没涨**、以及最后有没有一条 done。
+  const prog = []
+  worker.addEventListener('message', (ev) => {
+    if (ev.data?.type === 'progress') prog.push(ev.data)
+  })
+
+  let ready = null
+  try {
+    worker.postMessage({ type: 'init', libBuf: parl, opencvUrl: '/vendor/opencv.js' }, [parl])
+    // 13MB 的 wasm 编译 + 实例化，无头环境里给足时间。
+    ready = await waitFor(worker, 'ready', 120_000, 'Worker init')
+  } catch (err) {
+    push('Worker init 成功', false, { error: err.message, onerror: fatal })
+    document.getElementById('out').textContent = JSON.stringify(checks, null, 1)
+    return { ok: false, checks, failures: checks.filter((c) => !c.ok) }
+  }
+
+  push('Worker init 成功（module worker 能加载 opencv.js）', true)
+
+  // ── 进度条的数据源 ──────────────────────────────────────────────────
+  {
+    const withTotal = prog.filter((p) => p.total > 0)
+    push(`报了进度（${prog.length} 条）`, prog.length > 0, { prog: prog.slice(0, 3) })
+    push('进度带 total（Content-Length 拿到了，UI 才能显示确定百分比）',
+      withTotal.length > 0, { note: '没有 total 时 UI 会退化成不确定条，那是刻意的' })
+    if (withTotal.length > 1) {
+      // 单调不减。倒退过的进度条比没有进度条更让人以为出错了。
+      let monotonic = true
+      for (let i = 1; i < withTotal.length; i++) {
+        if (withTotal[i].loaded < withTotal[i - 1].loaded) monotonic = false
+      }
+      push('进度单调不减', monotonic, { first: withTotal[0], last: withTotal.at(-1) })
+      push('最终到达 total（不会停在 87% 不动）',
+        withTotal.at(-1).loaded === withTotal.at(-1).total,
+        { last: withTotal.at(-1) })
+    }
+    // 节流是有必要的：13MB 的流会给出上千个 chunk，每个都 postMessage 会把主线程的
+    // rAF 挤掉 —— 表现是加载期间进度条自己卡顿，正是它要消除的那种观感。
+    push(`节流生效（${prog.length} 条，远少于 chunk 数）`, prog.length < 200, { count: prog.length })
+    push('最后一条是 done（UI 靠它切成"正在编译"）', prog.at(-1)?.done === true, { last: prog.at(-1) })
+  }
+  push('库解包出一张照片', ready.nPhotos === 1, { ready })
+  push('无词表（这份 fixture 是刻意不带的）', ready.hasVocab === false, { ready })
+  push('Worker 里的 OpenCV 版本与服务端一致',
+    ready.opencvVersion === expect.cv2Version, { got: ready.opencvVersion, want: expect.cv2Version })
+  await log(`ready: ${JSON.stringify(ready)}`)
+
+  // ── 喂一帧真实查询帧，看它认不认得出来 ──────────────────────────────
+  const frameBytes = await gunzip(await fetch('/test/golden/frame-bgr.bin.gz'))
+  const n = e.frameH * e.frameW
+
+  /**
+   * 每次要送帧就**新造一份** RGBA。
+   *
+   * 不能复用：postMessage 的 transfer 会把 buffer detach，之后从它再构造会抛
+   * `Cannot perform Construct on a detached ArrayBuffer`。这个坑在这个文件里踩过两次
+   * （第二帧那处、长跟踪循环那处），所以干脆做成一个函数 —— `frameBytes` 自己没被
+   * transfer，可以反复用。
+   *
+   * 产品代码不会踩它：`FrameGrabber.grab()` 每帧都从 `getImageData` 拿新的一份，
+   * 理由写在 camera.js 上。
+   */
+  const W = e.frameW
+  const H = e.frameH
+
+  /**
+   * 造一帧 RGBA，可选**整数平移** dx/dy（模拟手持时画面在动）。
+   *
+   * 为什么需要平移：反复喂**同一帧**时光流几乎一个点都不丢（实测 60 帧内点 81→81），
+   * 于是补种子逻辑根本不被触发 —— 那个测试看起来绿，其实什么都没验到。真机日志里
+   * 点数 1 秒内从 27 掉到 8，靠的正是帧间的位移与形变。
+   *
+   * 用整数平移而不是 warpAffine：这里没有 cv（它在 Worker 里），而平移足以让边缘的点
+   * 走出画面、让 LK 的搜索窗口逐渐失配 —— 也就是足以让点数真的降下来。
+   */
+  /**
+   * 确定性伪随机（LCG）。**不用 Math.random**：测试必须每次跑出同一个结果，否则
+   * "补种子有没有被触发"会变成一个随机通过的断言。
+   */
+  const lcg = (seed) => () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)
+
+  const makeRgba = (dx = 0, dy = 0, noise = 0, seed = 1) => {
+    const rnd = lcg(seed)
+    const a = new Uint8ClampedArray(n * 4)
+    for (let y = 0; y < H; y++) {
+      const sy = y - dy
+      if (sy < 0 || sy >= H) continue // 移出去的部分留黑，与真实取景一致
+      for (let x = 0; x < W; x++) {
+        const sx = x - dx
+        if (sx < 0 || sx >= W) continue
+        const si = (sy * W + sx) * 3
+        const di = (y * W + x) * 4
+        // 噪声：模拟真机上让光流失配的那些东西（运动模糊、反光、曝光跳动）。
+        // 纯平移逼不出掉点 —— 实测干净序列上 60 帧内点 81→81，补种子一次都不触发。
+        const nz = noise ? (rnd() - 0.5) * 2 * noise : 0
+        a[di] = frameBytes[si + 2] + nz
+        a[di + 1] = frameBytes[si + 1] + nz
+        a[di + 2] = frameBytes[si] + nz
+        a[di + 3] = 255
+      }
+    }
+    return a
+  }
+
+  const sendFrame = (id, dx = 0, dy = 0, noise = 0, seed = 1) => {
+    const b = makeRgba(dx, dy, noise, seed).buffer
+    worker.postMessage({ type: 'frame', id, width: W, height: H, buf: b }, [b])
+  }
+
+  sendFrame(1)
+
+  const res = await waitFor(worker, 'result', 60_000, '第一帧识别')
+  await log(`result: reason=${res.reason} photoId=${res.photoId} inliers=${res.inliers} ms=${res.ms} state=${res.state}`)
+  await log(`photo 回包字段: ${Object.keys(res.photo ?? {}).join(',')}`)
+  push('第一帧就命中', res.reason === 'ok' && res.photoId === 'goldenphoto', { res })
+  push(`内点数与服务端相当（${res.inliers} vs ${e.inliers}）`,
+    Math.abs((res.inliers ?? 0) - e.inliers) / e.inliers <= 0.2, { res })
+  push('命中后状态是 locked', res.state === 'locked', { state: res.state })
+  push('给出了四个角', Array.isArray(res.quad) && res.quad.length === 8, { quad: res.quad })
+  // `fresh` 是 app.js 用来决定"该加载视频了"的唯一信号，而它**必须与四角是否合格无关**。
+  // 第一版把加载视频嵌在"四角合格"的分支里，于是命中那一帧算不出四角时视频永远不加载
+  // （真机日志：一长串"跟踪 ok 四角=有"配"视频 ready=NOTHING"，且没有任何视频日志）。
+  push('命中带 fresh 标志（app.js 靠它加载视频，与四角无关）', res.fresh === true, { fresh: res.fresh })
+
+  // ── 第二帧应当走跟踪 ────────────────────────────────────────────────
+  {
+    sendFrame(2)
+    const r2 = await waitFor(worker, 'result', 30_000, '第二帧跟踪')
+    push('第二帧跟踪成功且更快', r2.reason === 'ok' && r2.ms <= res.ms,
+      { detectMs: res.ms, trackMs: r2.ms })
+  }
+
+  // ── 长时间跟踪（画面在动）：光流会掉点，补种子要把它托住 ────────────
+  //
+  // 真机日志实测 1 秒内 27 → 8 然后放手。根因是 `_track` 用存活的点**替换**种子却
+  // 从不补充，于是种子数单调递减。
+  //
+  // 这里让画面**每帧平移 3 像素**（60 帧累积 180px，照片会有一大块移出画面），
+  // 这才逼得出真实的掉点。3px/帧在 LK 的 21×21 窗口内，所以它跟得上 —— 掉点来自
+  // 边缘的点走出画面，而那正是手持时真实发生的事。
+  {
+    const N = 60
+    const STEP = 3
+    const trail = []
+    let gaveUp = false
+    let reseeds = 0
+    for (let i = 0; i < N; i++) {
+      // 平移 + 逐帧加强的噪声。噪声从 0 涨到 60（0..255 量纲），到后半段足以让
+      // 相当一部分点失配 —— 而那正是要测的场景：点在掉，补种子该把它托住。
+      sendFrame(100 + i, (i + 1) * STEP, Math.round((i + 1) * STEP * 0.4),
+        Math.round((i / N) * 130), 1000 + i)
+      const r = await waitFor(worker, 'result', 30_000, `第 ${i + 3} 帧`)
+      trail.push(r.inliers ?? 0)
+      if (r.reseeded) reseeds++
+      if (r.gaveUp) { gaveUp = true; break }
+    }
+    metrics.longTrack = {
+      frames: trail.length, reseeds, gaveUp,
+      first: trail[0], last: trail.at(-1), min: Math.min(...trail),
+    }
+    await log(`长跟踪 ${trail.length} 帧 内点 ${trail[0]}→${trail.at(-1)} 最低 ${Math.min(...trail)} 补种子 ${reseeds} 次`)
+    push(`连续 ${N} 帧不放手（实测跑了 ${trail.length} 帧）`, !gaveUp, metrics.longTrack)
+    // 不要求内点数不降 —— 同一帧反复喂，光流本来就会慢慢漂。要求的是它不掉到失败线下面。
+    push(`内点数没跌破跟踪下限（最低 ${Math.min(...trail)}）`, Math.min(...trail) >= 12, metrics.longTrack)
+    // **补种子必须真的被触发过**，否则那段逻辑是死代码。
+    // 这条断言本身抓到过一个 bug：判据原来用光流存活数（`kept`），而噪声下光流的
+    // status 仍报成功、只是被 RANSAC 剔成外点 —— 于是内点掉到 32（触发线 49）而
+    // 补种子一次都没跑。改成用内点数之后才触发。
+    push(`补种子被触发过（${reseeds} 次）`, reseeds > 0, metrics.longTrack)
+  }
+
+  push('Worker 全程没有 onerror', fatal === null, { fatal })
+  worker.terminate()
+
+  const failed = checks.filter((c) => !c.ok)
+  document.getElementById('out').textContent = JSON.stringify(checks, null, 1)
+  return {
+    ok: failed.length === 0,
+    passed: checks.length - failed.length,
+    total: checks.length,
+    metrics,
+    ready,
+    firstResult: { reason: res.reason, inliers: res.inliers, ms: res.ms, state: res.state },
+    failures: failed,
+  }
+})
+</script>
