@@ -155,27 +155,87 @@ export class FrameGrabber {
     this.size = null
   }
 
-  /** @returns `{width, height, data}`（ImageData）或 null（视频还没就绪）。 */
-  grab() {
-    const v = this.video
-    const vw = v.videoWidth
-    const vh = v.videoHeight
+  /**
+   * 目标尺寸：长边压到 `longEdge`，等比。
+   *
+   * 抓帧就抓到查询长边，不多抓。抓 4K 再缩是白付一次转换 + 一次 resize，
+   * 而识别管线反正要把长边压到 1280。
+   *
+   * 单独抽出来是因为 **worker 那条路也要用同一个算法** —— 两处各算一遍的话，
+   * 差一个像素就是"另一张图"，所有关键点位置全移（`orb.js` 顶部那张表的第一行）。
+   */
+  targetSize() {
+    const vw = this.video.videoWidth
+    const vh = this.video.videoHeight
     if (!vw || !vh) return null
-
-    // 抓帧就抓到查询长边，不多抓。抓 4K 再缩是白付一次 GPU 回读 + 一次 resize，
-    // 而识别管线反正要把长边压到 1280。
     const s = Math.min(1, this.longEdge / Math.max(vw, vh))
-    const w = Math.max(1, Math.round(vw * s))
-    const h = Math.max(1, Math.round(vh * s))
+    return [Math.max(1, Math.round(vw * s)), Math.max(1, Math.round(vh * s))]
+  }
+
+  /**
+   * @returns `{width, height, data}`（ImageData）或 null（视频还没就绪）。
+   *
+   * ⚠️ **这条路在主线程上花 65ms**（真机实测，1280×960）。它是"渲染不丝滑"的
+   * 主要原因：22.5% 的帧迟到，其中 92% 正好跟在一次抓帧之后。首选 `grabBitmap()`，
+   * 这个留作兜底（`createImageBitmap` 或 `OffscreenCanvas` 缺一个就走它）。
+   */
+  grab() {
+    const size = this.targetSize()
+    if (!size) return null
+    const [w, h] = size
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w
       this.canvas.height = h
       this.size = [w, h]
     }
-    this.ctx.drawImage(v, 0, 0, w, h)
+    this.ctx.drawImage(this.video, 0, 0, w, h)
     return this.ctx.getImageData(0, 0, w, h)
   }
+
+  /**
+   * 抓一帧成 `ImageBitmap`，**把 RGBA 转换那 65ms 挪出主线程**。
+   *
+   * ## 实测（小米 M2012K11C / Edge 150，相机 1280×960）
+   *
+   * | 路径 | 主线程 |
+   * |---|---|
+   * | `grab()`：drawImage + getImageData | **65.1ms** |
+   * | `createImageBitmap(video)` | **19.4ms** |
+   * | bitmap → ImageData（这一段在 worker 上） | 10.2ms |
+   *
+   * 抓帧原来占掉主线程的 **55%**（7.5 次/秒 × 71.7ms），换成这条之后是 ~16%。
+   *
+   * ## 为什么**不**用 createImageBitmap 自带的 resize
+   *
+   * 它有 `resizeWidth/resizeHeight/resizeQuality`，看起来正好省掉一次 drawImage。
+   * 但那是**另一个缩放算法** —— 而缩放算法决定每一个像素，像素决定 FAST 角点，
+   * 角点决定描述子的每一位。换算法就是换特征空间，而库里的 `desc.bin` 是按现在这个
+   * 算的。所以这里**只做转换、不缩放**，缩放留给 worker 里的 `drawImage`（与
+   * `grab()` 逐字节同一条路）。
+   *
+   * ## 像素等价性是验过的，不是推的
+   *
+   * 真机上拿一张定住的帧作源，比较 `getImageData` 与 `createImageBitmap → OffscreenCanvas
+   * → getImageData`：**4,915,200 字节全部相同**（默认选项与关掉色彩转换/预乘都是 0 差异）。
+   * 定住源这一步是关键 —— 直接拿会动的 video 作源时，`createImageBitmap` 的 await
+   * 期间相机又推了一帧，量到的"61% 像素不同"是帧差异，不是路径差异。踩过一次。
+   *
+   * @returns `{bitmap, width, height}` 或 null。`bitmap` 是 Transferable，
+   *   调用方要么 transfer 给 worker、要么自己 `close()` —— 不然是真的泄漏 GPU 内存。
+   */
+  async grabBitmap() {
+    const size = this.targetSize()
+    if (!size) return null
+    // 不给 resize 选项，理由见上。colorSpaceConversion 给 'none' 是为了明确意图；
+    // 实测两种都是 0 差异，但写出来能防将来有人以为默认值做了什么。
+    const bitmap = await createImageBitmap(this.video, { colorSpaceConversion: 'none' })
+    return { bitmap, width: size[0], height: size[1] }
+  }
 }
+
+/** 这台浏览器走不走得通 `grabBitmap()` 那条路。 */
+export const canGrabBitmap = () =>
+  typeof createImageBitmap === 'function' && typeof OffscreenCanvas === 'function'
 
 export function stopCamera(stream) {
   for (const t of stream?.getTracks() ?? []) t.stop()
