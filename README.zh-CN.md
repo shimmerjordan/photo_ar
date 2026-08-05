@@ -3,34 +3,33 @@
 [English](README.md) · **简体中文**
 
 举起手机对着一张**打印出来的**照片，一段视频就贴在照片上播起来，跟着你的视角走。
+**打开一个网页就行，不用装任何东西。**
 
 照片是**触发条件 + 画布**：它不必是视频里的某一帧，任何一张打印出来的照片都能挂上
 任何一段视频。
 
-全自托管：识别索引跑在自己的 NAS 上，Android App 负责相机和 AR 跟踪。照片和视频
-都不出家门 —— 没有云服务、不调第三方识别 API。谁能看哪些照片在自带的网页管理台里配。
+全自托管：照片、视频、识别索引都在自己的 NAS 上，没有云服务、不调第三方识别 API。
+谁能看哪些照片在自带的网页管理台里配。
 
-**识别与 AR 贴合全部在手机上，服务端不在热路径里。** 服务端只做三件事：资源索引
-（预建 ARCore 目标库）、传输（下发目标库与视频）、管理（用户 / 权限 / 配置）。
+**识别与贴合全部在浏览器里跑，服务端不在热路径上。** 手机打开页面时下一次识别库
+（几十 KB），之后每一帧的特征提取、匹配、单应矩阵、贴合渲染都在本地 —— 服务端只做
+三件事：资源索引、传输（识别库与视频）、管理（用户 / 权限 / 配置）。
 
 ```
-┌── Android App ──────────────┐    ┌── NAS ─────────────────────────┐
-│ ARCore 本地识别 + 6DoF 追踪 │    │ 索引：arcoreimg 预建整库目标库 │
-│   ↑ 装的是服务端预建的库    │←db─┤   GET /v1/targets/db  (ETag)   │
-│   （首次同步下一次，几 MB） │←元─┤   GET /v1/targets/manifest     │
-│ + GLES 视频面片             │    │ 传输：/v1/photo/<id>/media     │
-│   识别不走网络              │←mp4┤   （支持 Range 的吐流）        │
-│                             │    │ 管理：/admin 网页管理台        │
+┌── 手机浏览器 ───────────────┐    ┌── NAS：一个容器，一个端口 ─────┐
+│ opencv.js(wasm) 提 ORB 特征 │    │  /          网页版（这一半）    │
+│ + RANSAC 单应矩阵           │←库─┤  /api/lib   识别库包（ETag）    │
+│ + WebGL 贴视频面片          │    │  /admin     网页管理台          │
+│   识别一帧都不走网络        │←mp4┤  /v1/*      API、视频吐流       │
 └─────────────────────────────┘    └────────────────────────────────┘
-        └── 兜底（超 1000 张 / 装不上预建库）→ POST /v1/recognize ──┘
 ```
 
 ## 识别是怎么做的
 
-1. **入库** —— 每张照片提局部描述子，量化成词序列存进倒排索引；同时让 ARCore 的
-   `arcoreimg` 给一个质量分，并生成手机跟踪要用的 `.imgdb`。特征后端可切换：
-   **ORB**（默认，已通过出口条件的基线）或 **XFeat**（CVPR 2024 预训练模型，
-   Apache-2.0）。两者的取舍与实测数字见 [docs/decisions.md](docs/decisions.md)。
+1. **入库** —— 每张照片提局部描述子，量化成词序列存进倒排索引。特征后端可切换：
+   **ORB**（默认，已通过出口条件的基线，也是浏览器侧唯一实现的那个）或
+   **XFeat**（CVPR 2024 预训练模型，Apache-2.0）。两者的取舍与实测数字见
+   [docs/decisions.md](docs/decisions.md)。
 2. **查询** —— 相机帧走同一条管线，倒排索引给出候选，然后每个候选用 RANSAC 单应
    矩阵做几何校验。判定命中需要**内点数 ≥ 40**。
 3. **为什么是 40** —— 量出来的，不是猜的。29740 次查询里，真实误识别的内点数最大
@@ -38,14 +37,21 @@
    误识别率压到 0。复现脚本在 `bench/`。（XFeat 后端是另一套分布，阈值 60，
    依据见决策记录。）
 
-识别侧有两种情况是**故意拒绝**的：纹理太稀疏、ARCore 跟不住的照片（实测**真实家庭
-照片约 65% 属于这类**），以及与库中已有照片构成近重复的 —— 两张都留下的后果是
-**两张都永远认不出来**。
+识别侧有两种情况是**故意拒绝**的：纹理太稀疏、跟不住的照片（实测**真实家庭照片约
+65% 属于这类**），以及与库中已有照片构成近重复的 —— 两张都留下的后果是**两张都
+永远认不出来**。
 
 ## 部署
 
-服务端以容器镜像发布在 GHCR 上。NAS 上只需要四个配置文件加两个你自己的文件，
-**不用 clone 源码、不用构建**：
+**一个容器，一个端口。** 网页版、管理台、API 在同一个端口上按 URI 分：
+
+| 地址 | 是什么 |
+|---|---|
+| `/` | 宾客扫照片的页面 |
+| `/admin` | 网页管理台（用户、授权、参数、照片↔视频映射） |
+| `/v1/*` | 后端 API（批量入库脚本打这里） |
+
+NAS 上不用 clone 源码、不用构建：
 
 ```bash
 cp .env.example .env      # 只有 PHOTOAR_ROOTS 必须看一眼
@@ -55,18 +61,25 @@ docker compose up -d
 不需要手写配置文件、不需要预先训练词表、不需要预置模型 —— 缺的都会在启动日志里
 说清楚，并且服务照样起得来。引导管理员的口令会打印在日志里一次。
 
+⚠️ **对宾客开放时前面必须有一层 https**：相机（`getUserMedia`）只在安全上下文里
+存在，`http://<局域网IP>` 不算。现有的 Cloudflare Tunnel 加一条 ingress 指到这个
+端口就够。只用管理台和 API 的话 http 直连没问题。
+
 每一步都带「看到什么算成」的完整流程：**[docs/deploy.md](docs/deploy.md)**。
 
-镜像里**故意不含** `arcoreimg`（ARCore 的闭源二进制，不可再分发）和 `vocab.npz`
-（用你自己的照片训出来的词汇树），两个都在运行时用 bind mount 送进容器。
+镜像里**故意不含** `vocab.npz`（用你自己的照片训出来的词汇树）与 `xfeat.onnx`，
+两个都在运行时送进容器 —— 理由与做法见 Dockerfile 里那段注释。
 
 ## 文档
 
+**从 [docs/README.md](docs/README.md) 进** —— 那是一页索引，按你要干的事挑一份。
+
 | 文档 | 里面有什么 |
 |---|---|
-| [docs/deploy.md](docs/deploy.md) | 部署步骤：开 SSH → compose 起服务 → 确认核显硬编 → 入库 → Tailscale → Cloudflare → 出 APK → 手机配通道。每步都写了看到什么算成 |
+| [docs/deploy.md](docs/deploy.md) | 部署步骤：开 SSH → compose 起服务 → 确认核显硬编 → 入库 → Tailscale → Cloudflare → 手机打开网页。每步都写了看到什么算成 |
 | [docs/decisions.md](docs/decisions.md) | **决策记录**：识别特征为什么选 XFeat、为什么放弃全局描述子、阈值怎么量出来的、用户体系与权限为什么这样设计、实测延迟、以及**已知风险与下一步必须做的测量** |
-| [docs/deploy-details.md](docs/deploy-details.md) | 取舍与数字：为什么媒体绝不走 Cloudflare、为什么用 VAAPI 而不是 QuickSync、批量入库为什么串行、实测基线、排障对照表 |
+| [docs/deploy-details.md](docs/deploy-details.md) | 取舍与数字：证书为什么同时管着相机和缓存、CDN 该缓存什么、为什么用 VAAPI 而不是 QuickSync、实测基线、排障对照表 |
+| [web-front/README.md](web-front/README.md) | 网页版自己那一半：浏览器里怎么跑 ORB、跟踪与贴合、为什么没有 ARCore 的等价物 |
 | [deploy/README.md](deploy/README.md) | 命令速查、例行维护命令、`data/` 下每个文件丢了会怎样 |
 | [bench/README.md](bench/README.md) | 上面每个数字背后的测量脚本 |
 
@@ -75,22 +88,26 @@ docker compose up -d
 ```
 src/photoar/          识别、入库、转码和 HTTP 服务端（Python）
   server/             /v1/* 接口、路径白名单、媒体 URL 解析
-android/
-  arview/             ARCore + GLES 扫描视图、通道选择、离线缓存
-  app/                Compose 外壳：照片库、详情、浏览、设置
   server/webui/       零构建的网页管理台（用户、授权、配置、照片）
+web-front/            网页版（原生 ES modules + 零依赖 Node，没有构建步骤）
+  public/             页面、识别管线（opencv.js）、WebGL 渲染
+  server/             静态资源、/v1 与 /admin 反代、识别库打包、媒体票据
+docker/               容器入口（双进程管理器）与健康检查
 tools/                batch_ingest.py（只用标准库）、export_models.py、fetch_models.py
 bench/                Phase 0 的测量脚本
-deploy/               config.example.json 与命令速查
-docs/                 部署文档
+deploy/               config.example.json、开发机的 compose 覆盖层、运维速查
+docs/                 README.md 是索引；部署、取舍与决策记录
 ```
 
 ## 开发
 
 ```bash
 pip install -e ".[dev]" && pytest        # 服务端与识别
-cd android && ./gradlew test             # arview 与外壳的单测
+cd web-front && npm test                 # 网页版（零依赖，只用 node --test）
 ```
+
+网页版还有几套要真浏览器的：`npm run test:browser`（识别管线的黄金用例）、
+`npm run test:smoke` 与 `npm run test:pages`（对着一个跑着的容器点一遍每个页面）。
 
 发一版新的服务端镜像是个明确动作，不是推代码的副作用：
 
@@ -98,14 +115,18 @@ cd android && ./gradlew test             # arview 与外壳的单测
 git tag v0.2.0 && git push origin v0.2.0    # 触发构建并推到 GHCR
 ```
 
-读源码的两点提醒：
-
-- 注释里的 `§N` 指的是一份没有随仓库发布的内部设计文档。每处注释都把真正的理由
-  写在了旁边，所以不看那份文档也不缺信息。
-- Android 的 release 是**故意用 debug key 签的** —— 这个包只装自己那几台手机，
-  不上应用市场。代价是**换机器出的包签名不同，不能覆盖安装**。
+读源码的一点提醒：注释里的 `§N` 指的是一份没有随仓库发布的内部设计文档。每处注释
+都把真正的理由写在了旁边，所以不看那份文档也不缺信息。
 
 ## 现状
 
-识别可行性验证、NAS 服务端、ARCore 扫描视图、App 外壳、端侧缓存与离线识别都已经
-做完并在跑。一个只读的网页版（让亲友不装 App 也能看到效果）设计好了但还没做。
+识别可行性验证、NAS 服务端、网页版（识别 + 跟踪 + 贴合 + 像素风界面）、用户与权限、
+网页管理台都已经做完并在跑，真机（安卓 / Chromium）上验证过完整链路。一个容器一个
+端口的部署形态在开发机上按 NAS 的资源预算（3 核 / 3 GiB）验证过。
+
+**安卓原生客户端 2026-08-05 下线**，精力集中在网页版：不用装、iOS 与鸿蒙同样能用，
+而它的识别与贴合质量已经够。那一套代码在 git 历史里（`android/`），决策记录在
+[docs/decisions.md](docs/decisions.md)。
+
+还没在目标硬件上验证的：XFeat 后端在 N5095 上的延迟（在更快的机器上按 3 核预算实测
+p50 800ms，那台上大概太慢）。它默认关着。见 [docs/decisions.md](docs/decisions.md) §11。

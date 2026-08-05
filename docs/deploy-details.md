@@ -20,63 +20,117 @@
 
 ---
 
-## 三条通道为什么这么分
+## 两条外网通道，各跑什么
 
-**媒体和 API 走的不是同一条路**，这不是可选项，是 Cloudflare 的条款和限制决定的：
+网页版只有**一个源、一个端口**（`/` 网页、`/admin` 管理台、`/v1/*` API），所以"走哪条
+路"完全由用户打开哪个地址决定 —— 没有客户端探活那一层了（那是已下线的安卓客户端的
+`EndpointResolver`）。
 
 | 通道 | 跑什么 | 什么时候用 |
 |---|---|---|
-| LAN | API + 视频 | 在家。默认，最快 |
-| Tailscale | API + 视频 | 在外面看视频 |
-| Cloudflare Tunnel | **只跑 API 小包** | 在外面、且没开 Tailscale |
+| LAN | 全部 | 在家。最快，但**要真证书才能开相机**（见下面「证书不是可选项」） |
+| Tailscale | 全部 | 自己和家里人在外面 |
+| Cloudflare Tunnel | **全部，含视频** | 宾客。他们不会装 Tailscale |
 
-客户端同时探这几条，按可用性和延迟挑（`EndpointResolver`），所以**三条都配上是常态**，
-不是三选一。隧道上一次识别请求上行约 50KB（JPEG 帧）、下行 <2KB —— 这个量级下，
-后面所有「加速」手段的收益都要打折看。
+**视频走 Cloudflare 是 2026-08-05 定下的**，推翻了之前"隧道只跑 API 小包"那条。理由很
+直接：网页版的宾客不装任何东西，也就没有第二条路可走 —— 要么视频从隧道出去，要么宾客
+根本看不到视频。风险是真的（见下面第三条），是一个被明确接受的取舍，不是被忽略的问题。
 
 ## 隧道的三条硬限制
 
 | 限制 | 官方数字 | 对本项目的后果 |
 |---|---|---|
-| 请求体上限 | Free / Pro **100MB**，Business 200MB | `/v1/upload` 传原片会被 413。客户端探测到 media 走隧道时**隐藏上传入口**，服务端见到 `CF-Ray` 头的上传请求也直接 413 并说明原因 |
-| Proxy Read Timeout | **125 秒**，非 Enterprise 不可调，超时 524（Proxy Write Timeout 30 秒） | 带视频入库是同步请求，软编慢档必然 524。批量入库走 LAN |
-| CDN 服务条款 | 非 Enterprise 套餐**不得**通过 CDN 提供视频或「不成比例的图片、音频、大文件」，要买 Stream / Images；Cloudflare 保留「停用或限制你使用 CDN」的权利，**且通知不保证提前** | 一条视频最大 16.24MiB、实测 14.72MiB。真把媒体挂上去，赔的是整个账号 —— 同一条 tunnel 上其它服务一起没 |
+| 请求体上限 | Free / Pro **100MB**，Business 200MB | `/v1/upload` 传原片会被 413。服务端见到 `CF-Ray` 头的上传请求直接 413 并说明原因 —— **批量入库和传素材走 LAN 或 Tailscale** |
+| Proxy Read Timeout | **125 秒**，非 Enterprise 不可调，超时 524（Proxy Write Timeout 30 秒） | 带视频入库是同步请求，软编慢档必然 524。入库走 LAN |
+| CDN 服务条款 | 非 Enterprise 套餐**不得**通过 CDN 提供视频或「不成比例的图片、音频、大文件」，要买 Stream / Images；Cloudflare 保留「停用或限制你使用 CDN」的权利，**且通知不保证提前** | 一条视频最大 16.24MiB、实测 14.72MiB。50 个宾客人均 3 条约 **2.2GB**。风险是**账号级**的：同一条 tunnel 上其它服务会一起没 |
 
-第三条是账号级风险，不是性能问题，所以「适合 media」这个开关**绝对不要勾在隧道那张卡上**。
+第三条**已经被接受**（见上一节）。能降低暴露面的两件事，都在部署层：
+
+- **视频只在婚礼那几个小时里可达。** 用完把那条 ingress 摘掉 —— 长期挂着一个能拉
+  2GB 视频的公开地址，风险是按时间累积的。
+- **别给 `/v1/*` 或 `/api/*` 加任何缓存规则。** 理由见下面「CDN：该缓存什么、绝对不该
+  缓存什么」——那不只是流量问题，是会**跨用户串视频**。
 
 关于 524：隧道超时的时候**照片其实已经入进去了**。写库是整个流程的最后一步（转码
 完成之后才写 catalog 和识别库），你看到的只是响应超时；再提交一次会得到 409
 `already_ingested` 并带上 photoId，不会重复入库。
 
-## 客户端选通道的规则（和一个兜底）
+## 证书不是可选项 —— 它同时管着相机和缓存
 
-`EndpointChoice.select` 的逻辑是：**在存活的候选里，优先挑声明了这个用途的；一条都
-没有就取第一条通的。**
+两件事都断在这上面，第二件是 2026-08-05 实测出来的，之前一直不知道：
 
-后半句意味着 —— **LAN 和 Tailscale 都不通时，media 会兜底落到隧道上。** 这是故意
-留的：没有它，Tailscale 一掉线在外面就完全播不了视频。介意上面第三条的话，出门前
-用离线缓存，或者干脆把 Tunnel 那张卡的开关关掉 —— 关掉的卡不参与探活，也就不会被
-选中。
+1. **相机。** `getUserMedia` 只在安全上下文里存在。`https://` 任意域名算，
+   `http://localhost` 算，**`http://192.168.x.x` 与 `http://100.x.x.x` 都不算。**
+2. **浏览器的磁盘缓存。** Chromium 对**有证书错误的源整体禁用磁盘缓存** —— 自签证书、
+   或者点过"继续访问"的那种，全都算。`Cache-Control: immutable` 写了也不生效。
 
-另外两道护栏：Tunnel 卡的 `prefer` 默认只有 `api`；`uploadAllowed()` 在 media 落到
-隧道上时返回 false（设置页「上传」那一行显示的就是它）。
+第二条的代价是量过的。同一台手机（小米 M2012K11C / Edge for Android 150）、同一份代码，
+只换地址：
 
-「是隧道」这个标记不勾的后果不是「少个标记」：客户端据此判断能不能上传，一旦 media
-落到隧道又没标记，它会放行上传，然后被 413，白等一次。
+| 地址 | 每次打开页面 | 界面可用 |
+|---|---|---|
+| `https://100.110.121.64:8964`（自签） | 引擎 **4.87MB**（预取 + 装配各一遍，一次都进不了缓存） | **16.0 秒** |
+| `http://localhost:8964`（adb reverse，无 TLS） | 首次 2.43MB，**再进 0 字节** | **1.6 秒** |
 
-## 要不要再加一层 Cloudflare Access
+也就是说自签证书的代价不是"有个警告要点一下"，是**每个宾客每次进页面都重下一遍引擎**。
+拿真证书的两条路见 [deploy.md 第 7 步](deploy.md)。
 
-服务端唯一的鉴权是 Bearer token（`hmac.compare_digest` 定长比较，没有时序泄漏），
-token 一泄漏就等于全开。要再加一层的话：
+## CDN：该缓存什么、绝对不该缓存什么
 
-- **Access + Service Token**：客户端每个请求多带 `CF-Access-Client-Id` /
-  `CF-Access-Client-Secret`。安全性实打实提高，代价是 Android 客户端要改（现在只发
-  `Authorization`），而且 token 轮换要两边一起换
-- **WAF 规则限国家 / ASN**：零改动，能挡掉绝大多数扫描流量，但挡不住定向
-- **什么都不加**：路径是随机子域名 + 32 字符 token，扫不到也猜不出
+网页版有 **2.6MB 的静态资源**是所有宾客共享、且内容永不变的（引擎 2.43MB brotli、
+字体 175KB、素材 37KB）。让它们停在 Cloudflare 边缘，宾客就不用每人从 NAS 拉一遍 ——
+这是隧道那一段最值钱的一次优化。
 
-现在的建议是第二条（挡噪声）+ 把 token 当密码管。等做给亲友用的 web 版时，Access 的
-email OTP 才是对的工具 —— 那时才有「按人授权」的需求。
+### ⛔ 先说不该缓存的
+
+**`/v1/*` 和 `/api/*` 一律不能缓存。** 它们是**按人授权**的：`/api/lib` 是这个用户能扫
+的那些照片、`/api/stream/<票>` 是一次性票据换来的视频流。任何一条把它们缓存到边缘的
+规则，都会把一个人的视频发给另一个人 —— 而且没有任何症状，你看到的是"能播"。
+
+所以**不要开 "Cache Everything" 页规则**（那是老教程里最常见的一条）。要缓存就写成
+按路径限定的 Cache Rule，见下面。
+
+### ✅ 该缓存的：`/vendor/*` 与 `/art/*`
+
+Cloudflare 的默认缓存是**按文件扩展名**的，一份固定名单（`.js` / `.css` / `.png` /
+`.woff2` / `.mp4` …）。名单里**没有 `.wasm`** —— 而 2.43MB 里的 2.43MB 就是它。所以
+默认状态下最大的那一块**不会**被边缘缓存，得自己加一条规则。
+
+Cloudflare 后台 → Caching → Cache Rules，新建一条：
+
+```
+名字：photoar static
+表达式：(http.host eq "ar.你的域名") and (starts_with(http.request.uri.path, "/vendor/")
+        or starts_with(http.request.uri.path, "/art/"))
+设置：
+  Cache eligibility        → Eligible for cache
+  Edge TTL                 → Use cache-control header if present（回退 1 天）
+  Browser TTL              → Respect origin
+  Cache key → Query string → Include all（默认；`?v=` 必须参与做键）
+```
+
+三件事要留意，都是踩过或差点踩的：
+
+- **`?v=` 必须进缓存键。** 引擎的 URL 是 `/vendor/opencv.wasm?v=<内容哈希前12>`，
+  版本号在 query 里（由 `tools/split-wasm.mjs` 写进 opencv.js）。把 query 从键里去掉的
+  话，升级 OpenCV 之后边缘会一直发旧字节 —— 而新 js 配旧 wasm 的表现是"函数签名对不上"。
+- **`Vary: Accept-Encoding` 已经在发了。** 服务端对 wasm 与 opencv.js 发预压的 brotli，
+  同时带 `Vary` 和不同的 ETag。Cloudflare 会按编码分别存，别去动它。
+- **`/vendor/opencv.js` 是 `no-cache` 的**，所以它不会被边缘缓存 —— 有意的：它的 URL 里
+  没有版本号（一直叫 `opencv.js`），给它 immutable 是个哑雷。128KB（brotli 后 30KB）
+  换一次条件请求，划算。
+
+### 怎么确认它真的生效了
+
+```bash
+U="https://ar.你的域名/vendor/opencv.wasm?v=<从 opencv.js 里抄那个版本号>"
+curl -sI -H 'Accept-Encoding: br' "$U" | grep -iE 'cf-cache-status|content-encoding|content-length|cache-control'
+```
+
+第一次多半是 `cf-cache-status: MISS`，**再打一次要变成 `HIT`**。
+`DYNAMIC` = 这条根本没被判定为可缓存（规则没生效或表达式没命中）；
+`BYPASS` = 有别的规则或 cookie 把它挡掉了。
+`Content-Length` 应该是 2.5MB 左右而不是 11.9MB —— 那说明 brotli 也一路透传了。
 
 ## 转码与核显硬编
 
@@ -184,7 +238,8 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 | SaaS 回源优选 | ⚠️ 最后手段 | 外网 `/v1/ping` 中位数明显超过 400ms |
 | Argo / Smart Shield | ❌ | 优化不到国内出口那一段 |
 | China Network | ❌ | 要 Enterprise + ICP 备案 |
-| **把媒体也挂到隧道上** | ❌❌ | 违反 CDN 条款，赔的是整个账号 |
+| **把静态资源缓存到边缘**（Cache Rule） | ✅ **收益最大** | 2.6MB × 每个宾客，见上一节 |
+| 把视频也挂到隧道上 | ⚠️ 已接受 | 违反 CDN 条款、风险是账号级的。2026-08-05 明确接受，理由见「两条外网通道」 |
 
 ### 让 cloudflared 走 IPv6
 
@@ -327,9 +382,9 @@ workflow** 时才发新的 —— 往 main 推代码不会动镜像。所以 `pu
 | 只改了服务端逻辑 / 接口 | 什么都不用 | — |
 | 照片原文件被移动或改名 | `verify` 看报告，重新关联 | 详情页 `refStale`，识别仍在（用的是入库时存的特征） |
 
-**改了 Android**：重新 `assembleRelease -Pphotoar.deviceAbiOnly=true`，用**同一份 debug
-keystore** 覆盖安装。CI 出的包签名不同（runner 上的 `debug.keystore` 是每次现生成的），
-和本地包互换必须先卸载 —— 而卸载会清掉设置里的通道、令牌和离线缓存。
+**改了网页版**：`docker compose up -d --build`。前端没有构建步骤，但它在镜像里 ——
+改了 `web-front/public/` 不重建镜像是不会生效的。宾客那边刷新一下页面就是新的
+（HTML 与 js 都是 `no-cache`，只有 `vendor/` 和字体是 immutable）。
 
 **备份**：值钱的只有 `data/`（每个文件的作用见 [deploy/README.md](../deploy/README.md)
 的表）。`imgdb/`、`thumb/`、`playable/` 丢了只能重新入库再生成，所以别只备份

@@ -1,173 +1,80 @@
-# 部署 photo-ar-server（Phase 1）
+# `deploy/` 里有什么，以及命令速查
 
-目标环境：QNAP TS-464C2（Celeron N5095，4C/4T，8GB），Container Station。
-复用已有的 cloudflared tunnel 与 CloudDrive2 挂载，**不新建任何服务**。
+这个目录只有两个文件：
 
-> 第一次部署请按 [docs/deploy.md](../docs/deploy.md) 走 —— 那份是带验证步骤的
-> 完整流程。取舍与实测数据在 [docs/deploy-details.md](../docs/deploy-details.md)。
-> 这份只是命令速查。
+| 文件 | 干什么 |
+|---|---|
+| `config.example.json` | 可选的配置文件模板。**不需要它** —— 全部配置都能从 `.env` 的环境变量来。想用更细的参数（media 策略、`self_score_samples`、ffprobe 路径…）就 `cp` 成 `deploy/config.json`，entrypoint 检测到它存在就用它 |
+| `compose.local.yml` | 在**开发机**上起服务的覆盖层。用法与「与 NAS 到底哪里不一样」写在那个文件的头部 |
 
-## 1. 准备
+> **第一次部署不看这份。** 走 [docs/deploy.md](../docs/deploy.md) —— 那份是带
+> 「看到什么算成」的完整流程。取舍、实测数字与排障在
+> [docs/deploy-details.md](../docs/deploy-details.md)。
+>
+> 这份只留**不在那两份里**的东西：例行维护的命令、`data/` 里每个文件丢了会怎样、
+> 以及几条只有运维会撞上的坑。
+>
+> （2026-08-05 把这份文件里重复的那半删了。它当时还写着"词汇树必须预先训好拷进
+> `data/`"——那条**早就不成立**了，服务没词表也能起。一份过时的速查比没有速查更坏。）
 
-```bash
-# 1) arcoreimg（ARCore SDK for Android 的 tools/arcoreimg/linux/arcoreimg）
-#    闭源二进制，不在仓库里。放到 tools/ 下，构建时会一起进镜像。
-cp ~/Downloads/arcoreimg tools/arcoreimg && chmod +x tools/arcoreimg
-
-# 2) 词汇树。服务端不训练，必须预先训好拷进 data/。
-#    用一批与家里照片风格接近的照片训（几千张即可，与要入库的照片不必相同）。
-photoar build --photos /path/to/一批照片 --out /tmp/corpus
-cp /tmp/corpus/vocab.npz data/vocab.npz
-
-# 3) 配置
-cp deploy/config.example.json deploy/config.json
-$EDITOR deploy/config.json          # 改 roots 为容器内路径
-cp .env.example .env
-$EDITOR .env                        # 填 PHOTOAR_TOKEN（openssl rand -hex 24），别写进配置文件
-```
-
-`vocab.npz` 换了就必须 `photoar-server reindex --rebuild-words`，否则库里存的
-词序列还是旧树量化出来的，倒排索引会指向错误的桶——表现是识别率突然掉到底，
-而日志里一切正常。
-
-## 2. 起服务
-
-```bash
-docker compose pull            # 用 GHCR 上的镜像。自己改了代码就换成 docker compose build
-docker compose up -d
-docker compose logs -f photo-ar-server
-```
-
-自检（`T` 取 `.env` 里那串）：
-
-```bash
-curl -sS -H "Authorization: Bearer $T" http://<NAS 的 LAN IP>:8964/v1/ping
-# {"ok": true, "version": "phase1", "serverTime": 1753...}
-
-# 硬编到底有没有生效（软编回退是静默的，只能这样问）
-docker compose exec photo-ar-server vainfo 2>&1 | grep -c VAEntrypointEncSlice
-docker compose exec photo-ar-server python -c \
-  "from photoar import transcode as T; print(T.resolve_encoder('auto'))"
-# h264_vaapi = 硬编可用；libx264 = 回退了，查 /dev/dri 有没有透进来
-```
-
-## 3. 加一条 cloudflared ingress
-
-**不新建 tunnel，也不改 DNS。** 你自己域名的通配符 CNAME（`*.<你的域名>`）已经指向
-现有的 tunnel，加一条 ingress 规则即可。
-
-> 下面出现的 `<你的域名>`、`<NAS>` 都是占位符。真实地址只填两处：服务端填
-> `deploy/config.json`（已 gitignore），客户端填 App 的「设置 → 通道」——
-> 仓库里不写死。
-
-编辑 NAS 上 cloudflared 的配置（QNAP 上通常是
-`/share/Container/cloudflared/config.yml`），在 `ingress:` 列表里、**404 兜底那条
-之前**插入：
-
-```yaml
-ingress:
-  # ...已有的规则...
-
-  - hostname: arphoto.<你的域名>
-    service: http://127.0.0.1:8964
-    originRequest:
-      # 识别请求要跑 ORB+RANSAC，N5095 上 P95 约 100ms，但入库一张要 1~3s
-      # （arcoreimg + 20 次自匹配 + 可能的转码）。默认 30s 够，但改大更省心。
-      connectTimeout: 30s
-      # 视频走 LAN/Tailscale，隧道上只跑 API 小包，不需要大 buffer
-      noHappyEyeballs: true
-
-  # 兜底 404 必须留在最后
-  - service: http_status:404
-```
-
-然后重启 cloudflared：
-
-```bash
-docker restart cloudflared     # 或 Container Station 里重启
-```
-
-验证（从任何外网环境）：
-
-```bash
-curl -sS -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping
-```
-
-### 隧道上的三条硬限制（详见 [deploy-details](../docs/deploy-details.md#隧道的三条硬限制)）
-
-| 限制 | 后果 | 应对 |
-|---|---|---|
-| Cloudflare 免费版请求体 **100MB** 上限 | 上传原片会被 413 掉 | 客户端在识别到走隧道时隐藏上传入口；服务端见到 `CF-Ray` 头的上传请求直接 413 并说明原因 |
-| Proxy Read Timeout **125 秒**，非 Enterprise 不可调 | 带视频入库是同步请求，软编慢 preset 必然 524 | 批量入库走 LAN；软编默认 preset 已经是 `veryfast`（[为什么](../docs/deploy-details.md#转码与核显硬编)） |
-| 代理视频流**明文违反** CDN 服务条款（不是灰区：非 Enterprise 套餐要通过 CDN 提供视频/大文件必须另买 Stream/Images，Cloudflare 保留停用权且通知不保证提前） | 赔的是整个账号，同一条 tunnel 上其它服务一起没 | 媒体只走 LAN/Tailscale。隧道只跑 API 小包（上行约 50KB / 下行 <2KB） |
-
-## 4. 入库
-
-入口是 HTTP（Android 外壳的「关联新照片」页调的也是它）。单条：
-
-```bash
-curl -sS -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
-  -d '{"refPath":"/share/Photo/2019/IMG_0421.jpg",
-       "videoPath":"/share/Video/2019/IMG_0421.mov",
-       "printWidthMm":152,
-       "title":"外婆家院子"}' \
-  http://<NAS>:8964/v1/photo
-```
-
-批量（串行、可续跑，只用标准库）：
-
-```bash
-python3 tools/batch_ingest.py --base http://127.0.0.1:8964 \
-    --photos /share/Photo/某个目录 --videos /share/Video/某个目录 \
-    --recursive --width-mm 152 --limit 5 --dry-run     # 先看配对，再去掉这两个参数
-```
-
-`printWidthMm` 是**打印出来的照片实际宽度**，不是像素宽度。跟踪精度直接依赖
-它，所以没有默认值。常见规格：6 寸 152mm、5 寸 127mm、4 寸 102mm ——
-但冲印店的「6 寸」未必正好 152，**拿尺量画面本身，白边不算**
-（见 [deploy-details](../docs/deploy-details.md#打印那一侧两件影响成败的事)）。
-
-会被拒的几种情况，都带明确原因：
-
-| 状态码 | 原因 | 说明 |
-|---|---|---|
-| 422 `quality_too_low` | arcoreimg 质量分 < 75 | 大片天空、纯色背景、过曝、严重模糊。换图或给照片加一圈细纹理边框 |
-| 409 `already_ingested` | 同一张照片已入库 | photoId 是内容哈希，同内容必然同 id |
-| 409 `near_duplicate` | 与库中某张过于相似 | 会列出冲突对象。两张都留着的后果是两张都永远认不出来（0d 实测） |
-| 403 `path_denied` | 路径在白名单外 | 响应体不回显被拒的路径 |
-
-## 5. 例行维护
+## 例行维护
 
 ```bash
 # 素材完整性（mtime + bytes，只在不一致时才哈希）。不自动改绑，只报告。
-docker compose exec photo-ar-server python -m photoar.server.httpd -c /config/config.json verify
+docker compose exec photo-ar-server photoar-server verify
 
 # catalog 与识别库是否一致（有不一致时退出码 1）
-docker compose exec photo-ar-server python -m photoar.server.httpd -c /config/config.json check
+docker compose exec photo-ar-server photoar-server check
 
 # 重建倒排索引（换了 vocab 加 --rebuild-words）
-docker compose exec photo-ar-server python -m photoar.server.httpd -c /config/config.json reindex
+docker compose exec photo-ar-server photoar-server reindex
+
+# 训词表（入完库再训，用的是你这批照片自己的描述子）
+docker compose exec photo-ar-server photoar-server build-vocab
 ```
 
-`/data` 里各文件的作用：
+> `docker compose exec` **不走 ENTRYPOINT**，所以这些命令不会顺带起一个网页版进程。
+> 换成 `docker run` 的话 entrypoint 会认出这几个子命令、同样只跑它们
+> （见 `docker/entrypoint.py` 的 `_is_server_invocation`）。
+
+## 入库会被拒的几种情况
+
+都带明确原因，而且每一种的下一步动作不同：
+
+| 状态码 | 原因 | 说明 |
+|---|---|---|
+| 422 `quality_too_low` | 纹理质量分 < 75（`arcoreimg eval-img` 打的） | 大片天空、纯色背景、过曝、严重模糊。**实测真实家庭照片约 65% 属于这类**。换图，或给照片留一圈有纹理的边 |
+| 409 `already_ingested` | 同一张照片已入库 | photoId 是内容哈希，同内容必然同 id。响应里带着那张的 photoId |
+| 409 `near_duplicate` | 与库中某张过于相似 | 会列出冲突对象。**两张都留着的后果是两张都永远认不出来**（实测） |
+| 403 `path_denied` | 路径在白名单外 | 响应体不回显被拒的路径 |
+| 503 `arcoreimg_missing` | 那个二进制没送进容器 | 见 [docs/deploy.md](../docs/deploy.md) 的「先准备两样东西」 |
+
+## `/data` 里各文件的作用
 
 | 文件 | 作用 | 丢了会怎样 |
 |---|---|---|
-| `catalog.db` | 照片、素材、识别历史 | 全部元数据丢失，要重新入库 |
-| `library/desc.bin` | 每张照片的 ORB 描述子 | 同上 |
+| `catalog.db` | 照片、素材、识别历史、用户与授权 | 全部元数据丢失，要重新入库 |
+| `library/desc.bin` | 每张照片的 ORB 描述子 | 同上。**网页版发下去的就是它** |
 | `library/words.bin` | 每张照片的词序列 | 可用 `reindex --rebuild-words` 从 desc.bin 重算 |
 | `library/index.npz` | 倒排索引 | 可用 `reindex` 重建（秒级） |
 | `library/slots.json` | slot ↔ photoId 对照 | **最要紧的一个**。丢了 desc.bin 里的特征就对不上 id 了 |
-| `imgdb/`, `thumb/` | ARCore 增强图像库、缩略图 | 要重新入库才能再生成 |
-| `playable/` | 转码后的 faststart mp4 | 会重新转码 |
+| `thumb/` | 缩略图 | 要重新入库才能再生成 |
+| `imgdb/` | 单张的 ARCore `.imgdb` | **现在没有消费者**（安卓客户端 2026-08-05 下线）。删了不影响网页版，但入库仍然会生成 —— 拆掉它要动数据库那两列，见 decisions.md §36.1 |
+| `playable/` | 转码后的分片 mp4 | 会重新转码。**必须是分片的**（`moof` 在头部）—— 网页版靠 MediaSource 播，老的 faststart 格式播不了 |
+| `models/` | `xfeat.onnx` 与词表 | 启动时会重新取（`PHOTOAR_FETCH_MODELS=1`）；词表要重训 |
 
-容器以 root 跑（QTS 上的容器惯例如此），`/data` 里的产物属主是 root。想在宿主
-机上直接删 `data/` 会遇到 Permission denied，用容器自己删：
+**`library/` 里三份记录（`slots.json` / `desc.bin` / `words.bin`）的条数必须相等。**
+入库中途断电会留下条数不齐的目录，服务启动时会直接拒绝并让你跑 `reindex` —— 这是
+故意的：错位一位的后果是「识别命中后播的是别人的视频」，宁可不启动。
+
+## 两条只有运维会撞上的
+
+**`/data` 里的产物属主是 root**（容器以 root 跑，QTS 上的容器惯例如此）。想在宿主机上
+直接删会 Permission denied，用容器自己删：
 
 ```bash
 docker compose run --rm --entrypoint sh photo-ar-server -c 'rm -rf /data/*'
 ```
 
-`library/` 里三份记录（`slots.json` / `desc.bin` / `words.bin`）的条数必须相等。
-入库中途断电会留下条数不齐的目录，服务启动时会直接拒绝并让你跑 `reindex`
-——这是故意的：错位一位的后果是「识别命中后播的是别人的视频」，宁可不启动。
+**换了 `vocab.npz` 必须 `reindex --rebuild-words`。** 不做的话库里存的词序列还是旧树
+量化出来的，倒排索引指向错误的桶 —— 表现是**识别率突然掉到底，而日志里一切正常**。
