@@ -451,6 +451,9 @@ label { display: block; }
   overflow: hidden;
 }
 #bar[hidden] { display: none; }
+/* `.bar2` 是**面板内**的那一条（素材页），紧跟在按钮行下面。`#bar` 是扫描页压在
+   相机预览上的那条浮层，不能有外边距 —— 所以这里只给 `.bar2`。 */
+.bar2 { margin-top: 14px; }
 #bar > i, .bar2 > i {
   display: block;
   height: 100%;

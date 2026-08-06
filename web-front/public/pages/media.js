@@ -143,26 +143,49 @@ export default {
       try {
         const upOne = async (file, what) => {
           const sha = await sha256Hex(file)
+          if (!sha) {
+            // 说清楚跳过的是**上传前**的判重：服务端入库时仍会按 sha256 去重，
+            // 不会真的落出两份。
+            say('这个页面不是安全上下文（http），算不了 sha256，判重只能按文件名', 'warn')
+          }
           let known = null
-          if (sha) {
-            say(`检查${what}是不是已经传过…`)
-            try {
-              known = await api.uploadCheck(sha, file.size)
-            } catch { /* check 失败不该阻止上传，直接传 */ }
-          } else {
-            // 只在第一个文件时说一次就够，但说清楚：跳过的是**上传前**的判重，
-            // 服务端入库时仍然会按 sha256 去重，不会真的传出两份。
-            say('这个页面不是安全上下文（http），算不了 sha256，跳过上传前判重', 'warn')
+          say(`检查${what}是不是已经传过…`)
+          try {
+            known = await api.uploadCheck(file.name, sha, file.size)
+          } catch (e) {
+            // check 失败不该阻止上传 —— 但**必须说出来**。这个 catch 曾经是空的，
+            // 于是接口签名对不上（GET 打 POST 路由）这件事被它整个吞掉，
+            // 判重从来没工作过而界面上一切正常。
+            say(`判重没做成（${e.message}），直接传`, 'warn')
           }
-          if (known?.exists && known.nasPath) {
-            say(`${what}服务端已经有了，跳过上传`, 'ok')
-            return { nasPath: known.nasPath, sha256: sha }
+
+          // 内容已经在库里 —— 名字可能完全不同（相册第二次导出同一张照片就是这样）。
+          // 这一条比按名字有用得多，所以先看。`missing` 的资产不能复用：库里有记录但
+          // NAS 上文件没了，拿它去入库会在特征提取那一步失败。
+          const hit = (known?.matches ?? []).find((m) => m.path && !m.missing)
+          if (hit) {
+            say(`${what}服务端已经有了（${hit.path.split('/').pop()}），跳过上传`, 'ok')
+            return { nasPath: hit.path, sha256: sha }
           }
+          // 同名同内容：文件就在落地目录里，直接用。
+          if (known?.nameTaken && known.sameContent && known.existingPath) {
+            say(`${what}已经在落地目录里了，跳过上传`, 'ok')
+            return { nasPath: known.existingPath, sha256: sha }
+          }
+          // 同名不同内容：换服务端给的建议名。不换的话服务端会先把整个文件收下来、
+          // 落临时文件比完哈希才 409 —— 几十 MB 白传。
+          let name = file.name
+          if (known?.nameTaken && known.suggestedName) {
+            name = known.suggestedName
+            say(`落地目录里已有同名但不同内容的文件，${what}改名传成 ${name}`, 'warn')
+          }
+
           say(`上传${what}…`)
           const r = await api.upload(file, {
+            name,
             onProgress: ({ loaded, total }) => setProgress(loaded, total, `上传${what}`),
           })
-          return { nasPath: r?.nasPath ?? r?.path, sha256: sha }
+          return { nasPath: r?.path ?? r?.nasPath, sha256: sha }
         }
 
         const photoUp = await upOne(photoFile, '照片')

@@ -123,15 +123,43 @@ export const history = (limit = 100) =>
 
 // ── 上传与入库 ────────────────────────────────────────────────────────
 /**
+ * 把浏览器给的文件名清成服务端肯收的样子。
+ *
+ * **服务端在这条路上是「拒」不是「洗」**（`app.py` 的 `_upload` 与 `_safe_upload_name`
+ * 那段注释写明了这是刻意的两种策略）：名字带路径成分、以点开头、或空，一律 400。
+ * 理由是这条路上名字由客户端指定，静默改名会让文件落在一个客户端不知道的名字上，
+ * 而客户端下一步正要拿这条路径去入库。
+ *
+ * 所以清洗的责任在**这一边**。安卓相册导出的文件名基本都是干净的，但
+ * `Camera/IMG_1234.jpg` 这种带目录的、以及 iOS 分享出来的 `.HEIC` 临时名都出现过。
+ */
+export function uploadName(raw) {
+  // 正反斜杠都切：服务端在 posix 上跑，`a\b.jpg` 的 `Path().name` 还是它自己，
+  // 于是会原样落地成一个带反斜杠的文件名 —— 能过校验，但没人想要那个名字。
+  const base = String(raw ?? '').split(/[/\\]/).pop().trim().replace(/^\.+/, '')
+  return base || 'upload.bin'
+}
+
+/**
  * 先问服务端"这个文件是不是已经有了"。
  *
  * Android 那边这一步的价值写在 §29：**上传之前就告诉他重复了**。一段 50MB 的视频传完
  * 再被拒，用户白等一分钟且不知道为什么。
  *
- * @param sha256 十六进制小写
+ * **是 POST + JSON body，不是 GET + query。** 这里曾经写成 `GET ?sha256=&bytes=`，
+ * 而且没带 `name` —— 服务端那条路由是 POST，所以每次都失败。调用方把它包在
+ * `try {} catch {}` 里（"check 失败不该阻止上传"），于是这个功能**从来没工作过，
+ * 也从来没报过错**。
+ *
+ * @param name 目标文件名，会先过 `uploadName`
+ * @param sha256 十六进制小写；给 null 就只做「按名字」那一半
+ * @returns `{name, nameTaken, sameContent, existingPath, suggestedName, knownContent, matches}`
  */
-export const uploadCheck = (sha256, bytes) =>
-  req(`/v1/upload/check?sha256=${sha256}&bytes=${bytes}`)
+export const uploadCheck = (name, sha256, bytes) =>
+  req('/v1/upload/check', {
+    method: 'POST',
+    body: { name: uploadName(name), sha256: sha256 || undefined, bytes },
+  })
 
 /**
  * 传一个文件到 NAS。
@@ -140,15 +168,19 @@ export const uploadCheck = (sha256, bytes) =>
  * 要求 HTTP/2 且各家支持不一）。而这里传的是几十 MB 的视频，没有进度条就等于卡死 ——
  * Android 那边同样显示 `已发送 / 总共` 和 `已经 N 秒`。
  *
+ * **请求体是文件的原始字节，文件名走 `?name=`。** 不是 multipart —— 服务端
+ * `_upload` 直接 `stream_to(dst)` 把请求体原样写进目标文件。这里曾经发的是
+ * `FormData`，两个后果：`?name=` 没给所以 400；就算给了，落地的也是一个把
+ * multipart 边界和头一起写进去的坏文件。
+ *
  * @param onProgress `({loaded, total})`
+ * @returns `{path, bytes, reused}`
  */
-export function upload(file, { kind, onProgress, signal } = {}) {
+export function upload(file, { name, onProgress, signal } = {}) {
+  const target = uploadName(name ?? file.name)
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    const fd = new FormData()
-    fd.append('file', file, file.name)
-    if (kind) fd.append('kind', kind)
-    xhr.open('POST', '/v1/upload')
+    xhr.open('POST', `/v1/upload?name=${encodeURIComponent(target)}`)
     xhr.withCredentials = true
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress?.({ loaded: e.loaded, total: e.total })
@@ -164,7 +196,7 @@ export function upload(file, { kind, onProgress, signal } = {}) {
     xhr.onerror = () => reject(new ApiError(0, 'network', '上传中断（网络断了、或请求体超过了通道上限）'))
     xhr.onabort = () => reject(new ApiError(0, 'aborted', '上传已取消'))
     signal?.addEventListener('abort', () => xhr.abort())
-    xhr.send(fd)
+    xhr.send(file)
   })
 }
 
