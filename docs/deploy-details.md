@@ -40,7 +40,7 @@
 
 | 限制 | 官方数字 | 对本项目的后果 |
 |---|---|---|
-| 请求体上限 | Free / Pro **100MB**，Business 200MB | `/v1/upload` 传原片会被 413。服务端见到 `CF-Ray` 头的上传请求直接 413 并说明原因 —— **批量入库和传素材走 LAN 或 Tailscale** |
+| 请求体上限 | Free / Pro **100MB**，Business 200MB | 服务端见到 `CF-Ray` 头时把 `/v1/upload` 的上限收到 **95MiB**（`TUNNEL_MAX_UPLOAD_BYTES`），超了自己先 413 并说明原因，不等 Cloudflare 传到一半掐断。**没超就照传** —— 网页版的正常路径就是隧道。几百 MB 的原片仍要走 LAN 或 Tailscale |
 | Proxy Read Timeout | **125 秒**，非 Enterprise 不可调，超时 524（Proxy Write Timeout 30 秒） | 带视频入库是同步请求，软编慢档必然 524。入库走 LAN |
 | CDN 服务条款 | 非 Enterprise 套餐**不得**通过 CDN 提供视频或「不成比例的图片、音频、大文件」，要买 Stream / Images；Cloudflare 保留「停用或限制你使用 CDN」的权利，**且通知不保证提前** | 一条视频最大 16.24MiB、实测 14.72MiB。50 个宾客人均 3 条约 **2.2GB**。风险是**账号级**的：同一条 tunnel 上其它服务会一起没 |
 
@@ -337,7 +337,7 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 | 入库全部 422 | 正常（实测 65% 会被拒），不是故障 | 看响应里的分数，换纹理更丰富的照片 |
 | 转码特别慢 | 是不是回退软编了 | deploy.md 第 4 步那一行；`docker stats` 看 CPU 是否打满 |
 | 隧道 524 | 请求超过 125 秒 | 带视频的入库走 LAN。注意照片其实已经入进去了 |
-| 隧道 413 | 请求体超 100MB | 上传走 LAN |
+| 隧道 413 `upload_via_tunnel` | 单个文件超 95MiB | 那一个文件走 LAN 或 Tailscale。**小文件也报这个 = 镜像太老**（v0.1.0 及之前是"带 `CF-Ray` 就一律拒"，跟体积无关），升级镜像 |
 | 隧道 502，但**容器完全健康** | ingress 写了 `http://` 而容器在说 TLS | 见下面「502 而容器是绿的」 |
 | 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |
 | 扫描时整台 NAS 发木 | CPU 配额 | compose 里 `cpus: "3.0"` 是故意留一核给 cloudflared / QTS 的，别调到 4 |

@@ -69,6 +69,7 @@ from .config import (
     MAX_JSON_BYTES,
     MAX_RECOGNIZE_BYTES,
     MAX_UPLOAD_BYTES,
+    TUNNEL_MAX_UPLOAD_BYTES,
     ServerConfig,
 )
 from .db import (
@@ -230,10 +231,14 @@ _WEBUI_TYPES = {
 # 自己推断不出来 —— 隧道、Tailscale、LAN 到这里都是一个 TCP 连接。
 ENDPOINT_HEADER = "x-photoar-endpoint"
 
-# cloudflared 一定会加的头。用来在服务端也挡一道上传（spec §9.4 要求客户端
-# 隐藏入口，但客户端可能是旧版本或别人写的）。让它 413 并说明原因，比让用户
-# 传了 100MB 再被 Cloudflare 掐断要好。
+# cloudflared 一定会加的头。用来判断这个请求是不是从隧道进来的 —— 隧道有请求体
+# 上限（见 `TUNNEL_MAX_UPLOAD_BYTES`），超了要在**我们这里**拒并说清原因，
+# 而不是让 Cloudflare 在传到一半时掐断（它只会给一张没有上下文的错误页）。
 _TUNNEL_HEADERS = ("cf-ray", "cf-connecting-ip")
+
+
+def _via_tunnel(req: "Request") -> bool:
+    return any(req.header(h) for h in _TUNNEL_HEADERS)
 
 
 class HttpError(Exception):
@@ -1971,16 +1976,20 @@ class Server:
     def _upload(self, req: Request, prin: Principal) -> Response:
         # admin only：它往 NAS 上写文件。
         self._require_admin(prin, "上传")
-        # spec §9.4：上传只允许走非隧道通道（Cloudflare 免费版 100MB 请求体上限）。
-        # 客户端应隐藏入口，服务端这里再挡一道 —— 客户端可能是旧版本。
-        for h in _TUNNEL_HEADERS:
-            if req.header(h):
-                raise HttpError(
-                    413,
-                    "upload_via_tunnel",
-                    "上传不能走 Cloudflare 隧道（有 100MB 请求体上限）。"
-                    "连回家庭网络或开启 Tailscale 后再上传。",
-                )
+        # spec §9.4：Cloudflare 免费版有请求体上限，隧道上传超了会被它掐断。
+        # **按体积拒，不按来路拒** —— 网页版的正常访问路径就是隧道，几十 MB 的
+        # 照片＋短视频完全传得过去。理由见 config.TUNNEL_MAX_UPLOAD_BYTES。
+        if _via_tunnel(req) and req.content_length > TUNNEL_MAX_UPLOAD_BYTES:
+            mb = TUNNEL_MAX_UPLOAD_BYTES / (1024 * 1024)
+            # 文件体积保留一位小数：整数会把 95.4MB 印成 "95MB 超过 95MB 上限"，
+            # 一句自相矛盾的话（实测过）。
+            raise HttpError(
+                413,
+                "upload_via_tunnel",
+                f"这个文件 {req.content_length / (1024 * 1024):.1f}MB，超过了 Cloudflare "
+                f"隧道的 {mb:g}MB 请求体上限。连回家庭网络或开启 Tailscale 后再传，"
+                "那两条路没有这个限制。",
+            )
         if not self.cfg.upload_dir_root:
             raise HttpError(
                 503,

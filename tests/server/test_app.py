@@ -7,7 +7,7 @@
 import json
 
 from photoar import synth, transcode
-from photoar.server import fsbrowser
+from photoar.server import app, fsbrowser
 
 
 # ---- 鉴权与路由 ----
@@ -631,17 +631,43 @@ def test_upload_refuses_overwrite(make_env, tmp_path):
     assert r.status == 409
 
 
-def test_upload_blocked_over_cloudflare_tunnel(make_env, tmp_path):
-    """spec §9.4：Cloudflare 免费版有 100MB 请求体上限。客户端该隐藏入口，
-    服务端再挡一道 —— 客户端可能是旧版本。"""
+_TUNNEL = {"cf-ray": "abc-SJC", "cf-connecting-ip": "1.2.3.4"}
+
+
+def test_upload_over_tunnel_is_allowed_when_it_fits(make_env, tmp_path):
+    """**这条曾经是反的。**
+
+    原来的规则是"带 cf-ray 就一律 413"，理由是 App 传的都是几百 MB 的视频。网页版
+    把那条前提推翻了：网页的正常访问路径**就是**隧道，而现场随手挑的一张照片加一段
+    短视频只有几十 MB，Cloudflare 完全放得过去。一律拒等于网页上传功能整个不存在
+    —— 而且报的错还写着"100MB 上限"，让人以为是自己的文件太大。
+    """
     env = make_env(upload_dir_root=str(tmp_path / "nas" / "videos"))
-    r = env.request(
-        "POST",
-        "/v1/upload?name=x.mp4",
-        body=b"x",
-        headers={"cf-ray": "abc-SJC", "cf-connecting-ip": "1.2.3.4"},
-    )
+    r = env.request("POST", "/v1/upload?name=x.mp4", body=b"x" * 4096, headers=_TUNNEL)
+    assert r.status == 201, env.body_json(r)
+    assert env.body_json(r)["bytes"] == 4096
+
+
+def test_upload_over_tunnel_is_rejected_when_too_big(make_env, tmp_path, monkeypatch):
+    """超过隧道上限时仍要我们自己拒。
+
+    不能指望 Cloudflare 拒：它掐断时给的是一张没有上下文的错误页，用户只看到
+    "上传失败"，而那时文件已经传了一半。我们拒得早，而且话说得全。
+    """
+    env = make_env(upload_dir_root=str(tmp_path / "nas" / "videos"))
+    monkeypatch.setattr(app, "TUNNEL_MAX_UPLOAD_BYTES", 1024)
+    r = env.request("POST", "/v1/upload?name=x.mp4", body=b"x" * 2048, headers=_TUNNEL)
     assert r.status == 413 and env.body_json(r)["error"] == "upload_via_tunnel"
+    # 报错里要有真实体积，否则用户没法判断"到底超了多少"。
+    assert "Tailscale" in env.body_json(r)["message"]
+
+
+def test_upload_off_tunnel_ignores_the_tunnel_limit(make_env, tmp_path, monkeypatch):
+    """LAN / Tailscale 上没有这个上限 —— 它是 Cloudflare 的限制，不是我们的。"""
+    env = make_env(upload_dir_root=str(tmp_path / "nas" / "videos"))
+    monkeypatch.setattr(app, "TUNNEL_MAX_UPLOAD_BYTES", 1024)
+    r = env.request("POST", "/v1/upload?name=x.mp4", body=b"x" * 2048)
+    assert r.status == 201, env.body_json(r)
 
 
 # ---- 杂项 ----
