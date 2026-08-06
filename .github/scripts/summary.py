@@ -144,44 +144,87 @@ git tag v0.2.0 && git push origin v0.2.0
 docker compose build   # 版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记
 ```
 
-要部署**已发布**的那一版（不含这次的提交）：`docker pull {IMAGE}:latest`。
+⚠️ **别指望 `:latest` 或 `:main` 是新的。** 这两个 tag **只在发布时才被推**，所以它们停在
+「上一次特意发布」那一刻 —— 中间往 main 推过多少次都不会动它们。真踩过：拉了 `:main`
+拿到的还是几个月前的镜像，而那一版连网页版都还没合进容器，表现是 `/` 回
+「没有这个接口」。**确认办法**：起来之后 `curl -s <host>/api/config` 看 `version` 字段，
+或者 `docker exec <容器> printenv PHOTOAR_VERSION` —— 空的就是没经过版本注入的老镜像。
 """
 
 
 def deploy() -> str:
+    tag = TAGS[0] if (PUBLISHED and TAGS) else f"{IMAGE}:latest"
     return f"""### 2 · 起容器
 
-**推荐走 compose** —— 资源限制、核显透传、只读挂载那些取舍都已经写在那份文件里，
-而且每一条旁边都有为什么：
+**一份自包含的 compose，不用 clone 仓库。** 这就是 NAS 上实际在跑的那份 ——
+把 `/share/Study/media_bed/photo-ar` 换成你自己的目录（**六处都要换**），其余照抄：
+
+```yaml
+services:
+  photo-ar-server:
+    image: {tag}
+    container_name: photo-ar-server
+    restart: unless-stopped
+    ports:
+      - "{PORT}:{PORT}"
+    environment:
+      PHOTOAR_ROOTS: photos=/share/Study/media_bed/photo-ar/photos,videos=/share/Study/media_bed/photo-ar/videos
+      PHOTOAR_UPLOAD_DIR: /share/Study/media_bed/photo-ar/inbox
+      LANG: C.UTF-8
+    volumes:
+      # 服务自己的库。**必须持久**，丢了要全库重新入库（每张约 5s）
+      - /share/Study/media_bed/photo-ar/data:/data
+      # 素材：只读，这个服务永远不改你的原始文件
+      - /share/Study/media_bed/photo-ar/photos:/share/Study/media_bed/photo-ar/photos:ro
+      - /share/Study/media_bed/photo-ar/videos:/share/Study/media_bed/photo-ar/videos:ro
+      # 上传落地：唯一可写的用户目录，且必须在 ROOTS 之内
+      - /share/Study/media_bed/photo-ar/inbox:/share/Study/media_bed/photo-ar/inbox
+    healthcheck:
+      test: ["CMD", "python", "/opt/photoar/docker/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+```
 
 ```bash
-git clone {SERVER}/{REPO}.git && cd photo-ar
-cp .env.example .env && $EDITOR .env    # 只有 PHOTOAR_ROOTS 需要你真的看一眼
+mkdir -p /share/Study/media_bed/photo-ar/{{photos,videos,inbox,data}}   # 先建出来，见下
 docker compose up -d
-docker compose logs -f photo-ar-server  # 抄走里面那行随机管理员口令
+docker compose logs -f photo-ar-server
 ```
 
-**最小的 `docker run`**（CI 里刚刚跑通的就是这一组必填项，只多两个
-`PHOTOAR_ADMIN_*` 好让它自动登录测一遍）：
+登录用 **`admin` / `admin`**，进去会被强制改密（见下面「第一次登录」）。想跳过那一步
+就在 `environment:` 里加一行 `PHOTOAR_ADMIN_PASSWORD: 你的强口令`。
 
-```bash
-docker run -d --name photo-ar-server --restart unless-stopped \\
-  -e PHOTOAR_ROOTS=照片=/share/Photo \\
-  -v /share/Photo:/share/Photo:ro \\
-  -v photoar-data:/data \\
-  -p {PORT}:{PORT} \\
-  {TAGS[0] if (PUBLISHED and TAGS) else f"{IMAGE}:latest"}
-```
-
-必填与必须持久的就这两样，其余全部有能用的默认值：
+必填与必须持久的只有两样，其余全部有能用的默认值（完整变量表在 {doc(".env.example")}；
+阈值、闸门、识别后端这些是**热配置**，在 `/admin` 里改，不用动这份文件）：
 
 | | 为什么 |
 |---|---|
-| `PHOTOAR_ROOTS` | 白名单根目录，**容器内**的路径，不给的话 entrypoint 直接拒绝启动（症状是容器 2 秒就 unhealthy）。写法 `名字=路径,名字=路径`，名字会显示在目录浏览器里 |
-| `/data` | 索引、SQLite、缩略图、转码产物。**必须是持久卷** —— 丢了要全库重新入库，每张约 5s |
+| `PHOTOAR_ROOTS` | 白名单根目录，**容器内**的路径。不给的话 entrypoint 直接拒绝启动 —— 症状是容器 2 秒就 unhealthy |
+| `/data` | 索引、SQLite、缩略图、转码产物。**必须是持久卷** |
 
-阈值、闸门、识别后端、贴图方式都是**热配置**，在 `/admin` 里改，不用改这条命令。
-完整的环境变量表在 {doc(".env.example")}。
+**四个不响的坑**，每个都真踩过：
+
+1. **宿主机目录要先 `mkdir -p`。** bind mount 的源不存在时 dockerd 会**以 root 建一个空目录**，
+   不报错 —— 然后服务真的去索引那个空目录，表现是"一张都认不出来"。
+2. **`/data` 别落在 `PHOTOAR_ROOTS` 之内**，否则服务自己的 SQLite 会出现在管理台的目录浏览器里。
+   上面把 ROOTS 指到 `photos/` 和 `videos/` 两个子目录而不是整个 `photo-ar/`，就是为了这个。
+3. **别设 `WEBFRONT_TLS_CERT/KEY`**，除非你知道自己在干什么。设了之后容器在 {PORT} 上说的是
+   TLS，而 Cloudflare Tunnel 的 ingress 若仍写 `http://` 会**502，且容器看起来完全健康**
+   （`docker ps` 绿的、日志干净、healthcheck 也过，因为它在容器内部探）。
+   走隧道时证书由 Cloudflare 提供，容器不需要再包一层。
+4. **有核显想走硬件转码**，再加 `devices: [/dev/dri:/dev/dri]`。不加会**静默**回退 libx264 ——
+   在 N5095 上慢一个量级，慢到会撞上隧道的 125 秒超时。
+
+**只想快速试一下**（不落盘配置）：
+
+```bash
+docker run -d --name photo-ar-server -p {PORT}:{PORT} \\
+  -e PHOTOAR_ROOTS=photos=/media/photos \\
+  -v /你的/照片:/media/photos:ro -v photoar-data:/data \\
+  {tag}
+```
 """
 
 

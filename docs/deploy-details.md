@@ -338,11 +338,46 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 | 转码特别慢 | 是不是回退软编了 | deploy.md 第 4 步那一行；`docker stats` 看 CPU 是否打满 |
 | 隧道 524 | 请求超过 125 秒 | 带视频的入库走 LAN。注意照片其实已经入进去了 |
 | 隧道 413 | 请求体超 100MB | 上传走 LAN |
+| 隧道 502，但**容器完全健康** | ingress 写了 `http://` 而容器在说 TLS | 见下面「502 而容器是绿的」 |
 | 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |
 | 扫描时整台 NAS 发木 | CPU 配额 | compose 里 `cpus: "3.0"` 是故意留一核给 cloudflared / QTS 的，别调到 4 |
 | 容器被 OOM kill | 内存 | 本地实测峰值 1061MB / 3g 上限，还有两倍余量；真 OOM 说明库规模远超一万，调 `mem_limit` |
 | 服务拒绝启动，说三份记录条数不齐 | 入库中途断电了 | 跑 `reindex`。**这个拒绝是故意的** —— 错位一位的后果是「识别命中后播的是别人的视频」 |
 | 手机上所有通道都 401 | token 不一致 | 改了 `.env` 并重启了容器，但手机里还是旧的 |
+
+### 502 而容器是绿的
+
+2026-08-06 真踩到的，值得单列 —— 因为**所有常规检查都告诉你一切正常**：
+`docker ps` 是 `Up (healthy)`、`docker logs` 干干净净、healthcheck 也过
+（它在容器**内部**探，走的是回环，根本不经过隧道那条路）。
+
+根因：容器配了 `WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`，于是网页版在 8964 上说的是
+**TLS**；而隧道的 ingress 写的是 `service: http://localhost:8964`。cloudflared 拿明文
+去打一个 TLS 端口，连接被对端在握手阶段丢掉 → 502。
+
+**一句话确诊**（在 NAS 上）：
+
+```bash
+curl -s  -o /dev/null -w 'http  %{http_code}\n'  http://127.0.0.1:8964/healthz   # 挂掉 / 000
+curl -sk -o /dev/null -w 'https %{http_code}\n' https://127.0.0.1:8964/healthz   # 200
+```
+
+`http` 那条报 `curl: (52) Empty reply from server`、而 `https` 那条 200，就是它。
+
+两条修法，**必须二选一并保持两侧一致**：
+
+| | 容器侧 | ingress |
+|---|---|---|
+| **走隧道（推荐）** | 不设 `WEBFRONT_TLS_*` | `service: http://localhost:8964` |
+| 要保住局域网直连开相机 | 设 `WEBFRONT_TLS_*` | `service: https://localhost:8964` + `originRequest: {noTLSVerify: true}` |
+
+推荐第一条：走隧道时证书由 Cloudflare 提供，容器再包一层对公网访问**零收益**——浏览器
+看到的是 Cloudflare 的证书，容器那层它根本看不见。代价是局域网直连
+`http://192.168.x.x:8964` 不是安全上下文、**相机用不了**；但入库和管理台都不需要相机，
+所以只影响「断网退回局域网给宾客扫」这个备份方案。
+
+⚠️ 改 `WEBFRONT_TLS_*` 之后要 **`docker compose up -d`**，不能 `docker compose restart`
+—— 后者不重新读 `.env`，容器还带着老环境变量跑。
 
 ## 这台机器上量到的基线
 
