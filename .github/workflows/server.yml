@@ -81,20 +81,23 @@ name: server
 on:
   workflow_dispatch:
     inputs:
+      # 这四行 description 是**填表时**看的，不是学习用的：只说"勾不勾、填什么"，
+      # 不说这个值流到哪儿去（那些写在上面「发版」那一节，给读这个文件的人看）。
+      # 别再往括号里塞实现细节 —— 界面把长文本折成三四行，四个输入就糊成一片。
       publish:
-        description: "推镜像到 GHCR（不勾 = 只跑一遍检查，什么都不发出去）"
+        description: "推镜像到 GHCR（不勾＝只跑检查）"
         type: boolean
         default: false
       version:
-        description: "版本号，如 0.1.2（留空 = 只打 sha-<短sha>）。它同时是镜像 tag、烧进镜像的版本号、Release 的名字"
+        description: "版本号，如 0.1.2（留空＝只打 sha-xxxxxxx）"
         type: string
         default: ""
       latest:
-        description: "同时更新 :latest（指向这一版）"
+        description: "顺便把 :latest 指过来"
         type: boolean
         default: false
       release:
-        description: "建一个 GitHub Release（需要填版本号；会顺带打 git tag）"
+        description: "建 GitHub Release + git tag（需填版本号）"
         type: boolean
         default: false
 
