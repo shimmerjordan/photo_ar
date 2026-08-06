@@ -25,7 +25,6 @@ Tailscale 还是隧道，返回绝对 URL 会把客户端锁死在一条通道�
 import json
 import os
 import re
-import secrets
 import shutil
 import threading
 import time
@@ -63,6 +62,7 @@ from .auth import (
     check_name,
     normalize_name,
     photo_filter,
+    verify_password,
 )
 from .config import (
     MAX_FEATURES_BYTES,
@@ -102,6 +102,42 @@ SESSION_COOKIE = "photoar_session"
 # 只有登录在里面：没有它谁都登不进来。`logout` 与 `me` 都要鉴权 —— logout 得知道
 # 作废哪个 token，me 的全部内容就是"你是谁"。
 PUBLIC_PATHS = frozenset({"/v1/auth/login"})
+
+#: 引导管理员的**固定初始口令**。
+#:
+#: ## 这一条推翻了原来的设计，理由和代价都写在这里
+#:
+#: 原来是「不给 `PHOTOAR_ADMIN_PASSWORD` 就生成随机口令、在启动日志里打印一次」。
+#: 那个设计在安全上更好，但它有一个**在真实部署里致命**的失败模式，2026-08-06 撞上了：
+#:
+#: 那行只在**真的建出账号时**打印一次（已经有 admin 就一个字都不输出）。而
+#: `docker compose up -d` 重建容器会**清空旧容器的日志** —— 于是「库里已有 admin
+#: + 日志已被清」这个组合一旦出现，口令就永久拿不回来了：设 `PHOTOAR_ADMIN_PASSWORD`
+#: 不管用（已有 admin 就不动它），`photoar-server` 也没有重置口令的子命令，
+#: 唯一出路是进 SQLite 手动 `delete from user`。这不是理论风险，是实际发生的。
+#:
+#: 所以改成固定初始口令，代价用**强制改密**来抵：`/auth/login` 与 `/auth/me` 都会
+#: 回一个 `mustChangePassword`，管理台见到它就把整个界面锁住、只留改密表单
+#: （见 `_using_default_password`）。也就是说 `admin/admin` 只在「部署完成」到
+#: 「你第一次登录」这个窗口里有效。
+#:
+#: ⚠️ **那个窗口是真实的暴露**。这个服务挂在公网隧道后面、没有 Cloudflare Access、
+#: 登录也没有速率限制，而这个默认值就印在这份公开源码里。所以：
+#:   * 部署完**立刻**登录改掉，别放着过夜；
+#:   * 更好的做法是一开始就设 `PHOTOAR_ADMIN_PASSWORD`，那样这个默认值根本不会被用到
+#:     （设了它就不会走到这里，而且登录时也不会触发强制改密）。
+#:
+#: ## 强制改密**只拦在管理台前端**，这是刻意的
+#:
+#: 服务端没有"用默认口令的会话只能调改密接口"那种拦截。看起来像是漏了一层，其实
+#: 加上也**不提供任何保护**：抢先用 `admin/admin` 登进来的人，第一件事就是改密 ——
+#: 而那恰好是唯一被允许的操作。拦完的结果是他把口令改成自己的、你被锁在外面，
+#: 比不拦更糟。
+#:
+#: 所以这一层的定位是**防遗忘，不是防攻击**：它保证善意的部署者不会"登进去看一眼
+#: 就忘了改"。真正的防线只有两条 —— 尽快改掉，或者一开始就设
+#: `PHOTOAR_ADMIN_PASSWORD`。别把前端这个锁当成安全措施。
+DEFAULT_ADMIN_PASSWORD = "admin"
 
 #: 每条识别记录里存前几名候选。
 #:
@@ -599,20 +635,16 @@ class Server:
 
         - **必须建**。管理台是建号、发授权、改配置的唯一入口，而它只认库里的
           admin 行。不建的话，部署完谁都进不去，只能进容器手工 INSERT 一行。
-        - **不能用固定默认口令**。"先给个 admin/admin，提示用户改"在一个挂在
-          Cloudflare 隧道后面的服务上等于没有口令：没人会去改，而那个默认值就
-          印在这份源码里。
-        - 没给口令时**生成随机的、并且只打印这一次**。日志是唯一能把它交给部署
-          者的通道（容器第一次启动的输出他一定会看）。只在真的建出来时打印
-          （`ensure_bootstrap_admin` 返回 None = 已经有 admin 了）—— 每次重启都
-          刷一行"这是你的口令"的话，那个口令早就被改掉了，而日志还在言之凿凿。
+        - **没给口令时用固定的 `DEFAULT_ADMIN_PASSWORD`**（2026-08-06 从"随机口令
+          打印一次"改过来的，整段理由写在那个常量上）。一句话：随机口令只在建号那
+          一次打印，而重建容器会清掉日志，于是"库里已有 admin + 日志没了"就等于
+          永久锁死。代价由**强制改密**抵：用默认口令登进来的会话，管理台除了改密
+          什么都做不了（见 `_using_default_password`）。
         """
         password = cfg.admin_password
         generated = not password
         if generated:
-            # token_urlsafe(12) = 96 bit 熵。不追求更长是因为它要能被人从容器日志
-            # 里抄进输入框，而它的用途只是"第一次登录进去后立刻改掉"。
-            password = secrets.token_urlsafe(12)
+            password = DEFAULT_ADMIN_PASSWORD
         try:
             uid = auth.ensure_bootstrap_admin(cfg.admin_name, password)
         except NameTaken as exc:
@@ -629,10 +661,11 @@ class Server:
             return
         if generated:
             print(
-                f"[photoar] 已创建引导管理员 {cfg.admin_name!r}，随机口令："
-                f"{password}\n"
-                f"[photoar] ↑ 这行只出现这一次。立刻登录 /admin 并改掉它；"
-                f"要用固定口令请设环境变量 PHOTOAR_ADMIN_PASSWORD。",
+                f"[photoar] 已创建引导管理员 {cfg.admin_name!r}，"
+                f"初始口令：{DEFAULT_ADMIN_PASSWORD}\n"
+                f"[photoar] ⚠️ 这是写死在源码里的公开默认值。管理台会**强制**你先改掉它"
+                f"（不改进不去），但在你改掉之前这个服务等于没有口令 —— "
+                f"部署完请立刻登录 /admin。想跳过这一步就设 PHOTOAR_ADMIN_PASSWORD。",
                 flush=True,
             )
         else:
@@ -889,6 +922,31 @@ class Server:
             parts.append("Secure")
         return "; ".join(parts)
 
+    def _using_default_password(self, prin: Principal) -> bool:
+        """这个人是不是还在用 `DEFAULT_ADMIN_PASSWORD`。
+
+        ## 为什么是现算，而不是在库里存一个 `must_change_pwd` 标记
+
+        存标记要加一列、写迁移，而且那个标记与真相之间会**漂**：从库里直接改口令、
+        或者把口令又改回 `admin`，标记都不会跟着动。现算的语义就是字面意思 ——
+        "你此刻的口令等于那个公开的默认值" —— 不可能不同步。
+
+        代价是一次 hash 校验（实测 ~80ms）。只在 `/auth/login` 与 `/auth/me` 上算，
+        两个都是低频接口（登录一次 + 刷新页面一次），而**只对 admin 算**：viewer
+        没有管理台可进，给他算这一下纯属浪费。
+
+        取不到用户行时返回 False：那说明账号刚被删，接下来的请求本来就会 401，
+        在这里报"要改密"只会把一个已经没有意义的界面挡在前面。
+        """
+        if not prin.is_admin:
+            return False
+        row = self.catalog.get_user(prin.user_id)
+        if row is None:
+            return False
+        return verify_password(
+            DEFAULT_ADMIN_PASSWORD, row["pwd_hash"], row["pwd_salt"]
+        )
+
     def _auth_login(self, req: Request, prin: Principal | None) -> Response:
         """`prin` 恒为 None（这是唯一免鉴权的接口）。签名保持与其它处理器一致，
         好过让路由表为一个特例分叉。"""
@@ -925,6 +983,10 @@ class Server:
                 "role": principal.role,
                 "grantAll": principal.grant_all,
                 "expiresAt": self.auth.expires_at_of(token),
+                # 管理台见到它就把界面锁成"只能改密"。**`/auth/me` 上也有一份** ——
+                # 只在登录响应里给的话，刷新一下页面就绕过去了（前端进主界面走的是
+                # `/auth/me`）。
+                "mustChangePassword": self._using_default_password(principal),
             },
             **{
                 "Set-Cookie": self._session_cookie(
@@ -957,6 +1019,9 @@ class Server:
                 "role": prin.role,
                 "grantAll": prin.grant_all,
                 "isAdmin": prin.is_admin,
+                # 见 `_auth_login` 里同名字段的注释：刷新页面走的是这条路，
+                # 少了它强制改密就形同虚设。
+                "mustChangePassword": self._using_default_password(prin),
             },
             **{"Cache-Control": "no-store"},
         )

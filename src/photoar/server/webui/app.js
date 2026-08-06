@@ -274,6 +274,7 @@ function showGate(msg) {
   state.me = null;
   $('app').hidden = true;
   $('denied').hidden = true;
+  $('mustchg').hidden = true;
   $('gate').hidden = false;
   const box = $('login-err');
   if (msg) showFormErr(box, { message: msg, code: '' }); else hideFormErr(box);
@@ -291,6 +292,18 @@ function sessionLost() {
 function enter(me) {
   state.me = me;
   $('gate').hidden = true;
+  // 还在用源码里那个公开默认口令 —— 除了改密什么都不给做。
+  //
+  // 放在 isAdmin 判断**之前**：`mustChangePassword` 服务端只对 admin 算，所以
+  // 走到这里为真就一定是 admin，先拦下来比进去再拦少一次界面闪烁。
+  if (me.mustChangePassword) {
+    $('denied').hidden = true;
+    $('app').hidden = true;
+    $('mustchg').hidden = false;
+    $('mustchg-pw').focus();
+    return;
+  }
+  $('mustchg').hidden = true;
   if (!me.isAdmin) {
     // 访客登录成功了，但管理台每个接口都是 admin only。直说，别让他撞四次 403。
     $('app').hidden = true;
@@ -335,6 +348,43 @@ $('login-form').addEventListener('submit', async (ev) => {
   } finally {
     btn.disabled = false;
     btn.textContent = '登录';
+  }
+});
+
+$('mustchg-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const btn = $('mustchg-go');
+  const pw = $('mustchg-pw').value;
+  const pw2 = $('mustchg-pw2').value;
+  const err = $('mustchg-err');
+  if (pw !== pw2) {
+    showFormErr(err, { message: '两次输入不一样。', code: '' });
+    $('mustchg-pw2').focus();
+    return;
+  }
+  // 只拦这一个值。长度/复杂度的门槛交给服务端的 `_check_password_for_role`——
+  // 在两处各写一份规则，迟早分叉成"前端放行、后端拒绝"。
+  if (pw === 'admin') {
+    showFormErr(err, { message: '不能还是 admin —— 那就是要你改掉的那一个。', code: '' });
+    $('mustchg-pw').focus();
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '改中…';
+  try {
+    // 改自己的口令走的就是管理员改用户那条接口（自己也是一行 user）。
+    // 服务端 `set_password` 会顺带踢掉这个人的**全部**会话，包括当前这一个——
+    // 所以改完必须重新登录，下面直接把登录框弹回来，而不是假装还在线。
+    await api('PATCH', `/admin/users/${state.me.userId}`, { password: pw });
+    hideFormErr(err);
+    $('mustchg-pw').value = $('mustchg-pw2').value = '';
+    showGate('口令已改。请用新口令重新登录。');
+  } catch (e) {
+    showFormErr(err, e);
+    $('mustchg-pw').focus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '改掉并进入';
   }
 });
 

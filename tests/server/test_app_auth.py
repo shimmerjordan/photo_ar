@@ -606,23 +606,87 @@ def test_bootstrap_admin_is_created_and_can_log_in(env):
     assert env.admin().role == "admin"
 
 
-def test_bootstrap_generates_a_usable_random_password_and_prints_it_once(
+def test_bootstrap_uses_the_fixed_default_password_and_says_so_loudly(
     make_env, capsys
 ):
-    """没配 `PHOTOAR_ADMIN_PASSWORD` 时的行为，三条都要成立：
+    """没配 `PHOTOAR_ADMIN_PASSWORD` 时的行为。
 
-    - **仍然建出管理员**。不建的话部署完没人能进管理台（那是建号/发授权/改配置的
-      唯一入口），只能进容器手工 INSERT 一行。
-    - 口令是**随机**的，不是固定默认值 —— "admin/admin 然后提醒用户改"在一个挂在
-      隧道后面的服务上等于没有口令，而那个默认值就印在源码里。
-    - 打印出来的那个口令**真的能登录**。只打印不能用的话，部署者会以为是自己抄错了。
+    ⚠️ **这条测试在 2026-08-06 反过来了。** 原来断言的是"口令必须是随机的，不能是
+    固定默认值"，理由是 admin/admin 在一个挂在隧道后面的服务上等于没有口令。那个
+    理由**现在依然成立**，改的原因是随机口令有一个更糟的失败模式：它只在建号那一次
+    打印，而 `docker compose up -d` 重建容器会清掉日志 —— "库里已有 admin + 日志没了"
+    就等于永久锁死（设环境变量不管用，没有重置子命令，只能进 SQLite 手删）。
+    这在真实部署上发生了。
+
+    代价由强制改密抵（见下面几条测试），而这里钉住三件事：
+    - 仍然建得出管理员，而且那个固定口令**真的能登录**；
+    - 日志里**明说**这是公开默认值、要立刻改 —— 静悄悄地用一个源码里的口令最糟；
+    - 登录响应里带 `mustChangePassword`，管理台靠它锁界面。
     """
     env = make_env(admin_password="")
     printed = capsys.readouterr().out
-    assert "随机口令" in printed
-    password = printed.split("随机口令：")[1].split("\n")[0].strip()
-    assert password and password != ADMIN_PASSWORD
-    assert env.login(ADMIN_NAME, password).role == "admin"
+    assert app.DEFAULT_ADMIN_PASSWORD == "admin"
+    assert f"初始口令：{app.DEFAULT_ADMIN_PASSWORD}" in printed
+    # 光打印不够 —— 必须警告它是公开的，否则读日志的人不会有紧迫感
+    assert "公开默认值" in printed and "立刻登录" in printed
+    assert env.login(ADMIN_NAME, app.DEFAULT_ADMIN_PASSWORD).role == "admin"
+
+
+def test_default_password_login_demands_a_change(make_env):
+    """用默认口令登进来 → 两个接口都必须说"你得改"。
+
+    **`/auth/me` 上那一份是关键**：管理台进主界面走的是 `/auth/me`，只在登录响应里
+    带的话，刷新一次页面就绕过去了。
+    """
+    env = make_env(admin_password="")
+    creds = env.login(ADMIN_NAME, app.DEFAULT_ADMIN_PASSWORD)
+    body = env.login_body(ADMIN_NAME, app.DEFAULT_ADMIN_PASSWORD)
+    assert body["mustChangePassword"] is True
+    me = env.body_json(env.get("/v1/auth/me", as_=creds))
+    assert me["mustChangePassword"] is True
+
+
+def test_a_real_password_never_demands_a_change(env):
+    """配了 `PHOTOAR_ADMIN_PASSWORD` 的部署不该看见那个拦截页。"""
+    creds = env.admin()
+    assert env.login_body(ADMIN_NAME, ADMIN_PASSWORD)["mustChangePassword"] is False
+    assert env.body_json(env.get("/v1/auth/me", as_=creds))["mustChangePassword"] is False
+
+
+def test_changing_away_from_the_default_clears_the_demand(make_env):
+    """改掉之后标记必须消失 —— 否则用户改完还是进不去，那个锁就成了死锁。
+
+    顺带钉住它是**现算**的：没有存任何 `must_change` 标记，所以把口令改回
+    `admin` 标记会重新出现（下半段）。存标记的实现做不到这一点。
+    """
+    env = make_env(admin_password="")
+    creds = env.login(ADMIN_NAME, app.DEFAULT_ADMIN_PASSWORD)
+    r = env.patch_json(
+        f"/v1/admin/users/{creds.user_id}", {"password": "一个够长的新口令"}
+    )
+    assert r.status == 200, env.body_json(r)
+
+    # 改密会踢掉全部会话，所以要用新口令重新登录
+    assert env.login_body(ADMIN_NAME, "一个够长的新口令")["mustChangePassword"] is False
+
+    # 改回默认值 → 标记回来（证明是现算而不是一次性标记）
+    env.patch_json(
+        f"/v1/admin/users/{creds.user_id}",
+        {"password": app.DEFAULT_ADMIN_PASSWORD},
+    )
+    got = env.login_body(ADMIN_NAME, app.DEFAULT_ADMIN_PASSWORD)
+    assert got["mustChangePassword"] is True
+
+
+def test_viewers_never_get_the_demand(make_env):
+    """`mustChangePassword` 只对 admin 算。
+
+    两个理由：viewer 进不了管理台（那个锁对他没有意义），而且它要付一次 hash 校验
+    （~80ms）—— 给每个访客的每次 `/auth/me` 都加上这一下纯属浪费。
+    """
+    env = make_env(admin_password="")
+    env.viewer("小明")
+    assert env.login_body("小明", None)["mustChangePassword"] is False
 
 
 def test_bootstrap_does_not_reprint_on_a_second_start(make_env, capsys):

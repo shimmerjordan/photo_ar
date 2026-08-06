@@ -152,7 +152,8 @@ services:
       # 通过"）。留空的唯一代价是批量入库脚本用不了。生成：openssl rand -hex 24
       PHOTOAR_TOKEN: ${PHOTOAR_TOKEN:-}
       # 引导管理员。库里一个 admin 都没有时（= 第一次启动）按这两个值建一个。
-      # 口令留空 = 生成随机口令并在启动日志里**打印一次**，登进去立刻改掉。
+      # **口令留空 = 初始口令是 `admin`**（源码里的公开默认值）。管理台会强制先改掉它
+      # 才让进，但在你改掉之前等于没有口令 —— 公网部署建议在 .env 里直接填一个。
       PHOTOAR_ADMIN_NAME: ${PHOTOAR_ADMIN_NAME:-admin}
       PHOTOAR_ADMIN_PASSWORD: ${PHOTOAR_ADMIN_PASSWORD:-}
       # 上面那条 ports 是 LAN 直连（http），所以默认 0。全程 https 才设 1，

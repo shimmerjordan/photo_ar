@@ -78,6 +78,37 @@
   </div>
 </div>
 
+<!-- ---------- 还在用默认口令：先改掉，别的什么都不给做 ---------- -->
+<!-- 触发条件是服务端算出来的 `mustChangePassword`（`/auth/login` 与 `/auth/me` 都带）。
+     两个接口都带是必需的：只在登录响应里给的话，刷新一下页面就绕过去了。
+
+     ⚠️ 这一层**只拦前端**，是防遗忘不是防攻击 —— 理由写在 app.py 的
+     `DEFAULT_ADMIN_PASSWORD` 上（简单说：拦住攻击者的第一件事恰好就是让他改密，
+     那比不拦更糟）。 -->
+<div class="gate" id="mustchg" hidden>
+  <form id="mustchg-form" autocomplete="off">
+    <h1 style="margin:0 0 6px;font-size:1.25rem">先改掉初始口令</h1>
+    <p class="muted" style="margin:0 0 18px;max-width:46ch">
+      你正在用写死在源码里的公开默认口令 <code>admin</code>。这个站挂在公网上，
+      <b>在你改掉它之前等于没有口令</b>。改完才能用管理台。
+    </p>
+    <div class="formerr" id="mustchg-err" role="alert" hidden></div>
+    <label class="field">
+      <span>新口令</span>
+      <input id="mustchg-pw" type="password" autocomplete="new-password" required>
+    </label>
+    <label class="field">
+      <span>再输一次</span>
+      <input id="mustchg-pw2" type="password" autocomplete="new-password" required>
+    </label>
+    <button class="btn primary" id="mustchg-go" type="submit" style="width:100%">改掉并进入</button>
+    <p class="muted" style="margin:14px 0 0;font-size:.85rem">
+      想彻底跳过这一步：部署时设环境变量 <code>PHOTOAR_ADMIN_PASSWORD</code>，
+      那样初始口令就是你自己定的，不会再出现这个页面。
+    </p>
+  </form>
+</div>
+
 <!-- ---------- 主界面 ---------- -->
 <div id="app" hidden>
   <div class="chrome">

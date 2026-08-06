@@ -289,6 +289,19 @@ class Env:
 
     # -- 凭证 --
 
+    def login_body(self, name: str, password: str | None = None, **kw) -> dict:
+        """登录并返回**整份响应体**。
+
+        `login()` 只把它投影成 `Creds`，而有几个字段（`mustChangePassword`、
+        `expiresAt`）不在那个投影里 —— 要断言它们就得拿原始 body。
+        """
+        doc: dict = {"name": name}
+        if password is not None:
+            doc["password"] = password
+        resp = self.post_json("/v1/auth/login", doc, auth=False, **kw)
+        assert resp.status == 200, self.body_json(resp)
+        return self.body_json(resp)
+
     def login(self, name: str, password: str | None = None, **kw) -> Creds:
         """真的走一遍 `POST /v1/auth/login`，不是在库里伪造一行 session。
 
@@ -297,12 +310,7 @@ class Env:
         上 —— 而登录响应的形状（token 字段名、cookie 属性）正是最容易在改动中悄悄
         变掉的东西。
         """
-        doc: dict = {"name": name}
-        if password is not None:
-            doc["password"] = password
-        resp = self.post_json("/v1/auth/login", doc, auth=False, **kw)
-        assert resp.status == 200, self.body_json(resp)
-        body = self.body_json(resp)
+        body = self.login_body(name, password, **kw)
         return Creds(
             token=body["token"],
             user_id=body["userId"],

@@ -199,16 +199,23 @@ Python 在后跑识别与 API），后者绑在容器内的 `127.0.0.1:8965` 上
 | `http://<host>:{PORT}/healthz` | 网页版自己的存活探测，不碰上游也不碰识别库 |
 | `http://<host>:{PORT}/api/config` | 确认线上跑的是哪一版：回的 JSON 里 `version` 字段 |
 
-**第一次登录**：口令在启动日志里**只打印一次**。
+**第一次登录**：默认是 **`admin` / `admin`**。
+
+管理台会**强制**你先改掉它才让进（服务端在 `/auth/login` 与 `/auth/me` 上都回一个
+`mustChangePassword`，前端见到就把界面锁成只剩改密表单）。
+
+⚠️ **但在你改掉之前，这个站等于没有口令** —— 那个默认值就印在公开源码里，而这里
+没挂 Cloudflare Access、登录也没有速率限制。所以**部署完立刻登录**，别放着过夜。
+更好的做法是一开始就设 `PHOTOAR_ADMIN_PASSWORD`，那样默认值根本不会被用到、
+也不会弹强制改密页。
 
 ```bash
-docker compose logs photo-ar-server | grep 随机口令
 curl -s http://<host>:{PORT}/api/config    # 顺手确认版本号是 {VERSION}
 ```
 
-登进 `/admin` 之后立刻改掉它。想要一个自己记得住的就在 `.env` 里设
-`PHOTOAR_ADMIN_PASSWORD` —— 它**只在库里一个 admin 都没有时**生效，所以改过口令之后
-它不会把口令顶回去。
+`PHOTOAR_ADMIN_PASSWORD` **只在库里一个 admin 都没有时**生效 —— 改过口令之后它不会
+把口令顶回去，忘了也不能靠改它找回（那时只能 `delete from user where name='admin'`
+再重启，让它重新引导）。
 
 #### ⚠️ 要给宾客用，前面必须有一层 https
 
