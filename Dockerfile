@@ -90,12 +90,6 @@ RUN chmod +x ./tools/arcoreimg 2>/dev/null || true
 
 # ---- 网页版 ----
 #
-# 版本号注入。CI 填 tag 或短 sha（`--build-arg PHOTOAR_VERSION=...`）；不填的话
-# 网页版会退回 package.json 里那个 + `-dev`，而那正好区分"从镜像跑的"和"本地跑的"。
-# 它显示在设置页「关于」那一节，也是那个"连按 7 下进调试模式"的行。
-ARG PHOTOAR_VERSION=
-ENV PHOTOAR_VERSION=$PHOTOAR_VERSION
-
 # Node 就一个二进制（约 120MB）。没有 npm、没有 corepack、没有 node_modules ——
 # web-front 是零依赖的，那些一个都用不上，少拷一样就少一样要跟着升级的东西。
 COPY --from=nodert /usr/local/bin/node /usr/local/bin/node
@@ -105,6 +99,17 @@ COPY --from=nodert /usr/local/bin/node /usr/local/bin/node
 COPY web-front/server/ ./web-front/server/
 COPY web-front/public/ ./web-front/public/
 COPY web-front/package.json ./web-front/
+
+# 版本号注入。CI 填 tag 名或 `sha-<短sha>`（`--build-arg PHOTOAR_VERSION=...`）；不填的话
+# 网页版退回 package.json 里那个 + `-dev`，而那正好区分"从镜像跑的"和"本地跑的"。
+# 它显示在设置页「关于」那一节，也是那个"连按 7 下进调试模式"的行，而且
+# `GET /api/config` 会回它 —— 所以"线上跑的是哪一版"是一句 curl 能问出来的。
+#
+# ⚠️ **位置有意义：必须在所有 COPY 之后。** 它的值每次提交都变（短 sha），而 `ENV`
+# 会让后面所有层失效 —— 放在原来那个位置（`COPY --from=nodert` 之前）等于每次构建都
+# 重新拷一遍 120MB 的 node 二进制并重新导出层缓存。放在这里，失效的只有下面几行元数据。
+ARG PHOTOAR_VERSION=
+ENV PHOTOAR_VERSION=$PHOTOAR_VERSION
 
 # 8964：spec §9.1 的 LAN endpoint 端口。合并之后**它是唯一对外的端口** ——
 # 网页版、管理台、API 全在这一个上，按 URI 分（见 docker/entrypoint.py）。

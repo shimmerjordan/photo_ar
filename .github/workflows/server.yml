@@ -132,6 +132,34 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # 烧进镜像的版本号。它显示在设置页「关于」那一行（连按 7 下进调试模式的那一行），
+      # 也是 `GET /api/config` 回的 `version`。
+      #
+      # 取值刻意与下面推出去的 tag **对得上**，这样"设置页上那串字"能直接反查到镜像：
+      #   打 tag   → `v0.2.0`（git tag 名；镜像 tag 是 `0.2.0`，差一个 v）
+      #   其它     → `sha-1a2b3c4`，与 `type=sha,format=short` 产出的镜像 tag 逐字符相同
+      #
+      # 不注入的话网页版会退回 `x.y.z-dev` —— 那个后缀的语义是"不是 CI 出的镜像"。
+      # 而在这一步补上之前，**CI 出的镜像也全都写着 -dev**，于是那一行读数在真正会被
+      # 部署的那些镜像里恰好是没用的。
+      #
+      # `REF_NAME` 走 env 而不是直接把 `${{ }}` 展开进脚本正文：tag 名是外部可控的字符串，
+      # 内联展开等于把它拼进 shell 源码。这里的攻击面只对能推 tag 的人开着，但 env 这条
+      # 写法一样短，没有理由留着另一条。
+      - id: ver
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_TAG" = "true" ]; then
+            v="$REF_NAME"
+          else
+            v="sha-${GITHUB_SHA::7}"
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "版本号 $v"
+
       # 只构建 linux/amd64。目标机器是 QNAP TS-464C2（Celeron N5095，x86-64）；
       # 加 arm64 会让构建时间翻倍（opencv 的 arm64 wheel 要走 QEMU 模拟），而现在没有
       # 任何 arm 机器要跑它。将来真要上 arm，改这一行。
@@ -149,6 +177,10 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: photo-ar-server:ci
+          # Dockerfile 里这个 ARG 刻意放在所有 COPY 之后，所以它每次都变也只会让
+          # 最后几行元数据失效，不会把 120MB 的 node 二进制那层顶掉。
+          build-args: |
+            PHOTOAR_VERSION=${{ steps.ver.outputs.value }}
           # 层缓存存在 Actions 的缓存里：不改依赖的话，opencv 那层不会重装。
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -159,6 +191,9 @@ jobs:
       # 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署走的那条 ——
       # 顺手把它验一遍。
       - name: 起容器并打接口
+        env:
+          # 同上：不把 tag 名内联展开进脚本正文
+          WANT_VERSION: ${{ steps.ver.outputs.value }}
         run: |
           set -euo pipefail
           docker volume create photoar-ci-data
@@ -213,6 +248,15 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/healthz)
           echo "存活探测 /healthz -> $code"
           [ "$code" = "200" ] || { echo "::error::/healthz 不对"; docker logs photoar-ci; exit 1; }
+
+          # 版本号真的烧进去了吗。`/api/config` 不需要登录（访客也要拿阈值），所以这一句
+          # 也顺带证明了"确认线上是哪一版"那条 curl 是真能用的。
+          #
+          # 断言而不是只打印：漏掉 build-arg 的表现是设置页上写着 `x.y.z-dev`，
+          # 而那**看起来完全正常** —— 不比对就永远发现不了。（这一步加进来之前，
+          # CI 出的每一个镜像都是 -dev。）
+          curl -sf http://127.0.0.1:8964/api/config | tee /tmp/config.json
+          python3 -c "import json,os;g=json.load(open('/tmp/config.json'))['version'];w=os.environ['WANT_VERSION'];assert g==w,f'版本号没烧进镜像：容器说 {g}，应当是 {w}';print('版本号 ok:',g)"
 
           # 登录 → 拿 token → 打 ping。这三步串起来就覆盖了「路由表装上了、
           # 鉴权链通了、SQLite 能写」。
