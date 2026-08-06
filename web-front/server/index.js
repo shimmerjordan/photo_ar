@@ -246,6 +246,36 @@ function serveCa(res) {
 }
 
 // ── 静态 ──────────────────────────────────────────────────────────────
+/**
+ * 发 `staleguard.js`，把版本占位符换成这一版的版本号。
+ *
+ * ETag 必须**带上版本**：同一个镜像里文件的 size/mtime 不变，而发出去的内容随
+ * `PHOTOAR_VERSION` 变。沿用普通静态文件那个 `size-mtime` 的 ETag 会让升级后的
+ * 浏览器拿到 304、继续用旧版本号 —— 那正好让这个探测器自己失效。
+ */
+function serveStaleGuard(req, res, file, st) {
+  const body = Buffer.from(
+    readFileSync(file, 'utf8').replaceAll('__PHOTOAR_VERSION__', VERSION),
+    'utf8',
+  )
+  const etag = `"sg-${st.size.toString(16)}-${Buffer.from(VERSION).toString('hex')}"`
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { ETag: etag, ...ISOLATION_HEADERS }).end()
+    return
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/javascript; charset=utf-8',
+    'Content-Length': body.length,
+    ETag: etag,
+    // 与别的 js 一致（no-cache + ETag）。**不能用 no-store** —— 那样它永远是新的，
+    // 而"它和别的 js 一起变旧"恰恰是这个探测器的工作原理。
+    'Cache-Control': 'no-cache',
+    ...ISOLATION_HEADERS,
+    ...SECURITY_HEADERS,
+  })
+  res.end(body)
+}
+
 async function serveStatic(req, res, url) {
   let rel = normalize(decodeURIComponent(url.pathname))
   if (rel === '/' || rel === '') rel = '/index.html'
@@ -261,6 +291,12 @@ async function serveStatic(req, res, url) {
   } catch {
     return json(res, 404, { error: 'not_found', path: rel })
   }
+
+  // `staleguard.js` 要带上这一版的版本号。**发的时候替换，不是构建时写死** ——
+  // 版本来自运行时的 `PHOTOAR_VERSION`（镜像 ARG→ENV），而 public/ 是只读的镜像内容。
+  // 它跟别的 js 走同一套缓存策略是**故意的**：浏览器手上的包旧了，这个文件也旧，
+  // 于是它带的版本号就是旧的 —— 那正是探测要的信号。见 staleguard.js 的模块注释。
+  if (rel === '/staleguard.js') return serveStaleGuard(req, res, file, st)
 
   // 预压的 brotli。见 `pickEncoding` —— 这一条把 11.4MB 的引擎变成 2.43MB。
   const enc = await pickEncoding(file, st, req.headers['accept-encoding'] ?? '')

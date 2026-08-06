@@ -387,6 +387,33 @@ describe('/api/config', () => {
     }
   })
 
+  test('/staleguard.js 里的版本号与 /api/config 的是同一个', async () => {
+    // 这是陈旧前端探测的**唯一**判据：两个值由同一个 PHOTOAR_VERSION 生成，
+    // 同一次部署里必然相同。不相同就说明浏览器手上的 js 比服务端旧。
+    // 这条测试拦的是"占位符没被替换"和"两边取了不同的版本来源"——任何一个发生，
+    // 探测器要么永远不报、要么永远误报，而两种都不会有别的迹象。
+    const [sg, cfg] = await Promise.all([
+      fetch(url('/staleguard.js')).then((r) => r.text()),
+      fetch(url('/api/config')).then((r) => r.json()),
+    ])
+    assert.ok(!sg.includes('__PHOTOAR_VERSION__'), '占位符必须被替换掉')
+    assert.match(sg, new RegExp(`BUILD = '${cfg.version.replace(/[.\\/]/g, '\\$&')}'`))
+  })
+
+  test('/staleguard.js 的 ETag 必须跟着版本走，不能只看 size/mtime', async () => {
+    // 镜像里这个文件的 size/mtime 不变，而发出去的内容随 PHOTOAR_VERSION 变。
+    // 沿用普通静态文件那个 `size-mtime` 的 ETag 会让升级后的浏览器拿到 304、
+    // 继续用旧版本号 —— 那正好让这个探测器自己失效。
+    const a = await fetch(url('/staleguard.js'))
+    const tag = a.headers.get('etag')
+    assert.ok(tag && tag.startsWith('"sg-'), `ETag 应当是 staleguard 专用的，实际 ${tag}`)
+    // 带上它应当 304（同一个版本，内容确实没变）。
+    const b = await fetch(url('/staleguard.js'), { headers: { 'If-None-Match': tag } })
+    assert.equal(b.status, 304)
+    // 而且**不能是 no-store**：它必须和别的 js 一起变旧，那才是探测的原理。
+    assert.equal(a.headers.get('cache-control'), 'no-cache')
+  })
+
   test('拿不到 admin 配置时返回空阈值，而不是失败', async () => {
     fake.configStatus = 403
     const r = await fetch(url('/api/config'))

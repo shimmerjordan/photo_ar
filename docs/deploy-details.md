@@ -339,6 +339,7 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 | 隧道 524 | 请求超过 125 秒 | 带视频的入库走 LAN。注意照片其实已经入进去了 |
 | 隧道 413 `upload_via_tunnel` | 单个文件超 95MiB | 那一个文件走 LAN 或 Tailscale。**小文件也报这个 = 镜像太老**（v0.1.0 及之前是"带 `CF-Ray` 就一律拒"，跟体积无关），升级镜像 |
 | 隧道 502，但**容器完全健康** | ingress 写了 `http://` 而容器在说 TLS | 见下面「502 而容器是绿的」 |
+| **发了新版但行为还是旧的**（接口 400、样式没生效） | Cloudflare 的 Browser Cache TTL 覆盖了源站的 `no-cache` | 见下面「新版发了，用户拿到的还是旧的」 |
 | 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |
 | 扫描时整台 NAS 发木 | CPU 配额 | compose 里 `cpus: "3.0"` 是故意留一核给 cloudflared / QTS 的，别调到 4 |
 | 容器被 OOM kill | 内存 | 本地实测峰值 1061MB / 3g 上限，还有两倍余量；真 OOM 说明库规模远超一万，调 `mem_limit` |
@@ -477,3 +478,43 @@ docker save photo-ar-server:dev | gzip -1 | ssh admin@<NAS> 'gunzip | docker loa
 ```
 
 然后在 NAS 的 `.env` 里写 `PHOTOAR_IMAGE=photo-ar-server:dev`，`up -d` 就会用它。
+
+## 新版发了，用户拿到的还是旧的
+
+**症状**：容器日志里版本号是新的，`curl` 拿到的文件是新的，边缘节点上的也是新的 ——
+只有浏览器里是旧的。表现是接口报 400（旧客户端打新服务端）、改的样式没生效、
+或者"这个功能明明修了啊"。**排查会全部指向别处**，因为三个能查的地方都显示正常。
+
+**原因**：Cloudflare 的 **Browser Cache TTL** 会**覆盖源站的 `Cache-Control`**。
+
+```
+$ curl -sI https://<你的域名>/api.js | grep -iE 'cache-control|cf-cache-status'
+cache-control: max-age=14400      ← 源站发的是 no-cache，被换掉了
+cf-cache-status: REVALIDATED
+```
+
+`max-age=14400` = 四小时内浏览器**连问都不会问**。普通刷新（F5）也不会 —— 只有
+"硬刷新"（长按刷新键 / Ctrl+Shift+R）才绕得过去，而那件事没人知道要做。
+
+HTML 不受影响（Cloudflare 默认不缓存 HTML，`/` 是 DYNAMIC），所以页面框架是新的、
+里面的 JS 是旧的 —— 这个组合让症状更难认。
+
+### 修
+
+**Cloudflare 控制台 → Caching → Configuration → Browser Cache TTL → `Respect Existing Headers`。**
+
+源站已经发的是正确的头（`no-cache` + ETag：每次问一句，没变就 304，没有下载成本），
+让 Cloudflare 别改它就行。改完再 `curl -I` 确认一次 —— 上面那行应该变成 `no-cache`。
+
+`.wasm` / `.woff2` 那两个是 URL 带内容哈希的，源站给的是
+`max-age=31536000, immutable`，Respect 之后它们仍然被长缓存，不受影响。
+
+### 应用自己也会说
+
+`web-front/public/staleguard.js`：`/staleguard.js` 带着一个**跟 JS 包一起被缓存**的
+版本号，`/api/config`（`no-store`，CDN 不缓存）带着服务端**当下**的版本号。两个不等
+就在第一屏停住并说明白，同时给一个能真正自救的按钮（`fetch(url, {cache:'reload'})`
+逐个重取再刷新 —— 普通 `location.reload()` 对还在有效期内的资源不发任何请求）。
+
+**它不能替代把 CDN 配对**：加这个探测的那一版自己救不了自己（用户手上如果是"还没有
+这段代码"的旧包，这段代码就不会跑），从下一次部署开始才生效。

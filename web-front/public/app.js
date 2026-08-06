@@ -18,6 +18,7 @@ import * as api from './api.js'
 import { junimo } from './art.js'
 import { bindToggle, diagAlways, initDiag } from './diag.js'
 import { Shell } from './shell.js'
+import { hardRefresh, staleAgainst } from './staleguard.js'
 import { toast } from './ui.js'
 
 const $ = (id) => document.getElementById(id)
@@ -141,6 +142,34 @@ function showGate(msg) {
   els.app.hidden = true
 }
 
+/**
+ * 「你手上这一版是旧的」。**停在这里，不往下走。**
+ *
+ * 不用 toast、不放行：旧客户端打新服务端会在后面的任何一步炸，而那些错长得像别的
+ * 毛病（接口 400、样式没生效、扫不出来）。把话说死在第一屏，比让他带着一个坏包
+ * 继续用要好。
+ *
+ * 版本号两个都印出来 —— 那是这句话唯一能被验证的部分，也是他截图给我看时我需要的。
+ */
+function showStale({ build, server }) {
+  progress(null, { hide: true })
+  els.boot.hidden = true
+  showGate(
+    '<span class="err">你的浏览器还拿着旧版页面。</span><br>' +
+    `本地 <code>${build}</code>，服务端 <code>${server}</code>。<br>` +
+    '普通刷新救不了它（缓存还在有效期内，浏览器根本不会去问）。点下面这个按钮。',
+  )
+  const btn = document.createElement('button')
+  btn.textContent = '取新版并重新载入'
+  btn.addEventListener('click', () => {
+    btn.disabled = true
+    btn.textContent = '正在取…'
+    hardRefresh()
+  })
+  els.gateMsg.appendChild(document.createElement('br'))
+  els.gateMsg.appendChild(btn)
+}
+
 // ── 启动 ──────────────────────────────────────────────────────────────
 async function boot() {
   els.gate.hidden = true
@@ -154,6 +183,12 @@ async function boot() {
     cfg = await api.webConfig()
   } catch { /* 拿不到就用 consts.js 的源码默认阈值 */ }
   state.webCfg = cfg
+
+  // 浏览器手上的 JS 比服务端旧？**在别的事之前问** —— 旧客户端打新服务端的表现是
+  // 一堆对不上号的错（接口 400、样式没生效），而那些错会把真正的原因盖掉。
+  // 判据与自救见 staleguard.js。
+  const stale = staleAgainst(cfg.version)
+  if (stale) { showStale(stale); return }
 
   let libBuf
   try {
