@@ -86,6 +86,11 @@ RUN pip install --no-cache-dir --no-deps .
 # ArcoreimgMissing，信息里写着去哪儿取。
 COPY tools/ ./tools/
 COPY docker/ ./docker/
+# XFeat 模型（4.3MB，sha256 由 tools/fetch_models.py 钉住）。**打进镜像是刻意的**：
+# 曾经的默认是启动时从 GitHub release 下载，它在真实部署里死于两件事的叠加 ——
+# 那个 release 一直没发布，而且用户的 NAS 根本连不上 github.com。模型跟着镜像走，
+# 启动就不再需要任何外网。entrypoint 仍会过一遍 sha256 校验（见 _model_source）。
+COPY models/ ./models/
 RUN chmod +x ./tools/arcoreimg 2>/dev/null || true
 
 # ---- 网页版 ----

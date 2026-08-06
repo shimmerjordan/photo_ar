@@ -285,12 +285,43 @@ class ServerConfig:
                 "要用就设一个：openssl rand -hex 24",
                 flush=True,
             )
-        roots = doc.get("roots") or {}
+        roots = dict(doc.get("roots") or {})
         if not roots:
             raise ConfigError("必须配置至少一个白名单根目录 roots")
         for name, p in roots.items():
             if not str(p).startswith("/"):
                 raise ConfigError(f"白名单根目录必须是绝对路径：{name}={p!r}")
+
+        # 上传落地目录不在任何白名单根内时，**自动把它收编成一个根**，并把这件事
+        # 大声说出来。只警告不收编是不够的：`/v1/upload` 落地前要过 SafeRoots 校验，
+        # 不在白名单内的表现是**每一次上传都 403 path_denied**，而 403 的响应体刻意
+        # 不回显路径（免得变成探测工具）—— 用户看到的只有"传不上去"，什么线索都没有。
+        # 真实部署踩过：roots 配了 photos/videos 两个根，PHOTOAR_UPLOAD_DIR 指了它们的
+        # **兄弟目录** inbox，于是整个网页上传功能对这套部署从没工作过。
+        #
+        # 收编而不是拒绝启动：配了上传目录的人的意图明确就是"要用上传"，替他把意图
+        # 补全比让服务起不来好。resolve() 双边解析是跟着 SafeRoots 的语义走的 ——
+        # 它在构造时也 resolve（QNAP 上 /share 常是符号链接）。
+        upload_dir = str(doc.get("upload_dir_root") or "").strip()
+        if upload_dir.startswith("/"):
+            up = Path(upload_dir).resolve()
+            covered = any(
+                up == Path(str(p)).resolve() or up.is_relative_to(Path(str(p)).resolve())
+                for p in roots.values()
+            )
+            if not covered:
+                name = "upload"
+                n = 2
+                while name in roots:
+                    name, n = f"upload{n}", n + 1
+                roots[name] = upload_dir
+                print(
+                    f"[photoar] ⚠️ 上传落地目录 {upload_dir} 不在任何白名单根内，"
+                    f"已自动收编为根 '{name}'。不收编的话所有上传都会 403。"
+                    f"想让这条警告消失：把它显式写进 roots（PHOTOAR_ROOTS），"
+                    f"或把上传目录挪到某个已有根的下面。",
+                    flush=True,
+                )
         if "data_dir" not in doc:
             raise ConfigError("必须配置 data_dir（转码产物与索引都写在这里）")
         # vocab_path **可选**：全新部署时那个文件必然不存在（词表要用库里的描述子训，

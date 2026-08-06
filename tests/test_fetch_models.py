@@ -133,7 +133,7 @@ def test_truncated_download_is_deleted_and_reported(server, tmp_path, payload):
 
 
 def test_404_gives_actionable_advice(server, tmp_path, payload):
-    """默认那个 GitHub release 目前**确实不存在**，所以 404 是预期路径 ——
+    """网络下载现在只剩源码部署会走到（镜像用内置副本），但 404 仍是预期路径 ——
     它必须给出可执行的下一步，而不是一句"下载失败"。"""
     base, _ = server
     _, sha = payload
@@ -141,8 +141,8 @@ def test_404_gives_actionable_advice(server, tmp_path, payload):
         fm.fetch(tmp_path / "m.bin", f"{base}/no-such-file.bin", expected_sha=sha)
     msg = str(exc.value)
     assert "404" in msg
-    assert "export_models.py" in msg  # 出路 1：自己导出
-    assert "release" in msg  # 出路 2：发布 release
+    assert "models/xfeat.onnx" in msg  # 出路 1：仓库里本来就有
+    assert "export_models.py" in msg  # 出路 2：自己导出
     assert "--url" in msg  # 出路 3：指别处
     assert "不影响服务启动" in msg  # 以及"这不是致命的"
 
@@ -157,13 +157,54 @@ def test_unreachable_host_gives_the_same_advice(tmp_path, payload):
 def test_the_expected_sha_matches_the_real_export():
     """常量本身。改模型必须同时改这两行 —— 那正是应该被 code review 看到的改动。
 
-    这里只钉住格式与自洽（64 位十六进制、字节数是那个 4.31MB），不去碰真实文件：
-    仓库里没有 xfeat.onnx（它不进版本库也不进镜像），测试不能依赖开发机上恰好有一份。
+    **这条测试曾经只钉格式**，docstring 写着"仓库里没有 xfeat.onnx（它不进版本库
+    也不进镜像）"。那个决定被推翻了：启动时下载在真实部署里死于"release 没发布 +
+    NAS 连不上 github.com"的叠加，模型改为随仓库入版本库、随镜像分发
+    （models/xfeat.onnx，见 docker/entrypoint._model_source）。所以现在直接钉真文件。
     """
     assert len(fm.EXPECTED_SHA256) == 64
     assert set(fm.EXPECTED_SHA256) <= set("0123456789abcdef")
     assert fm.EXPECTED_BYTES == 4_313_719
     assert fm.DEFAULT_URL.startswith("https://github.com/")
+
+    bundled = Path(__file__).resolve().parent.parent / "models" / "xfeat.onnx"
+    assert bundled.is_file(), (
+        "models/xfeat.onnx 不在仓库里。它是入了版本库的（Dockerfile 会 COPY 它进"
+        "镜像），丢了就用 tools/export_models.py 重新导 —— 导出是确定性的。"
+    )
+    assert bundled.stat().st_size == fm.EXPECTED_BYTES
+    assert fm.sha256_of(bundled) == fm.EXPECTED_SHA256, (
+        "仓库里那份模型与 EXPECTED_SHA256 不一致。要么文件坏了（重新导出），要么"
+        "有人换了模型但没改常量 —— 两个必须一起改，见 fetch_models 模块 docstring。"
+    )
+
+
+def test_fetch_from_file_url_installs_the_bundled_copy(tmp_path):
+    """entrypoint 装镜像内置副本走的就是这条路（`--url file://…`）。
+
+    **不是特殊分支**：file:// 由 urllib 原生支持，所以内置副本吃的是与网络下载
+    完全相同的 sha256 校验 + 原子落盘。这条测试同时钉住两件事：file:// 能用，
+    以及校验对它同样生效（坏文件被拒、不留半成品）。
+    """
+    src = tmp_path / "src" / "xfeat.onnx"
+    src.parent.mkdir()
+    src.write_bytes(b"model-bytes")
+    sha = fm.sha256_of(src)
+
+    out = tmp_path / "models" / "xfeat.onnx"
+    downloaded, why = fm.fetch(out, src.as_uri(), expected_sha=sha)
+    assert downloaded and out.read_bytes() == b"model-bytes"
+
+    # 幂等：第二次不重拷。
+    downloaded, why = fm.fetch(out, src.as_uri(), expected_sha=sha)
+    assert not downloaded and "跳过" in why
+
+    # 内置副本坏了（镜像被截断/压坏）也要被查出来，不能静默用坏模型。
+    bad = tmp_path / "src" / "bad.onnx"
+    bad.write_bytes(b"corrupted")
+    with pytest.raises(fm.FetchFailed, match="校验不过"):
+        fm.fetch(tmp_path / "m2" / "xfeat.onnx", bad.as_uri(), expected_sha=sha)
+    assert not (tmp_path / "m2" / "xfeat.onnx").exists()
 
 
 def test_out_can_be_a_directory(server, tmp_path, payload):

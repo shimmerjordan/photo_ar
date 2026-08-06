@@ -338,6 +338,8 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 | 转码特别慢 | 是不是回退软编了 | deploy.md 第 4 步那一行；`docker stats` 看 CPU 是否打满 |
 | 隧道 524 | 请求超过 125 秒 | 带视频的入库走 LAN。注意照片其实已经入进去了 |
 | 隧道 413 `upload_via_tunnel` | 单个文件超 95MiB | 那一个文件走 LAN 或 Tailscale。**小文件也报这个 = 镜像太老**（v0.1.0 及之前是"带 `CF-Ray` 就一律拒"，跟体积无关），升级镜像 |
+| 上传/入库 403 `path_denied`，什么都传不上 | `PHOTOAR_UPLOAD_DIR` 不在任何 `PHOTOAR_ROOTS` 根**里面**（典型：inbox 是 photos/videos 的兄弟目录） | 新镜像启动时会**自动收编**上传目录为一个根并打警告（看启动日志有没有"自动收编"）；老镜像要把上传目录显式加进 `PHOTOAR_ROOTS` 或挪到某个根下面 |
+| 启动日志 `[fetch-models] 取不到 XFeat 模型` | 镜像太老（那时模型要启动时从 GitHub 下载，而 NAS 连不上 github.com） | 升级镜像 —— 模型现在**打在镜像里**（4.3MB），启动时本地拷贝 + sha256 校验，不需要外网。另：**这条从来不影响网页版**，浏览器识别用的是 ORB，xfeat 是服务端识别与已下线安卓客户端用的 |
 | 隧道 502，但**容器完全健康** | ingress 写了 `http://` 而容器在说 TLS | 见下面「502 而容器是绿的」 |
 | **发了新版但行为还是旧的**（接口 400、样式没生效） | Cloudflare 的 Browser Cache TTL 覆盖了源站的 `no-cache` | 见下面「新版发了，用户拿到的还是旧的」 |
 | 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |

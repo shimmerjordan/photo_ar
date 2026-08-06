@@ -101,6 +101,34 @@ const RESEED_RATIO = 0.6
 const RESEED_FLOOR = 20
 
 /**
+ * 定期重锚：即使点数没掉，每隔这么久也对锁定那张重新匹配一次。
+ *
+ * ## 为什么"点数不掉"不等于"没漂"
+ *
+ * 上面两个判据（比例 + 下限）都盯着**点的数量**，而漂移的两种主要来源恰恰不掉点：
+ *
+ * 1. **随机游走。** 光流每帧把存活点的位置替换成新解，每一跳都带亚像素误差 ——
+ *    误差没有回零机制，几百帧后累积成看得见的整体偏移。点一个都不少。
+ * 2. **反光锁点。** 覆膜照片上的高光随手的倾斜**连贯移动**，一簇点锁在高光上时
+ *    光流"跟到了"（status=1）、往返也一致 —— 前后向校验都抓不住它。这簇一致但错
+ *    的点够多时，RANSAC 会把错误共识解出来。真机上"视频慢慢滑走/歪掉，而界面一直
+ *    显示认出了"就是这个样子。
+ *
+ * 两种来源共同的解药只有一个：**回到外观**。`_reseed` 对锁定那张重新做描述子匹配，
+ * 新种子是被参考图外观验证过的 —— 这一步把漂移寿命的上界钉在这个间隔上。
+ *
+ * ## 为什么是 1500ms
+ *
+ * 重锚要提一次特征 + 一次单候选匹配（桌面 ~100ms，手机按 2~4 倍外推）。管线跑在
+ * worker 里，卡的是观测节奏不是渲染帧率（渲染侧 quadfilter 会用外推盖住空档），
+ * 但 400~600ms 的观测空档一秒来一次仍然摸得到。1500ms 时占空比约 7%~15%，而
+ * 1.5 秒内的随机游走漂移在查询空间里通常不到 2px —— 肉眼在"贴住"的判断阈之下。
+ *
+ * 与上面按点数触发的补种子**共用冷却与实现**：两条判据、一个动作。
+ */
+const REANCHOR_MS = 1500
+
+/**
  * 两次补种子之间至少隔多久。
  *
  * 补种子要提一次特征 + 一次单候选匹配（桌面实测约 100ms，手机按 2~4 倍外推）。
@@ -300,6 +328,10 @@ export class Pipeline {
     this._prevPts = pm
     this._refPts = new Float32Array(dst2)
     this._seedCount = n
+    // 种子刚刚被外观验证过（检测或重锚都走到这里）—— 重锚的计时从现在起算。
+    // 不设的话 _lastReseedAt 还是 0，锁定后的**第一帧**就会触发定期重锚：
+    // 刚付完检测的 1.2s 又立刻付一次 100ms 的重匹配，纯浪费。
+    this._lastReseedAt = performance.now()
   }
 
   _track(imageData) {
@@ -363,14 +395,19 @@ export class Pipeline {
       // 所以判据必须是它。
       const quality = Math.min(kept, r.inliers)
       const floor = Math.max(RESEED_FLOOR, Math.round(this._seedCount * RESEED_RATIO))
+      const now = performance.now()
+      const decayed = quality < floor && now - this._lastReseedAt > RESEED_COOLDOWN_MS
+      // 定期重锚：点数不掉也要回到外观。漂移的两种主要来源（随机游走、反光锁点）
+      // 都不掉点，按点数触发的那条永远抓不住它们 —— 理由与数字见 REANCHOR_MS。
+      const overdue = now - this._lastReseedAt > REANCHOR_MS
       let reseeded = 0
-      if (quality < floor && performance.now() - this._lastReseedAt > RESEED_COOLDOWN_MS) {
+      if (decayed || overdue) {
         reseeded = this._reseed(src)
       }
       return {
         quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
         photo: this.locked.photo, tracked: kept,
-        ...(reseeded ? { reseeded } : {}),
+        ...(reseeded ? { reseeded, reanchored: overdue && !decayed } : {}),
       }
     } finally {
       src.delete(); nextPts.delete(); status.delete(); err.delete()

@@ -156,6 +156,56 @@ runPage(async () => {
     detectMs / trackMs >= 5, metrics)
   push('跟踪也给出四角', plausible(tracked.quad), { quad: tracked.quad })
 
+  // ── 4b. 漂移与定期重锚 ───────────────────────────────────────────────
+  //
+  // 漂移的两种主要来源（光流误差的随机游走、覆膜反光上的锁点）有一个共同点：
+  // **点一个都不掉**，所以按点数触发的补种子永远不会发生，而错误的四角会无限期
+  // 保持 —— 真机上"视频慢慢滑走/歪掉，界面却一直显示认出了"就是它。
+  //
+  // 这里用最纯的方式注入这种漂移：把全部跟踪种子整体平移。平移后的点集彼此完全
+  // 一致（RANSAC 全体内点、光流零位移、往返校验也抓不住 —— 与反光锁点同构），
+  // 唯一能把它拉回来的是**回到外观**：REANCHOR_MS 到点后对锁定那张重新做描述子
+  // 匹配。三步断言：漂移真的立住了；重锚真的触发了；重锚后真的回来了。
+  {
+    const pipe2 = new Pipeline(lib)
+    const lock = pipe2.push(frame)
+    const truth = lock.quad
+    push('4b：重新锁定拿到基准四角', plausible(truth), { quad: truth })
+
+    // 注入 25px 整体平移（查询空间）。触碰私有字段是刻意的 —— 这种漂移没有任何
+    // 公开接口能造出来，而它正是要测的东西。
+    const pts = pipe2._prevPts.data32F
+    for (let i = 0; i < pts.length; i += 2) { pts[i] += 25; pts[i + 1] += 25 }
+
+    const meanAbsDiff = (a, b) => {
+      let s = 0
+      for (let i = 0; i < 8; i++) s += Math.abs(a[i] - b[i])
+      return s / 8
+    }
+
+    const drifted = pipe2.push(frame)
+    const driftAmt = meanAbsDiff(drifted.quad, truth)
+    push('4b：漂移立住了（点数不掉，按点数的补种子没触发）',
+      drifted.reason === 'ok' && !drifted.reseeded && driftAmt > 0.01,
+      { driftAmt, reseeded: drifted.reseeded, tracked: drifted.tracked })
+
+    // 等过 REANCHOR_MS。这不是"给异步留时间"的那种 sleep —— 重锚的触发条件
+    // 就是墙钟时间，测试等的正是被测的东西。
+    await new Promise((r) => setTimeout(r, 1_700))
+
+    const reanchoring = pipe2.push(frame)
+    push('4b：到点后重锚触发（reanchored 标记 + 真的补了种子）',
+      reanchoring.reseeded > 0 && reanchoring.reanchored === true,
+      { reseeded: reanchoring.reseeded, reanchored: reanchoring.reanchored })
+
+    const recovered = pipe2.push(frame)
+    const backAmt = meanAbsDiff(recovered.quad, truth)
+    push('4b：重锚后四角回到基准（漂移被外观纠正）', backAmt < 0.005,
+      { backAmt, driftWas: driftAmt })
+    metrics.drift = { injected: driftAmt, afterReanchor: backAmt }
+    pipe2.delete()
+  }
+
   // ── 5. 连续喂空白帧应当放手回到 SCANNING ────────────────────────────
   {
     const blank = { width: e.frameW, height: e.frameH, data: new Uint8ClampedArray(n * 4).fill(128) }

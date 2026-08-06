@@ -49,6 +49,48 @@ class FakeCfg:
         self.bind = bind
 
 
+# ---- 模型从哪儿来 ----
+
+
+def test_model_source_prefers_the_explicit_url(monkeypatch):
+    """用户显式指的地址永远最大 —— 他可能就是要换一份自己托管的模型。"""
+    monkeypatch.setenv("PHOTOAR_MODEL_URL", "https://example.test/m.onnx")
+    url, _ = ep._model_source()
+    assert url == "https://example.test/m.onnx"
+
+
+def test_model_source_uses_the_bundled_copy(monkeypatch, tmp_path):
+    """正常路径：镜像内置副本，file:// URL。**这条曾经不存在** —— 默认是启动时从
+    GitHub release 下载，死于"release 没发布 + NAS 连不上 github.com"的叠加。"""
+    monkeypatch.delenv("PHOTOAR_MODEL_URL", raising=False)
+    bundled = tmp_path / "xfeat.onnx"
+    bundled.write_bytes(b"x")
+    monkeypatch.setattr(ep, "BUNDLED_MODEL", bundled)
+    url, label = ep._model_source()
+    assert url == bundled.as_uri() and url.startswith("file://")
+    assert "内置" in label
+
+
+def test_model_source_falls_back_to_network_without_a_bundle(monkeypatch, tmp_path):
+    """只剩源码部署会走到：没有内置副本时回到 fetch_models 的默认地址（None = 默认）。"""
+    monkeypatch.delenv("PHOTOAR_MODEL_URL", raising=False)
+    monkeypatch.setattr(ep, "BUNDLED_MODEL", tmp_path / "not-there.onnx")
+    url, _ = ep._model_source()
+    assert url is None
+
+
+def test_the_bundled_model_path_matches_the_dockerfile():
+    """entrypoint 找的路径必须与 Dockerfile COPY 进去的一致 —— 两边各写一个字符串，
+    分叉的表现是"镜像里明明有模型却去联网"，正好是这次要消灭的那个故障。"""
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY models/ ./models/" in dockerfile
+    # entrypoint 的 REPO 在容器里是 /opt/photoar（Dockerfile 的 WORKDIR），
+    # 所以相对路径必须是 models/xfeat.onnx。
+    assert ep.BUNDLED_MODEL.relative_to(ep.REPO) == Path("models/xfeat.onnx")
+    # 仓库里那份真文件存在（sha 由 test_fetch_models 钉）。
+    assert (REPO / "models" / "xfeat.onnx").is_file()
+
+
 # ---- 端口怎么分 ----
 
 

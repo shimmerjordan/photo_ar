@@ -137,12 +137,11 @@ services:
       # orb 或 xfeat。⚠️ 只作为**初始值**写进库，之后以管理台里的设置为准 ——
       # 否则在管理台改完、重启一次容器就被这里改回去了（见 Server._seed_backend）。
       PHOTOAR_BACKEND: ${PHOTOAR_BACKEND:-orb}
-      # XFeat 的 onnx 从哪儿下。⚠️ 默认那个 GitHub release **还没发布**，所以默认会
-      # 404 —— 那不影响启动（自动回退 orb，`/v1/ping` 的 backendDegraded 会说明）。
-      # 要用 xfeat：自己 `python tools/export_models.py --out ./data/models` 导出一份
-      # 放进卷里，或者把它发到那个 release 上，或者在这里填一个可信的地址。
+      # XFeat 的 onnx 从哪儿来。**正常情况下留空**：模型已打进镜像（4.3MB），启动时
+      # 从镜像内拷进 /data/models 并过 sha256 校验，全程不需要外网。只有想换一份
+      # 自己托管的模型时才填（sha256 不一致会被拒，见 tools/fetch_models.py）。
       PHOTOAR_MODEL_URL: ${PHOTOAR_MODEL_URL:-}
-      # 设 0 = 启动时完全不尝试下载模型（离线部署，或模型是手工放进卷里的）。
+      # 设 0 = 启动时完全不安装模型（模型是手工放进卷里维护的那种部署才需要）。
       PHOTOAR_FETCH_MODELS: ${PHOTOAR_FETCH_MODELS:-1}
 
       # ---- 身份 ----

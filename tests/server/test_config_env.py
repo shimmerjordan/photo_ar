@@ -83,6 +83,75 @@ def test_from_env_minimal(clean_env, tmp_path):
     assert cfg.port == 8964
 
 
+def test_upload_dir_outside_roots_gets_enrolled(clean_env, tmp_path, capsys):
+    """上传目录是白名单根的**兄弟目录**时，自动收编成一个根，并大声说出来。
+
+    真实部署踩过的原样：roots 配了 photos/videos，PHOTOAR_UPLOAD_DIR 指了它们的
+    兄弟 inbox —— 不收编的话每一次上传都 403 path_denied，而 403 的响应体刻意不回显
+    路径，用户看到的只有"传不上去"。
+    """
+    clean_env.setenv(
+        "PHOTOAR_ROOTS",
+        f"photos={tmp_path}/photos,videos={tmp_path}/videos",
+    )
+    clean_env.setenv("PHOTOAR_UPLOAD_DIR", f"{tmp_path}/inbox")
+    clean_env.setenv("PHOTOAR_DATA", str(tmp_path / "data"))
+    cfg = ServerConfig.from_env()
+    assert cfg.roots.get("upload") == f"{tmp_path}/inbox"
+    assert cfg.upload_dir_root == f"{tmp_path}/inbox"
+    out = capsys.readouterr().out
+    assert "自动收编" in out and f"{tmp_path}/inbox" in out
+
+
+def test_upload_dir_inside_a_root_is_left_alone(clean_env, tmp_path, capsys):
+    """在某个根**里面**的上传目录不该多出一个根，也不该有警告 —— 那是配对了的样子。"""
+    clean_env.setenv("PHOTOAR_ROOTS", f"nas={tmp_path}")
+    clean_env.setenv("PHOTOAR_UPLOAD_DIR", f"{tmp_path}/inbox")
+    clean_env.setenv("PHOTOAR_DATA", str(tmp_path / "data"))
+    cfg = ServerConfig.from_env()
+    assert set(cfg.roots) == {"nas"}
+    assert "自动收编" not in capsys.readouterr().out
+
+
+def test_upload_dir_equal_to_a_root_is_left_alone(clean_env, tmp_path):
+    """上传目录**就是**某个根（边界情形）：算被覆盖，不收编。"""
+    clean_env.setenv("PHOTOAR_ROOTS", f"nas={tmp_path}")
+    clean_env.setenv("PHOTOAR_UPLOAD_DIR", str(tmp_path))
+    clean_env.setenv("PHOTOAR_DATA", str(tmp_path / "data"))
+    assert set(ServerConfig.from_env().roots) == {"nas"}
+
+
+def test_enrolled_root_name_avoids_collision(clean_env, tmp_path):
+    """用户已经有一个叫 upload 的根时，收编的名字要让开，不能悄悄顶掉他的。"""
+    clean_env.setenv(
+        "PHOTOAR_ROOTS", f"upload={tmp_path}/elsewhere,nas={tmp_path}/nas"
+    )
+    clean_env.setenv("PHOTOAR_UPLOAD_DIR", f"{tmp_path}/inbox")
+    clean_env.setenv("PHOTOAR_DATA", str(tmp_path / "data"))
+    cfg = ServerConfig.from_env()
+    assert cfg.roots["upload"] == f"{tmp_path}/elsewhere"  # 用户的没被动
+    assert cfg.roots["upload2"] == f"{tmp_path}/inbox"
+
+
+def test_enrolled_upload_dir_actually_accepts_uploads(clean_env, tmp_path):
+    """收编的终点不是"配置里多了一个根"，是**上传真的能落地** —— 用 SafeRoots
+    验到底，别让"收编了但校验还是不过"这种半吊子状态活下来。"""
+    from photoar.server.safepath import Roots
+
+    clean_env.setenv(
+        "PHOTOAR_ROOTS",
+        f"photos={tmp_path}/photos,videos={tmp_path}/videos",
+    )
+    clean_env.setenv("PHOTOAR_UPLOAD_DIR", f"{tmp_path}/inbox")
+    clean_env.setenv("PHOTOAR_DATA", str(tmp_path / "data"))
+    cfg = ServerConfig.from_env()
+    (tmp_path / "inbox").mkdir()
+    roots = Roots(cfg.roots)
+    # _upload 落地前做的就是这一步；收编之前这里抛 PathDenied → 403。
+    dst = roots.resolve(f"{tmp_path}/inbox/婚礼 照片.jpg")
+    assert dst.name == "婚礼 照片.jpg"
+
+
 def test_from_env_requires_roots(clean_env):
     """唯一必填的东西。信息里要写清两种写法，否则用户只知道"缺了个变量"。"""
     with pytest.raises(ConfigError, match="PHOTOAR_ROOTS"):

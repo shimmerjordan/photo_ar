@@ -64,6 +64,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 FETCH = REPO / "tools" / "fetch_models.py"
+# 随镜像分发的模型副本（Dockerfile COPY models/）。见 `_model_source`。
+BUNDLED_MODEL = REPO / "models" / "xfeat.onnx"
 WEB_ENTRY = REPO / "web-front" / "server" / "index.js"
 
 # 算好的端口写在这里给健康检查读。**与 docker/healthcheck.py 里那个常量必须一致。**
@@ -111,15 +113,43 @@ def _mask(name: str) -> str:
     return "已设置" if (os.environ.get(name) or "").strip() else "未设置"
 
 
+def _model_source() -> tuple[str | None, str]:
+    """模型从哪儿来。返回 `(传给 fetch_models 的 --url 或 None, 给日志的一句话)`。
+
+    优先级，每一级都有明确的理由：
+
+    1. **`PHOTOAR_MODEL_URL`** —— 用户显式指的地址永远最大。他可能就是要换一份
+       自己托管的模型（配合 --sha256 的场景），内置副本不该抢在他前面。
+    2. **镜像里的内置副本**（`models/xfeat.onnx`，随仓库入版本库、随镜像分发）——
+       这是正常路径。曾经的默认是启动时从 GitHub release 下载，它在真实部署里
+       死于两件事的叠加：那个 release 一直没发布（404），而且 NAS 在国内**根本
+       连不上 github.com**（timed out）。一个 4.3MB 的文件不值得一条外网依赖 ——
+       镜像本来就要从 registry 拉，模型跟着镜像走，启动就不再需要任何外网。
+    3. **GitHub release 地址**（fetch_models.DEFAULT_URL）—— 只剩源码部署这一种
+       情况会走到（跑的不是镜像，仓库又是浅拷贝/没拉 LFS 之类导致本地没有那份文件）。
+
+    `file://` 不是特殊分支：fetch_models 的下载走 urllib，它原生支持 file://，
+    所以内置副本走的是**同一条 sha256 校验 + 原子落盘路径** —— 镜像里的文件坏了
+    （被压坏、被截断）同样会被查出来并报清楚，而不是静默用一份坏模型。
+    """
+    url = (os.environ.get("PHOTOAR_MODEL_URL") or "").strip()
+    if url:
+        return url, f"取 XFeat 模型（PHOTOAR_MODEL_URL）→"
+    if BUNDLED_MODEL.is_file():
+        return BUNDLED_MODEL.as_uri(), "安装镜像内置的 XFeat 模型 →"
+    return None, "取 XFeat 模型 →"
+
+
 def _fetch_model_if_needed() -> None:
-    """需要时取 XFeat 模型。**不看 recog.backend**，只看要不要取。
+    """需要时装 XFeat 模型。**不看 recog.backend**，只看要不要装。
 
-    刻意不去读库里的 `recog.backend` 再决定取不取：那会让"在管理台把后端切成 xfeat →
+    刻意不去读库里的 `recog.backend` 再决定装不装：那会让"在管理台把后端切成 xfeat →
     重启"这个最自然的操作序列在**第一次**重启时失败（重启那一刻库里已经是 xfeat 了，
-    但模型还没取过，而这次启动才是第一次有机会取）。反过来，无条件取的代价只是一次
-    4MB 的下载，而它是幂等的（已存在就跳过）。
+    但模型还没装过，而这次启动才是第一次有机会装）。反过来，无条件装的代价只是一次
+    4MB 的拷贝（正常路径是镜像内置副本，见 `_model_source`），而它是幂等的
+    （已存在且校验通过就跳过）。
 
-    真的不想要就设 `PHOTOAR_FETCH_MODELS=0`（离线部署、或者模型是手工放进卷里的）。
+    真的不想要就设 `PHOTOAR_FETCH_MODELS=0`（模型是手工放进卷里的那种部署）。
     """
     if not _flag("PHOTOAR_FETCH_MODELS", True):
         print("[entrypoint] PHOTOAR_FETCH_MODELS=0，跳过取模型", flush=True)
@@ -132,17 +162,17 @@ def _fetch_model_if_needed() -> None:
         # 要说清楚，而不是让 subprocess 抛一个 FileNotFoundError。
         print(f"[entrypoint] ⚠️ 找不到 {FETCH}，跳过取模型", flush=True)
         return
+    url, label = _model_source()
     cmd = [sys.executable, str(FETCH), "--out", models]
-    url = os.environ.get("PHOTOAR_MODEL_URL")
-    if url and url.strip():
-        cmd += ["--url", url.strip()]
-    print(f"[entrypoint] 取 XFeat 模型 → {models}", flush=True)
+    if url:
+        cmd += ["--url", url]
+    print(f"[entrypoint] {label} {models}", flush=True)
     # check=False：失败不阻断启动（理由见模块 docstring 最后一节）。
     # fetch_models.py 自己已经把可执行的建议打到 stderr 上了，这里不再包一层。
     rc = subprocess.run(cmd, check=False).returncode
     if rc != 0:
         print(
-            "[entrypoint] ⚠️ 模型没取到（上面有原因和出路）。服务照常启动，"
+            "[entrypoint] ⚠️ 模型没装上（上面有原因和出路）。服务照常启动，"
             "识别后端会回退到 orb。",
             flush=True,
         )
