@@ -29,6 +29,14 @@
 #      **Dockerfile 里那三个 pip 包够不够**的地方（第 1 层装的是 pyproject 那份，
 #      两份清单不必也不该保持一致）。
 #
+# ## 运行页上那份部署说明
+#
+# 最后一步把「这一版怎么拿、怎么起、从哪访问」写进 Job Summary（`.github/scripts/summary.py`），
+# 所以看着构建变绿的人不用再去翻仓库找 tag 和命令。它**只在冒烟过了的时候**给部署说明；
+# 挂了就只说"没有可部署的东西、先看哪一步"。它声称的每条 URI 都是上面那一步真打过的，
+# 那条最小 `docker run` 与上面跑通的那条是同一组必填项（`tests/test_ci_summary.py` 从这个
+# 文件里抠出来做比对）—— 所以它讲不出没被验证过的话。
+#
 # ⚠️ `arcoreimg` 不在仓库里（ARCore SDK 里的闭源二进制、不可再分发），所以镜像里没有它，
 # 入库那条路在 CI 上会回 503。这是**预期**的：E2E 只打不需要它的接口，入库那一整条的
 # 覆盖在单元测试里（`fake_arcoreimg` fixture）。
@@ -171,6 +179,7 @@ jobs:
       # 镜像里不含 arcoreimg 和 vocab.npz：前者不可再分发，后者是你自己照片训出来的
       # 数据。两个都在运行时 bind mount 送进容器（见 docker-compose.yml）。
       - name: 编镜像
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -191,6 +200,7 @@ jobs:
       # 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署走的那条 ——
       # 顺手把它验一遍。
       - name: 起容器并打接口
+        id: e2e
         env:
           # 同上：不把 tag 名内联展开进脚本正文
           WANT_VERSION: ${{ steps.ver.outputs.value }}
@@ -202,10 +212,18 @@ jobs:
           # 加上的 —— 第一版这个 workflow 少了它，容器 2 秒就 unhealthy。
           # 名字用 ASCII：真实部署里是「照片=/share/Photo」这样的中文名，而在
           # CI 的 shell → docker → python 这条链上省掉一层编码变量。
+          #
+          # 除了那两个 PHOTOAR_ADMIN_*（为了下面能自动登录测一遍），**这一组必填项
+          # 与 job summary 里给出的那条最小 `docker run` 是同一组** —— 也就是说那份
+          # 说明是被真的跑过的。哪天多出一个必填变量，这里会先变 unhealthy。
+          #
+          # 刻意**没有** PHOTOAR_BIND：合并形态下它是空转的。entrypoint 把网页版的
+          # HOST 写死成 0.0.0.0、把后端强制按到回环上（那条有安全含义，见
+          # docker/entrypoint.py 里 backend_env 的注释），所以外面设它不改变任何事。
+          # 留着会让照抄这段的人以为它是必需的。
           docker run -d --name photoar-ci \
             -e PHOTOAR_ADMIN_NAME=admin \
             -e PHOTOAR_ADMIN_PASSWORD=admin \
-            -e PHOTOAR_BIND=0.0.0.0 \
             -e PHOTOAR_ROOTS=photos=/data/photos,videos=/data/videos \
             -v photoar-ci-data:/data \
             -p 8964:8964 \
@@ -330,6 +348,7 @@ jobs:
       # （即便全部命中缓存，产出的也是"另一次构建"），而这里要的正是**把刚刚跑过的
       # 那个镜像**推出去。photo-ar-server:ci 就在本地 docker 里，直接改名推走。
       - name: 推镜像
+        id: push
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
         run: |
           set -euo pipefail
@@ -339,3 +358,27 @@ jobs:
             docker tag photo-ar-server:ci "$t"
             docker push "$t"
           done
+
+      # ---- 运行页上的那份说明 ----
+      #
+      # 「这一版怎么拿、怎么起、从哪访问」写进 Job Summary，直接显示在这次 run 的页面上。
+      # 为什么要在这里再写一遍（而不是只指向 docs/deploy.md）、以及它凭什么不会变成
+      # 一份过时的拷贝，都写在那个脚本的 docstring 里。
+      #
+      # `if: always()`：编镜像或冒烟挂了的时候它走另一条分支 —— **不给部署说明**，
+      # 只说清楚"没有可部署的东西"和先看哪里。绿一半的运行页上放一份部署指南，
+      # 读的人会以为有东西可部署。
+      #
+      # 摘要生成放在最后一步而不是塞进上面那几个 run：它要同时知道镜像编没编出来、
+      # 冒烟过没过、推没推出去，而这三件事分散在三个 step 的 outcome 里。
+      - name: 写部署说明到 Job Summary
+        if: always()
+        env:
+          # IMAGE 从上面 workflow 级的 env 继承，不用在这里再写一遍
+          VERSION: ${{ steps.ver.outputs.value }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+          # 推失败也算没发布 —— 那时 registry 上还是上一版，说"已推送"就是谎话。
+          PUBLISHED: ${{ steps.push.outcome == 'success' }}
+        run: python3 .github/scripts/summary.py

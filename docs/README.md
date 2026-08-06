@@ -6,7 +6,8 @@
 |---|---|
 | 从零把它部署起来 | [deploy.md](deploy.md) —— 每一步都带「看到什么算成」 |
 | 知道某个数字/限制是怎么来的，或者出问题了 | [deploy-details.md](deploy-details.md) —— 取舍、实测基线、排障对照表 |
-| 搞清楚"为什么是这样设计的" | [decisions.md](decisions.md) —— 按时间排的决策记录，2300+ 行 |
+| 搞清楚"为什么是这样设计的" | [decisions.md](decisions.md) —— 按时间排的决策记录，2600+ 行 |
+| 手上有一次 CI 构建，想知道**这一版**怎么拉怎么起 | 那次 run 的页面（Actions → server），顶部就是 —— tag、版本号、最小命令、验过什么。由 [../.github/scripts/summary.py](../.github/scripts/summary.py) 生成 |
 | 改网页版的代码 | [../web-front/README.md](../web-front/README.md) —— 浏览器里怎么跑 ORB、跟踪、贴合、缓存 |
 | 复现 README 里引用的某个数字 | [../bench/README.md](../bench/README.md) |
 | 例行维护的命令 / `data/` 里每个文件丢了会怎样 | [../deploy/README.md](../deploy/README.md) |
