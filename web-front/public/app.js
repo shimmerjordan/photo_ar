@@ -159,6 +159,12 @@ function showStale({ build, server }) {
     `本地 <code>${build}</code>，服务端 <code>${server}</code>。<br>` +
     '普通刷新救不了它（缓存还在有效期内，浏览器根本不会去问）。点下面这个按钮。',
   )
+  // 登录表单要藏起来。**这一步不能省**：让他先输名字再进来，进来的仍然是那个坏包，
+  // 而那时报的错是别的（旧客户端打新服务端）—— 等于把刚说清楚的原因又盖回去。
+  // 这一屏只该有一个动作。
+  for (const el of [els.name?.closest('.field'), els.pwField, els.gateErr]) el?.setAttribute('hidden', '')
+  els.enter?.closest('.actions')?.setAttribute('hidden', '')
+
   const btn = document.createElement('button')
   btn.textContent = '取新版并重新载入'
   btn.addEventListener('click', () => {
