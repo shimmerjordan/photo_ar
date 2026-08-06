@@ -107,6 +107,13 @@ PHOTOAR_ROOTS=照片=/share/Photo,视频=/share/Video,网盘=/share/CloudDrive
 一样是故意的：入库时填的路径在宿主机、容器里、白名单里是同一个字符串，不用换算。
 改完记得 `PHOTOAR_ROOTS` 与它们对得上。
 
+> **你的目录完全不是 `/share/Photo` 那一套**（比如素材全在
+> `/share/Study/media_bed/photo-ar` 下面）——`docker-compose.yml` 顶部的
+> 「改成你自己的路径」那一节有完整的对照例子，以及三条各有一个**不响的失败方式**的
+> 约束：`/data` 别落在 `PHOTOAR_ROOTS` 之内、上传目录必须在 `PHOTOAR_ROOTS` 之内且
+> 挂载可写、宿主机上的目录要先 `mkdir -p`（不建的话 dockerd 会以 root 建一个空目录，
+> 不报错，然后服务真的去索引它）。
+
 **看到什么算成**：`ls tools/arcoreimg .env docker-compose.yml` 三个都在。
 
 最后长这样：
@@ -653,10 +660,17 @@ cd photo-ar
 mkdir -p local/photos/_inbox local/videos          # 素材放这儿，local/ 在 .gitignore 里
 cp .env.example .env                                # 至少填 PHOTOAR_ADMIN_PASSWORD（见下）
 
-export PHOTOAR_LOCAL="-f docker-compose.yml -f deploy/compose.local.yml"
-docker compose $PHOTOAR_LOCAL up -d --build
-docker compose $PHOTOAR_LOCAL logs -f
+# 把文件列表写进 .env，之后这个目录里直接用 docker compose，覆盖层自动带上
+echo 'COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml' >> .env
+
+docker compose up -d --build
+docker compose logs -f
 ```
+
+**别漏掉那个覆盖层**，而且漏掉的后果是不可逆的：主文件挂的是 NAS 的 `/share/Photo`，
+开发机上没有那个路径，dockerd 会**以 root 身份在你的根目录下建出来**（空目录，不报错，
+服务还真去索引它）。写进 `.env` 就没机会忘；理由和合并规则在
+[../deploy/compose.local.yml](../deploy/compose.local.yml) 顶部。
 
 起来之后本机 `http://127.0.0.1:8964/` 是网页版、`/admin` 是管理台，同一个端口。
 

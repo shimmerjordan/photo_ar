@@ -5,6 +5,7 @@
 | 我想… | 看这份 |
 |---|---|
 | 从零把它部署起来 | [deploy.md](deploy.md) —— 每一步都带「看到什么算成」 |
+| 我的照片不在 `/share/Photo`，compose 该怎么改 | [../docker-compose.yml](../docker-compose.yml) 顶部「改成你自己的路径」—— 成对的三处、三条约束、一个完整例子 |
 | 知道某个数字/限制是怎么来的，或者出问题了 | [deploy-details.md](deploy-details.md) —— 取舍、实测基线、排障对照表 |
 | 搞清楚"为什么是这样设计的" | [decisions.md](decisions.md) —— 按时间排的决策记录，2600+ 行 |
 | 手上有一次 CI 构建，想知道**这一版**怎么拉怎么起 | 那次 run 的页面（Actions → server），顶部就是 —— tag、版本号、最小命令、验过什么。由 [../.github/scripts/summary.py](../.github/scripts/summary.py) 生成 |

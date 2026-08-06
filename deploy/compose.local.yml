@@ -4,9 +4,32 @@
 #   docker compose -f docker-compose.yml -f deploy/compose.local.yml up -d --build
 #   docker compose -f docker-compose.yml -f deploy/compose.local.yml logs -f
 #
-# 每次都打两个 -f 很烦，所以更常用的是把它接成一个变量：
+# 每次都打两个 -f 很烦，而且**漏掉第二个的后果是不可逆的**（见下面 !override 那段：
+# dockerd 会以 root 在你的根目录下建出 /share/Photo）。所以更好的做法是把文件列表
+# 写进仓库根目录的 `.env` —— compose 认它自己的这个变量：
+#
+#   COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml
+#
+# 之后在这个目录里直接 `docker compose up -d` / `logs -f` / `down` 就行，覆盖层
+# 自动带上，没机会忘。（分隔符在 Linux 上是 `:`；路径相对于仓库根目录。验证过：
+# compose 2.27.1 上不带任何 -f 也能正确合并。）
+#
+# 不想改 .env 就退回一个 shell 变量：
 #   export PHOTOAR_LOCAL="-f docker-compose.yml -f deploy/compose.local.yml"
 #   docker compose $PHOTOAR_LOCAL up -d --build
+#
+# ## 覆盖层的合并规则（按类型不同，这是最容易踩的一点）
+#
+#   | 类型 | 后一份对前一份做什么 |
+#   |---|---|
+#   | 标量（image、container_name） | **替换** |
+#   | map（environment、labels） | **逐键合并** |
+#   | list（volumes、ports、devices） | **追加**，不是替换 ← 坑在这里 |
+#
+# 所以下面 volumes 必须显式 `!override`。改完想确认合并结果，别猜 —— 这条会把
+# 变量替换和两层合并**完全展开**后打出来：
+#
+#   docker compose -f docker-compose.yml -f deploy/compose.local.yml config
 #
 # 为什么是覆盖层而不是另写一份完整的 compose：主文件里那些注释（为什么限 3 核、
 # 为什么 arcoreimg 得从宿主机送进去、为什么 PHOTOAR_BACKEND 只是初始值）是真正的
