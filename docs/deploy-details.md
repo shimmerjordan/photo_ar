@@ -403,9 +403,10 @@ curl -sk -o /dev/null -w 'https %{http_code}\n' https://127.0.0.1:8964/healthz  
 **升级服务端**：`docker compose pull && docker compose up -d`（自己改了代码就
 `build` 而不是 `pull`，依赖层有缓存，通常几十秒）。
 
-镜像只在**打 tag**（`git tag v0.2.0 && git push origin v0.2.0`）或者**手动跑
-workflow** 时才发新的 —— 往 main 推代码不会动镜像。所以 `pull` 拿到的 `latest`
-一定是某次特意发布的版本，不是某次随手提交。想钉死版本就在 `.env` 里写
+镜像**只在手动跑 workflow 且勾了 publish 时**才发新的（Actions → server →
+Run workflow，版本号在界面上填）——往 main 推代码、甚至打 git tag，都不会动镜像。
+而 `latest` 还要再勾一次「同时更新 latest」才会挪，所以 `pull` 拿到的 `latest`
+一定是某次特意发布**并特意指定**的版本。想钉死版本就在 `.env` 里写
 `PHOTOAR_IMAGE=ghcr.io/shimmerjordan/photo-ar-server:0.2.0`。
 
 什么时候需要动库，其余情况都不用：

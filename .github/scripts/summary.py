@@ -72,9 +72,9 @@ def describe_tag(tag: str) -> str:
     """一个 tag 该在什么时候用。规则照着 workflow 里 `metadata-action` 那段配置来。"""
     name = tag.rsplit(":", 1)[-1]
     if name == "latest":
-        return "最近一次**特意发布**的那一版（只有打 tag / 手动勾 publish 才会动它）"
+        return "最近一次发布时**特意勾了「同时更新 latest」**的那一版"
     if name.startswith("sha-"):
-        return "精确钉到某次提交。**回滚就用这个**"
+        return "精确钉到某次提交。**回滚就用这个**，而且它每次发布都有"
     parts = name.split(".")
     if len(parts) == 3 and all(p.isdigit() for p in parts):
         return "钉住这一版，不会被后续发布带走"
@@ -131,21 +131,25 @@ docker pull {first}
 """
     return f"""### 1 · 拿镜像
 
-**这次没有推镜像。** 它编出来了、也跑通了，但只存在于这台 runner 上，run 结束就没了。
-只有两种情况会推：打 `v*` tag，或者手动 Run workflow 把 publish 勾上。
+**这次没有推镜像。** 它编出来了、也跑通了，但只存在于这台 runner 上，run 结束就没了 ——
+因为这次跑的时候 **publish 没勾**。
 
-```bash
-# 发版（推荐）——推上去的必然是被起来打过接口的那一个镜像
-git tag v0.2.0 && git push origin v0.2.0
+要发出去：**Actions → server → Run workflow**，四个输入：
 
-# 只想临时发一版：Actions → server → Run workflow → 勾 publish
+| 输入 | 填什么 |
+|---|---|
+| `publish` | ✅ 勾上。不勾就永远只是跑一遍检查 |
+| `version` | `0.1.2` 这种。留空只会得到 `:sha-<短sha>`（能拉，但不占版本号） |
+| `latest` | 要不要把 `:latest` 指到这一版 |
+| `release` | 要不要建 GitHub Release（顺带打 git tag） |
 
-# 想跑含这次改动的镜像但不发版：在目标机器上自己构建
-docker compose build   # 版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记
-```
+**打 git tag 不会触发任何东西** —— 这条流水线只手动触发。
 
-⚠️ **别指望 `:latest` 或 `:main` 是新的。** 这两个 tag **只在发布时才被推**，所以它们停在
-「上一次特意发布」那一刻 —— 中间往 main 推过多少次都不会动它们。真踩过：拉了 `:main`
+想跑含这次改动的镜像但完全不经过 GHCR：在目标机器上 `docker compose build`
+（版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记）。
+
+⚠️ **别指望 `:latest` 是新的。** 它**只在发布时勾了 latest 才动**，所以停在
+「上一次特意发布并勾了它」那一刻 —— 中间往 main 推过多少次都不会动它。真踩过：拉了 `:main`
 拿到的还是几个月前的镜像，而那一版连网页版都还没合进容器，表现是 `/` 回
 「没有这个接口」。**确认办法**：起来之后 `curl -s <host>/api/config` 看 `version` 字段，
 或者 `docker exec <容器> printenv PHOTOAR_VERSION` —— 空的就是没经过版本注入的老镜像。

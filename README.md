@@ -124,9 +124,9 @@ The web app also has suites that need a real browser: `npm run test:browser`
 
 Publishing a new image is a deliberate act, not a side effect of pushing:
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0    # builds and pushes to GHCR
-```
+The pipeline is **manual-trigger only**: Actions → server → Run workflow, then
+fill in `publish` / `version` / `latest` / `release`. Pushing code — or pushing a
+git tag — triggers nothing.
 
 One note for anyone reading the source: `§N` references in comments point to an
 internal design document that is not published with the repository. The

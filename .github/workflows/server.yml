@@ -1,5 +1,8 @@
 # 唯一的一条流水线：单元测试（Python + 网页版）→ 编镜像 → 把镜像当生产环境跑一遍
-# →（打 tag 时）推 GHCR。
+# →（勾了 publish 时）推 GHCR →（勾了 release 时）建 Release。
+#
+# **只手动触发**（Actions → server → Run workflow）。版本号、要不要动 latest、要不要
+# 建 Release 全在那个界面上填，见下面 `on:` 那一段。
 #
 # 镜像里是**两个进程**：Node 的网页版在前（唯一的监听者）、Python 的后端在
 # 127.0.0.1:8965。所以 E2E 那一步同时打三种 URI：`/`（网页版）、`/admin`（反代）、
@@ -43,8 +46,15 @@
 #
 # ## 发版
 #
-#   git tag v0.2.0 && git push origin v0.2.0
-#   临时发一版：Actions → server → Run workflow，把 publish 勾上
+# Actions → server → Run workflow，四个输入：
+#
+#   publish  ✅   推镜像到 GHCR。不勾就只跑一遍检查，什么都不发出去
+#   version  0.1.2   镜像 tag、烧进镜像的版本号、Release 名字，三处同一个值
+#   latest   ✅   把 :latest 指到这一版
+#   release  ✅   建 GitHub Release（顺带打 git tag v0.1.2）
+#
+# 只想验一遍代码：四个全留默认，跑完什么都不会推出去。
+# 想推一个能拉的镜像试试但不占版本号：只勾 publish，得到 `:sha-<短sha>`。
 #
 # 第一次推完要手动做一件事：GHCR 上新建的包**默认是 private**，NAS 上
 # `docker compose pull` 会 denied。仓库右侧 Packages → photo-ar-server →
@@ -53,21 +63,38 @@
 
 name: server
 
-# 没有 paths 过滤，是刻意的。
+# **只手动触发**（2026-08-06 改）。
 #
-# 加上 `paths: [src/**, ...]` 能让只改文档的提交跳过这条流水线，但一旦同时写了
-# `tags: ["v*"]`，路径过滤对 tag 推送是否生效就变成一个说不清的行为 —— 而说不清的那个
-# 分支恰好是**发版**：打完 tag 却没有任何流水线跑起来，你要过一会儿才会发现镜像没更新。
-# 这个仓库是公开的，Actions 分钟数不计费，所以用「每次都跑」换掉那个坑是划算的。
+# 原来是 push main / push tag / PR 都跑。改成纯手动是用户的决定，代价要写清楚：
+#
+#   ⚠️ **推代码不再有任何自动检查。** 1150 个 Python 用例 + 152 个网页版用例 + 镜像
+#      构建 + 起容器打接口，现在一次都不会自动跑 —— 坏代码可以静静躺在 main 上，
+#      直到下次有人手动点一下才发现。
+#   ⚠️ **打 tag 不再自动发版。** `git tag v0.1.2 && git push` 什么也不会发生，
+#      发版一律走下面的手动入口（版本号在界面上填）。
+#
+# 想把自动跑测试加回来（**不编镜像**，十几分钟、不产出任何东西），加这一段就行：
+#     push:
+#       branches: [main]
+# 然后给 image job 加 `if: github.event_name == 'workflow_dispatch'`。
+# 那样推代码只跑 test/web 两个 job，发版仍然只能手动。
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
     inputs:
       publish:
-        description: "同时把镜像推到 GHCR（发版用；只想跑一遍检查就留 false）"
+        description: "推镜像到 GHCR（不勾 = 只跑一遍检查，什么都不发出去）"
+        type: boolean
+        default: false
+      version:
+        description: "版本号，如 0.1.2（留空 = 只打 sha-<短sha>）。它同时是镜像 tag、烧进镜像的版本号、Release 的名字"
+        type: string
+        default: ""
+      latest:
+        description: "同时更新 :latest（指向这一版）"
+        type: boolean
+        default: false
+      release:
+        description: "建一个 GitHub Release（需要填版本号；会顺带打 git tag）"
         type: boolean
         default: false
 
@@ -133,8 +160,10 @@ jobs:
     needs: [test, web]
     timeout-minutes: 30
     permissions:
-      contents: read
-      packages: write # 只有 publish 那两步用得到，但权限是 job 级的
+      # contents 要 write 是为了「建 Release」那一步（它顺带打 git tag）。
+      # 其余步骤只读，但权限是 job 级的，没法再收窄。
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -144,25 +173,39 @@ jobs:
       # 也是 `GET /api/config` 回的 `version`。
       #
       # 取值刻意与下面推出去的 tag **对得上**，这样"设置页上那串字"能直接反查到镜像：
-      #   打 tag   → `v0.2.0`（git tag 名；镜像 tag 是 `0.2.0`，差一个 v）
-      #   其它     → `sha-1a2b3c4`，与 `type=sha,format=short` 产出的镜像 tag 逐字符相同
+      #   填了版本号 → `0.1.2`，与镜像 tag 逐字符相同
+      #   留空       → `sha-1a2b3c4`，与 `type=sha,format=short` 产出的那个逐字符相同
       #
       # 不注入的话网页版会退回 `x.y.z-dev` —— 那个后缀的语义是"不是 CI 出的镜像"。
-      # 而在这一步补上之前，**CI 出的镜像也全都写着 -dev**，于是那一行读数在真正会被
+      # 而在补上它之前，**CI 出的镜像也全都写着 -dev**，于是那一行读数在真正会被
       # 部署的那些镜像里恰好是没用的。
       #
-      # `REF_NAME` 走 env 而不是直接把 `${{ }}` 展开进脚本正文：tag 名是外部可控的字符串，
-      # 内联展开等于把它拼进 shell 源码。这里的攻击面只对能推 tag 的人开着，但 env 这条
-      # 写法一样短，没有理由留着另一条。
+      # `RAW_VERSION` 走 env 而不是直接把 `${{ }}` 展开进脚本正文：它是**界面上手输的
+      # 字符串**，内联展开等于把它拼进 shell 源码。
       - id: ver
         env:
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          REF_NAME: ${{ github.ref_name }}
+          RAW_VERSION: ${{ inputs.version }}
+          WANT_RELEASE: ${{ inputs.release }}
         run: |
           set -euo pipefail
-          if [ "$IS_TAG" = "true" ]; then
-            v="$REF_NAME"
+          v="$(printf '%s' "$RAW_VERSION" | tr -d '[:space:]')"
+          if [ -n "$v" ]; then
+            # 只收 `1.2.3` / `1.2.3-rc1` 这种。挡住的不是恶意输入（能点 Run workflow
+            # 的人本来就有写权限），而是手滑：`v0.1.2`（多个 v，镜像 tag 会变成 `v0.1.2`
+            # 而 `{{major}}.{{minor}}` 派生不出来）、`0.1`（缺一位）、带空格或斜杠
+            # （docker tag 直接非法，而那时镜像已经编完了才失败）。
+            case "$v" in
+              [0-9]*.[0-9]*.[0-9]*) : ;;
+              *) echo "::error::版本号要形如 0.1.2（不要带 v 前缀），收到的是 '$v'"; exit 1 ;;
+            esac
+            case "$v" in
+              *[!0-9A-Za-z.+-]*) echo "::error::版本号里有非法字符：'$v'"; exit 1 ;;
+            esac
           else
+            if [ "$WANT_RELEASE" = "true" ]; then
+              echo "::error::勾了「建 Release」就必须填版本号 —— Release 得有个名字。"
+              exit 1
+            fi
             v="sha-${GITHUB_SHA::7}"
           fi
           echo "value=$v" >> "$GITHUB_OUTPUT"
@@ -319,7 +362,7 @@ jobs:
       # ---- 到这里镜像已经被起来打过接口了，才允许推出去 ----
 
       - name: 登录 GHCR
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        if: inputs.publish == true
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -327,29 +370,46 @@ jobs:
           # 仓库自带的 token 就够，不用另配 PAT
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `0.1.2` → `0.1`。metadata-action 的 `{{major}}.{{minor}}` 只认从 git ref 解析
+      # 出来的 semver，而我们的版本号是界面上手输的，所以自己派生。
+      - id: majmin
+        if: inputs.publish == true
+        env:
+          V: ${{ steps.ver.outputs.value }}
+        run: |
+          set -euo pipefail
+          case "$V" in
+            sha-*) echo "value=" >> "$GITHUB_OUTPUT" ;;   # 没填版本号，没有 major.minor 可言
+            *) echo "value=${V%.*}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - id: meta
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        if: inputs.publish == true
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # 打 v1.2.3 得到 :1.2.3 和 :1.2；手动跑得到当前分支名（如 :main）。
-          # :sha-xxxxxxx 一直有，用来精确回滚到某次提交。
+          # 全部由界面上那几个输入决定，不再从 git ref 猜：
           #
-          # latest 无条件更新：只有打 tag 和手动勾 publish 才会走到这里，所以
-          # 「latest = 我上次特意发布的那一版」就是准确的语义。
+          #   :0.1.2        填了版本号才有
+          #   :0.1          从版本号派生（跟着这条线的补丁版本走）
+          #   :sha-1a2b3c4  **一直有** —— 精确回滚到某次提交靠它
+          #   :latest       只有勾了「同时更新 latest」才动
+          #
+          # latest 从"无条件"改成"勾了才动"（2026-08-06）：以前只有发版才走到这里，
+          # 所以无条件是准确的；现在手动跑一次不填版本号也能推（得到一个 sha- tag），
+          # 那种"我只是想推一个能拉的镜像试试"不该把 latest 一起带走。
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=ref,event=branch
+            type=raw,value=${{ steps.ver.outputs.value }},enable=${{ inputs.version != '' }}
+            type=raw,value=${{ steps.majmin.outputs.value }},enable=${{ steps.majmin.outputs.value != '' }}
             type=sha,format=short
-            type=raw,value=latest,enable=true
+            type=raw,value=latest,enable=${{ inputs.latest == true }}
 
       # 用 docker tag + push 而不是再跑一次 build-push-action：后者会重新 build
       # （即便全部命中缓存，产出的也是"另一次构建"），而这里要的正是**把刚刚跑过的
       # 那个镜像**推出去。photo-ar-server:ci 就在本地 docker 里，直接改名推走。
       - name: 推镜像
         id: push
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+        if: inputs.publish == true
         run: |
           set -euo pipefail
           echo "${{ steps.meta.outputs.tags }}" | while read -r t; do
@@ -358,6 +418,32 @@ jobs:
             docker tag photo-ar-server:ci "$t"
             docker push "$t"
           done
+
+      # 建 GitHub Release。排在推镜像**之后**：Release 是对外的公告，而公告一个还没
+      # 推上去的镜像等于给人一个拉不到的地址。
+      #
+      # `gh release create` 会顺带打 git tag（`--target` 指向这次构建的那个 commit），
+      # 所以不需要事先 `git tag`。这也是 `contents: write` 的唯一用途。
+      - name: 建 Release
+        if: inputs.publish == true && inputs.release == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ steps.ver.outputs.value }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "镜像（同一个，任选其一）："
+            echo
+            echo '```'
+            printf '%s\n' "$TAGS" | sed 's/^/docker pull /'
+            echo '```'
+            echo
+            echo "怎么部署、从哪访问：见这次 run 页面顶部的 Job Summary。"
+          } > /tmp/relnotes.md
+          gh release create "v$V" --title "v$V" --notes-file /tmp/relnotes.md \
+            --target "$GITHUB_SHA"
+          echo "Release v$V 建好了"
 
       # ---- 运行页上的那份说明 ----
       #
