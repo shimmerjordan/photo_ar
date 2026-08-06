@@ -195,3 +195,69 @@ describe('Library 对着真实库', { skip: !hasLib && '没有 data/library/' },
     }
   })
 })
+
+describe('全新部署：库目录还不存在', () => {
+  // 服务端要到**第一次入库**才创建 `data/library/`。在那之前网页版必须能正常起来 ——
+  // 2026-08-06 之前不能：`load()` 在 `stat(slots.json)` 上抛 ENOENT，`/api/lib` 把它
+  // 变成 503，于是刚部署完的人点开扫一扫看到的是
+  // 「读不到识别库 /data/library：ENOENT…确认它被挂进容器」——而挂载完全正常。
+  const tmpLib = async () => {
+    const { mkdtemp } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    return join(await mkdtemp(join(tmpdir(), 'photoar-emptylib-')), 'library')
+  }
+
+  test('目录不存在 → 装成空库，不抛', async () => {
+    const lib = new Library(await tmpLib())
+    await lib.load()
+    assert.deepEqual(lib.photoIds, [])
+  })
+
+  test('空库能 pack —— /api/lib 要回一个 0 张的包而不是 503', async () => {
+    const lib = new Library(await tmpLib())
+    await lib.load()
+    const packed = await lib.pack([])
+    assert.ok(packed.buf.length > 0, '空包也得是个合法的包，前端要能装载它')
+  })
+
+  test('库空但 catalog 里有照片 → 如实报 not_in_library，不是静默丢掉', async () => {
+    // 这种状态是真实的：入库写 catalog 在写识别库之前失败过。
+    const lib = new Library(await tmpLib())
+    await lib.load()
+    const packed = await lib.pack([{ id: 'p1' }])
+    assert.deepEqual(packed.skipped, [{ id: 'p1', reason: 'not_in_library' }])
+  })
+
+  test('入库第一张之后能自动看见 —— 空库不会被 mtime 缓存钉死', async () => {
+    // `load()` 靠 mtime 决定要不要重读。空库那条路把 `_mtime` 设成 0，所以真文件
+    // 一出现（mtime 必然非 0）就会重新装载。写死成"装过就不再看"的话，第一张照片
+    // 入库后网页永远看不到它，而且没有任何报错。
+    const { writeFile, mkdir } = await import('node:fs/promises')
+    const dir = await tmpLib()
+    const lib = new Library(dir)
+    await lib.load()
+    assert.deepEqual(lib.photoIds, [])
+
+    // 造一份**真实形状**的库：入库会同时写 slots.json 与 desc.bin。只写前者的话
+    // `load()` 会在 open desc.bin 上 ENOENT —— 那是库损坏，本来就该抛（下一条测的
+    // 就是那种情况不许被吞掉）。
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'slots.json'), JSON.stringify({ photo_ids: ['p1'] }))
+    await writeFile(join(dir, 'desc.bin'), Buffer.alloc(ORB_LAYOUT.stride))
+    await lib.load()
+    assert.deepEqual(lib.photoIds, ['p1'], '库出现之后必须自动重读')
+    await lib.close()
+  })
+
+  test('⚠️ 只吞 ENOENT —— 坏掉的 slots.json 仍然要抛', async () => {
+    // "静悄悄地当成空库"会让人对着一个永远认不出东西的页面查很久。
+    const { writeFile, mkdir } = await import('node:fs/promises')
+    const dir = await tmpLib()
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'slots.json'), '{ 这不是 JSON')
+    await assert.rejects(() => new Library(dir).load())
+
+    await writeFile(join(dir, 'slots.json'), JSON.stringify({ 没有: 'photo_ids' }))
+    await assert.rejects(() => new Library(dir).load(), /photo_ids/)
+  })
+})

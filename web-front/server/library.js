@@ -66,7 +66,29 @@ export class Library {
    */
   async load() {
     const slotsPath = join(this.dir, 'slots.json')
-    const st = await stat(slotsPath)
+    let st
+    try {
+      st = await stat(slotsPath)
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+      // **全新部署：一张都还没入库时，服务端根本不会创建 `library/`。**
+      //
+      // 这不是故障，是"库是空的"。当成错误抛出去的后果很难看：部署完、登录、点开
+      // 扫一扫，迎面一句 `ENOENT ... stat '/data/library/slots.json'`，还叫人去
+      // "确认它被挂进容器" —— 而挂载完全正常，只是还没入库。**每一个新部署都会
+      // 撞上这一下**（2026-08-06 真撞了）。
+      //
+      // 与下面容忍词表缺失是同一条理由，只是那一条当初只想到了词表。
+      //
+      // ⚠️ 只吞 ENOENT。`slots.json` 在但读不动（权限、坏 JSON、少 photo_ids）
+      // 仍然要抛 —— 那些是真故障，而"静悄悄地当成空库"会让人对着一个永远认不出
+      // 东西的页面查很久。
+      this._mtime = 0
+      this._slots = { photo_ids: [] }
+      this._vocab = null
+      this._words = null
+      return this
+    }
     if (this._slots && st.mtimeMs === this._mtime) return this
     this._mtime = st.mtimeMs
 
