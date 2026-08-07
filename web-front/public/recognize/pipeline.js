@@ -203,6 +203,7 @@ export class Pipeline {
     this._prevPts?.delete()
     this._prevPts = null
     this._refPts = null
+    this._corrNext = false
   }
 
   _detect(imageData) {
@@ -400,13 +401,21 @@ export class Pipeline {
       // 定期重锚：点数不掉也要回到外观。漂移的两种主要来源（随机游走、反光锁点）
       // 都不掉点，按点数触发的那条永远抓不住它们 —— 理由与数字见 REANCHOR_MS。
       const overdue = now - this._lastReseedAt > REANCHOR_MS
+      // 这一帧的四角是否建立在**刚换过的种子**上 —— 也就是重锚纠正落地的那一帧。
+      // 换种子发生在上一帧（下面那个块），而新种子第一次参与解单应是在这一帧；
+      // 中间隔着丢帧的话，标一直留到第一个成功的四角。滤波器对它区别对待：
+      // 它不是运动，是纠正（quadfilter.observe 的 correction，真机抓出来的跳变来源）。
+      const corrected = this._corrNext === true
+      this._corrNext = false
       let reseeded = 0
       if (decayed || overdue) {
         reseeded = this._reseed(src)
+        if (reseeded) this._corrNext = true
       }
       return {
         quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
         photo: this.locked.photo, tracked: kept,
+        ...(corrected ? { corrected: true } : {}),
         ...(reseeded ? { reseeded, reanchored: overdue && !decayed } : {}),
       }
     } finally {

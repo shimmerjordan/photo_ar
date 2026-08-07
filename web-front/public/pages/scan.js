@@ -31,6 +31,7 @@ import {
 } from '../render/screenquad.js'
 import * as api from '../api.js'
 import { playStream } from '../mp4stream.js'
+import { cachedStream } from '../prefetch.js'
 import { button, h } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
@@ -74,8 +75,16 @@ export default {
     }, { kind: 'ghost' })
     rescan.hidden = true
     sound.hidden = true
+    /**
+     * 开/关相机。**这个按钮同时是权限重试的入口** —— 权限弹窗被划掉、或相机被
+     * 别的 App 占着时，原来唯一的出路是刷新整页（引擎白重载一遍）。现在关掉再开
+     * 就是一次全新的 getUserMedia：权限还能弹的浏览器会重新弹。
+     * 顺带是省电开关：拍完不看了可以把相机关掉，页面留着。
+     */
+    const camBtn = button('关相机', () => { st.stream ? closeCam() : openCam() }, { kind: 'ghost' })
+    camBtn.hidden = true
 
-    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, sound), dom.meta)
+    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, sound, camBtn), dom.meta)
     el.append(dom.canvas, dom.cam, dom.clip, dom.hud)
 
     /**
@@ -142,6 +151,8 @@ export default {
           const age = st.quadAt ? Math.round(performance.now() - st.quadAt) : null
           parts.push(st.quad ? `贴合中 ${age}ms前` : age === null ? '无四角' : `四角已过期 ${age}ms`)
           if (st.trackPoints) parts.push(`跟踪点 ${st.trackPoints}`)
+          if (st.filter?.correcting) parts.push('纠正滑行中')
+          if (st.filter?.rejected) parts.push(`毛刺 ${st.filter.rejected}`)
           if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
           else if (v.error) parts.push(`视频错误 ${v.error.code}`)
           else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
@@ -154,9 +165,28 @@ export default {
         else if (v.error) parts.push('视频播不了')
         else if (v.readyState < 2) parts.push('视频加载中…')
         else if (v.paused) parts.push('视频已暂停')
+        // 贴合准确度。**只在不稳时说话**（稳的时候这行字本身就是干扰），
+        // 而且说的是"怎么办"不是数字：跟踪点少 = 角度太斜/太远/反光，
+        // 这三样宾客都能自己调整。分档阈值见 fitQuality()。
+        const q = fitQuality()
+        if (q) parts.push(q)
       }
       dom.meta.textContent = parts.join(' · ')
     }
+    /**
+     * 贴合准确度分档。判据是**跟踪内点数**（st.trackPoints，每帧更新）：
+     * 它同时反映角度、距离、遮挡、反光 —— 正是贴合质量的直接决定量（内点少 →
+     * RANSAC 解不稳 → 四角抖/偏）。阈值对照 pipeline 里的两个常量：
+     * < 16（RESEED_MIN_INLIERS）已经贴近放手线；< 28 处在补种子频繁触发的区间。
+     */
+    function fitQuality() {
+      const n = st.trackPoints
+      if (!st.quad || n == null) return null
+      if (n < 16) return '贴合很不稳 —— 正对照片、再靠近一点'
+      if (n < 28) return '贴合一般 —— 角度小一点会更稳'
+      return null   // 稳的时候不说话
+    }
+
     // 连点三下**关掉**调试模式（开不了 —— 入口在设置页连按版本号，见 diag.js 的
     // `bindToggle`）。绑在这条读数上：调试时手机就在手上，跑回设置页很烦。
     ctx.bindDiagToggle?.(dom.meta)
@@ -241,16 +271,22 @@ export default {
         diagAlways('⚠️ 媒体是绝对地址。跨源会被 COEP 拦，要在部署层代理成同源。')
       }
 
-      // 两层绕路，缺一不可（都是真机上量出来的，见 mp4stream.js 顶部那张表）：
+      // 预取缓存命中就直接从本机播（登录时后台拉的，见 prefetch.js）——
+      // 现场网络最差的那一刻，正好是唯一不需要网络的一刻。
+      // 未命中走原来的两层绕路，缺一不可（都是真机上量出来的，见 mp4stream.js 顶部那张表）：
       //   1. `playableUrl` —— 换成自带凭证的票据地址，因为媒体组件拿不到会话 cookie；
       //   2. `playStream`  —— 页面自己 fetch、经 MediaSource 喂，因为那个组件还有
       //      独立的 TLS 栈，不认自签证书。
-      const src = await api.playableUrl(info.url)
+      const cached = await cachedStream(info.url)
+      if (cached) diagAlways('视频从预取缓存播（零网络）')
+      const src = cached ?? await api.playableUrl(info.url)
       if (!st.alive) return
       dom.clip.muted = true
       st.stopStream?.()
       st.stopStream = playStream(dom.clip, src, {
         onEvent: (name, detail) => diagAlways(`流 ${name} ${JSON.stringify(detail ?? {})}`),
+        // MSE 走不通退回 <video src> 时，缓存的 Response 给不出地址，现取一张票。
+        getFallbackUrl: () => api.playableUrl(info.url),
       })
       tip(`认出了 <b>${title}</b>，内点 ${m.inliers}。`, { hit: true })
       // 起播交给 playStream（它在第一个分片到位时就 play）。这里只负责把「开声音」
@@ -278,6 +314,7 @@ export default {
         (m.streak ? ` 累积 ${m.streak.n}/${m.streak.need}` : '') +
         (m.tracked ? ` 光流存活=${m.tracked}` : '') +
         (m.reseeded ? ` 补种子→${m.reseeded}` : '') +
+        (m.corrected ? ' 纠正帧' : '') +
         (m.gaveUp ? ' 放手' : ''))
       // 累积命中要与单帧命中**分得开**。不分的话，跨帧累积带来的误识别会混进单帧
       // 命中里，永远量不出来（服务端那边靠 recognize_log 的 reason 分，这边靠这一行）。
@@ -293,7 +330,9 @@ export default {
         // **这个四角测的是多久之前的画面** —— 抓帧那一刻到现在。滤波器要补的就是它。
         // `m.grabbedAt` 由 worker 原样带回（见 worker.js），拿不到就退回用跟踪耗时估。
         const age = m.grabbedAt ? Math.max(0, at - m.grabbedAt) : (m.ms ?? 0)
-        st.filter.observe(m.quad, at, age)
+        // `corrected` = 这个四角是重锚纠正落地的那一帧（pipeline 打的标）——
+        // 滤波器对它直接滑行而不是当成运动去跟（真机抓到的每 2 秒一次的瞬跳）。
+        st.filter.observe(m.quad, at, age, m.corrected ? { correction: true } : null)
       } else if (m.gaveUp) {
         // 放手时撤掉四角但**不停视频** —— 用户可能只是手抖了一下，重新检测通常一两秒
         // 就回来。停了再播会从头开始，那比继续播难看得多。
@@ -317,33 +356,70 @@ export default {
     ctx.worker.addEventListener('message', onWorkerMessage)
 
     // ── 相机 ────────────────────────────────────────────────────────
+    /**
+     * 开相机。mount 时自动调一次，之后由 camBtn 反复调 —— 每次都是一次全新的
+     * `getUserMedia`，这正是「不用刷新就能重新请求权限」的实现。
+     *
+     * 失败**不再是这一页的终局**（曾经是：整屏错误 + return，唯一出路是刷新）。
+     * 错误照样整屏说清原因（含 iOS 微信那条），但按钮留着 —— 处理好权限点一下就行。
+     */
+    async function openCam() {
+      camBtn.disabled = true
+      dom.camErr?.remove()
+      dom.camErr = null
+      tip('正在开相机…')
+      try {
+        st.stream = await openCamera(dom.cam)
+      } catch (e) {
+        st.stream = null
+        camBtn.disabled = false
+        camBtn.hidden = false
+        camBtn.querySelector('span').textContent = '重新开相机'
+        dom.camErr = h('div', { class: 'gate-inline' },
+          h('p', { class: 'bad', text: e instanceof CameraError ? e.message : `开相机失败：${e.message}` }))
+        el.appendChild(dom.camErr)
+        tip('相机没开起来。按上面说的处理好，点「重新开相机」。')
+        return
+      }
+      if (!st.alive) {
+        stopCamera(st.stream)
+        st.stream = null
+        return
+      }
+      camBtn.disabled = false
+      camBtn.hidden = false
+      camBtn.querySelector('span').textContent = '关相机'
+      st.renderer ??= new Renderer(dom.canvas)
+      st.grabber ??= new FrameGrabber(dom.cam)
+      tip(TIPS.scanning)
+      cancelAnimationFrame(st.raf)
+      st.raf = requestAnimationFrame(loop)
+    }
+
+    /** 关相机：停流、停渲染循环、把已锁定的视频也撤掉。页面与引擎都留着。 */
+    function closeCam() {
+      if (st.stream) stopCamera(st.stream)
+      st.stream = null
+      cancelAnimationFrame(st.raf)
+      st.renderer?.clear()
+      resetLock()
+      camBtn.querySelector('span').textContent = '开相机'
+      tip('相机已关。点「开相机」继续扫。')
+    }
+
     const lib = ctx.libInfo?.()
     if (lib && lib.nPhotos === 0) {
       tip(TIPS.empty)
       meta()
     } else {
-      try {
-        tip('正在开相机…')
-        st.stream = await openCamera(dom.cam)
-      } catch (e) {
-        // 相机开不了是这一页的**终局错误**。整屏说清原因（含 iOS 微信那条），
-        // 而不是塞进底部一行会被下一句盖掉的提示。
-        el.appendChild(h('div', { class: 'gate-inline' },
-          h('p', { class: 'bad', text: e instanceof CameraError ? e.message : `开相机失败：${e.message}` })))
-        return teardown
-      }
-      if (!st.alive) {
-        stopCamera(st.stream)
-        return teardown
-      }
-      st.renderer = new Renderer(dom.canvas)
-      st.grabber = new FrameGrabber(dom.cam)
-      tip(TIPS.scanning)
-      st.raf = requestAnimationFrame(loop)
+      await openCam()
     }
 
     function loop(now) {
       if (!st.alive) return
+      // 相机关了就不再自续 —— closeCam 已经 cancel 过一次，这里是防「cancel 和
+      // 一帧回调赛跑」的兜底：raf 回调可能已经在队里了。
+      if (!st.stream) return
       st.raf = requestAnimationFrame(loop)
       const r = st.renderer
       if (!r) return

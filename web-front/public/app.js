@@ -18,6 +18,7 @@ import * as api from './api.js'
 import { junimo } from './art.js'
 import { bindToggle, diagAlways, initDiag } from './diag.js'
 import { Shell } from './shell.js'
+import { startPrefetch } from './prefetch.js'
 import { hardRefresh, staleAgainst } from './staleguard.js'
 import { toast } from './ui.js'
 
@@ -315,6 +316,9 @@ function mountShell() {
   )
   state.shell.renderTabs(isAdmin())
   state.shell.start()
+  // 后台预取视频（宾客全取、管理员取最新几张，见 prefetch.js）。放在 shell 起来
+  // 之后、延迟几秒起跑：先让扫描页的引擎与相机把关键路径走完，预取只吃空闲带宽。
+  startPrefetch({ isAdmin: isAdmin() })
 }
 
 /**

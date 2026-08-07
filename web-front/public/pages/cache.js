@@ -21,6 +21,7 @@
  */
 import { bytes, button, h, row, section, toast } from '../ui.js'
 import { clearWasmCache } from '../recognize/wasmcache.js'
+import { clearPrefetched, prefetchStatus, prefetchedCount } from '../prefetch.js'
 
 export default {
   title: '本机缓存',
@@ -39,6 +40,24 @@ export default {
       lib?.skipped?.length
         ? h('p', { class: 'warnbox', text: '有照片在库里找不到特征：入库时被质量闸门或去重闸门拒了。那些照片扫任何角度都不会有反应，要管理员处理。' })
         : null))
+
+    // ── 预取的视频 ──────────────────────────────────────────────────
+    // 登录后后台拉的那些（prefetch.js）。这一层**是我们自己管的**，能精确报数。
+    const pre = section('预取的视频')
+    el.appendChild(pre)
+    {
+      const st = prefetchStatus()
+      pre.body.appendChild(row('状态', st.state))
+      const n = await prefetchedCount()
+      if (!alive) return
+      pre.body.appendChild(row('已在本机', `${n} 段`, { mono: true }))
+      pre.body.appendChild(h('p', { class: 'p dim', text: '扫到这些照片时视频直接从本机播，不走网络。宾客登录时取全部授权的；管理员只取最新几张。' }))
+      pre.body.appendChild(h('div', { class: 'actions' },
+        button('清空预取', async () => {
+          await clearPrefetched()
+          toast('已清空。下次登录会重新预取。')
+        }, { kind: 'ghost' })))
+    }
 
     const storage = section('浏览器给的存储配额')
     el.appendChild(storage)

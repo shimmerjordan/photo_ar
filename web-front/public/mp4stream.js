@@ -53,7 +53,14 @@ export function canStream() {
  * @returns 卸载函数。**必须调** —— 它要中止还在跑的 fetch，否则切页之后那 14MB
  *   还在下，而用户以为已经离开了。
  */
-export function playStream(video, url, { onEvent } = {}) {
+/**
+ * @param src 流地址（票据 URL），或**预取缓存命中时**的 Response（见 prefetch.js）。
+ *   Response 走的是完全相同的喂流路径 —— Cache Storage 每次 match 给的都是新的一份，
+ *   直接消费即可。
+ * @param getFallbackUrl 只在 `src` 是 Response 时用到：MSE 这条路走不通要退回
+ *   `<video src>` 时，Response 没有可用的地址，调它换一个（通常是去取一张票）。
+ */
+export function playStream(video, src, { onEvent, getFallbackUrl } = {}) {
   const ac = new AbortController()
   let done = false
   const stop = () => {
@@ -62,12 +69,16 @@ export function playStream(video, url, { onEvent } = {}) {
     ac.abort()
   }
 
+  const srcIsResponse = typeof src !== 'string'
+  /** 退回 `<video src>` 时给它一个真能用的地址。 */
+  const directUrl = async () =>
+    srcIsResponse ? await Promise.resolve(getFallbackUrl?.()).catch(() => null) : src
+
   if (!canStream()) {
     // 退回直连。在有这个毛病的安卓上它播不了，但在别的平台上它是完全正常的一条路，
     // 而"至少在能用的地方能用"胜过"哪儿都不能用"。
     onEvent?.('fallback', { why: 'no-mse' })
-    video.src = url
-    video.load()
+    directUrl().then((u) => { if (u) { video.src = u; video.load() } })
     return stop
   }
 
@@ -80,8 +91,7 @@ export function playStream(video, url, { onEvent } = {}) {
     onEvent?.('fallback', { why, ...detail })
     stop()
     URL.revokeObjectURL(objectUrl)
-    video.src = url
-    video.load()
+    directUrl().then((u) => { if (u) { video.src = u; video.load() } })
   }
 
   ms.addEventListener('sourceopen', async () => {
@@ -114,7 +124,9 @@ export function playStream(video, url, { onEvent } = {}) {
     const t0 = performance.now()
     let bytes = 0
     try {
-      const res = await fetch(url, { credentials: 'same-origin', signal: ac.signal })
+      const res = srcIsResponse
+        ? src
+        : await fetch(src, { credentials: 'same-origin', signal: ac.signal })
       if (!res.ok || !res.body) return fallback('fetch', { status: res.status })
       const reader = res.body.getReader()
       for (;;) {
