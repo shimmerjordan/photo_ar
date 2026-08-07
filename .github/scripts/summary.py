@@ -145,8 +145,9 @@ docker pull {first}
 
 **打 git tag 不会触发任何东西** —— 这条流水线只手动触发。
 
-想跑含这次改动的镜像但完全不经过 GHCR：在目标机器上 `docker compose build`
-（版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记）。
+想跑含这次改动的镜像但完全不经过 GHCR：在**开发机**上带覆盖层构建
+（`COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml`，`build:` 只在覆盖层里；
+版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记）。
 
 ⚠️ **别指望 `:latest` 是新的。** 它**只在发布时勾了 latest 才动**，所以停在
 「上一次特意发布并勾了它」那一刻 —— 中间往 main 推过多少次都不会动它。真踩过：拉了 `:main`

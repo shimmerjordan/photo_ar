@@ -421,8 +421,10 @@ Run workflow，版本号在界面上填）——往 main 推代码、甚至打 g
 | 只改了服务端逻辑 / 接口 | 什么都不用 | — |
 | 照片原文件被移动或改名 | `verify` 看报告，重新关联 | 详情页 `refStale`，识别仍在（用的是入库时存的特征） |
 
-**改了网页版**：`docker compose up -d --build`。前端没有构建步骤，但它在镜像里 ——
-改了 `web-front/public/` 不重建镜像是不会生效的。宾客那边刷新一下页面就是新的
+**改了网页版**：`docker compose up -d --build`（开发机 —— `build:` 只在
+`deploy/compose.local.yml` 覆盖层里，所以要按 deploy.md 那样把覆盖层写进
+`COMPOSE_FILE`；NAS 上没有构建这回事，等 CI 发版然后 pull）。前端没有构建步骤，
+但它在镜像里 —— 改了 `web-front/public/` 不重建镜像是不会生效的。宾客那边刷新一下页面就是新的
 （HTML 与 js 都是 `no-cache`，只有 `vendor/` 和字体是 immutable）。
 
 **备份**：值钱的只有 `data/`（每个文件的作用见 [deploy/README.md](../deploy/README.md)
@@ -452,7 +454,8 @@ Container Station →「应用程序」→「创建」，把 `docker-compose.yml
 
 - `PHOTOAR_TOKEN` 得直接写在 YAML 的 `environment:` 里（界面上没有「环境变量另填」
   的地方，也读不到 `.env`）
-- `build: .` 在界面里没有构建上下文，只能用 GHCR 上的镜像（把 `build:` 那行删掉）
+- 只能用 GHCR 上的镜像 —— 不过这正是部署 compose 的常态（`build:` 已经不在主文件里，
+  它只住在开发机的 deploy/compose.local.yml 覆盖层）
 
 而且**后面每一步验证命令都是 SSH 里跑的**，所以 SSH 早晚要开，建议直接走命令行。
 

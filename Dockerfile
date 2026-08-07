@@ -120,7 +120,16 @@ ENV PHOTOAR_VERSION=$PHOTOAR_VERSION
 # 网页版、管理台、API 全在这一个上，按 URI 分（见 docker/entrypoint.py）。
 # 后端自己退到容器内的 127.0.0.1:8965，那个端口不 EXPOSE、也打不到。
 EXPOSE 8964
-VOLUME ["/data", "/config"]
+# ⚠️ 这里**刻意没有** `VOLUME ["/data", "/config"]`（曾经有，被删掉了）。
+#
+# VOLUME 的语义是：容器创建时，声明过的路径若没被显式挂载，就为它生成一个**匿名卷**。
+# 后果在真实 NAS 上量过：用户用环境变量配置（不挂 /config），于是**每次**
+# `docker compose up -d` 换镜像重建容器都凭空多一个匿名卷，`docker rm` 还不带走 ——
+# 卷列表随升级次数线性变长，全是 64 位哈希名的垃圾。
+#
+# 它想换来的东西（"数据别丢在容器层里"）本来就是 compose 文件的职责：/data 在
+# docker-compose.yml 里是显式 bind mount。忘了挂的人得到的也不是保护，是一个
+# 藏在匿名卷里、下次重建就"丢失"的数据目录 —— 比直接写进容器层更难排查。
 
 # token 不写进镜像。Container Station 直接注入环境变量即可（config.py 里
 # PHOTOAR_TOKEN 的优先级高于配置文件）。

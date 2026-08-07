@@ -86,9 +86,13 @@ services:
     # 默认拉 GHCR 上由 CI 构建的镜像。想用别的 tag 就在 .env 里设 PHOTOAR_IMAGE，
     # 例如 ghcr.io/shimmerjordan/photo-ar-server:sha-1a2b3c4 回滚到某次提交。
     image: ${PHOTOAR_IMAGE:-ghcr.io/shimmerjordan/photo-ar-server:latest}
-    # 保留 build 是为了改了代码能本地构建；只要执行过 pull 或 build，
-    # `up` 就直接用本地已有的镜像，不会再动它。
-    build: .
+    # ⚠️ 这里**刻意没有** `build: .`（曾经有，挪去 deploy/compose.local.yml 了）。
+    #
+    # image 与 build 并存时，compose 在本地没有这个镜像的时候会**转去构建而不是
+    # pull** —— 在 NAS 上这意味着突然开始拉 node:22-trixie-slim 和 python:3.11-slim
+    # 两个基底镜像、然后跑一次几分钟的构建，产物还顶着 ghcr.io/... 的名字，让人以为
+    # 自己跑的是发布版。部署机永远只该 pull；要本地构建的是开发机，用
+    # deploy/compose.local.yml 那个 overlay（它带 build）。
     container_name: photo-ar-server
     restart: unless-stopped
     # 识别是 CPU 密集的（ORB + RANSAC，XFeat 还多一次 ONNX 推理）。N5095 只有 4 核，

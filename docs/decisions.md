@@ -2941,3 +2941,34 @@ golden 测试注入 25px 整体平移（与反光锁点同构：RANSAC 全体内
 - 这次"慢"的真身是 43.2 的 403：上传根本没成功，界面等到超时。不是计算慢。
 
 所以不搬。真要快，改的是转码档位（deploy-details 的 VAAPI 一节），不是搬计算。
+
+## 44. 第 21 轮：删掉 Dockerfile 的 VOLUME、把 build 从部署 compose 里挪走
+
+用户在 NAS 上发现两件"累赘"：莫名其妙拉额外的镜像、每次启动多出卷。两个都是我们
+自己文件里的地雷，而且都属于"每个人都会踩、没人会想到去查"的类型。
+
+### 44.1 `VOLUME ["/data", "/config"]`：每次重建容器凭空一个匿名卷
+
+VOLUME 的语义：容器**创建**时，声明过的路径若没被显式挂载，就为它生成一个匿名卷；
+`docker rm`（不带 -v）还不带走它。用户用环境变量配置、不挂 /config —— 于是每次
+`docker compose up -d` 换镜像重建都漏一个匿名卷，卷列表随升级次数线性变长。
+
+本机实测钉死：对现发布镜像 create+rm 三次，卷数量 22 → 28（每次 +2：/data 和
+/config 都没挂时）；删掉 VOLUME 重建镜像后同样操作，22 → 22。
+
+它想换来的"数据别丢在容器层里"本来就是 compose 的职责（/data 是显式 bind mount）。
+忘了挂的人得到的也不是保护 —— 是一个藏在匿名卷里、下次重建就"丢"的数据目录，
+比写进容器层更难排查。删。
+
+### 44.2 `build: .` 与 `image:` 并存：NAS 上凭空开始构建
+
+compose 在本地没有 `image:` 指的那个镜像时，如果同 service 还有 `build:`，会**转去
+构建而不是 pull** —— NAS 上表现成突然拉 node:22-trixie-slim 和 python:3.11-slim
+两个基底镜像、跑几分钟构建，产物还顶着 ghcr.io/... 的名字，让人以为跑的是发布版。
+
+部署机永远只该 pull。`build:` 挪进 deploy/compose.local.yml（开发机覆盖层）。
+
+顺带被 compose 上了一课：覆盖层里的相对路径（build context、bind mount）相对的是
+**项目目录**（第一个 -f 文件所在目录），不是覆盖层文件自己的目录 —— 第一版写了
+`build: ..`，`config` 展开后上下文跑到了仓库外面。所以 overlay 里写的是 `build: .`，
+注释里把这条规则钉住了。`docker compose config` 是唯一可信的确认方式，别猜。
