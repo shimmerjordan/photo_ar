@@ -209,6 +209,19 @@ export default {
     }
     for (const ev of videoEvents) dom.clip.addEventListener(ev, onVideoEvent)
 
+    /**
+     * 手动兜底循环。元素上已经有 `loop: true`（见 dom.clip 定义），但视频喂给的是
+     * `MediaSource`（mp4stream.js）而不是普通 `src` —— `endOfStream()` 之后原生 `loop`
+     * 在 Chromium 系上不可靠（老 bug：播完定在最后一帧，不重新播），表现就是"贴合还在，
+     * 视频却像暂停了"。这里显式接管：播完就跳回 0 重新播，不管原生 loop 有没有生效。
+     */
+    const onVideoEnded = () => {
+      dom.clip.currentTime = 0
+      dom.clip.play().catch(() => {})
+      diag(() => '视频 ended → 手动循环')
+    }
+    dom.clip.addEventListener('ended', onVideoEnded)
+
     function resetLock() {
       ctx.worker?.postMessage({ type: 'reset' })
       st.quad = null
@@ -541,6 +554,7 @@ export default {
       ctx.worker.removeEventListener('message', onWorkerMessage)
       dom.clip.removeEventListener('error', onVideoErr)
       for (const ev of videoEvents) dom.clip.removeEventListener(ev, onVideoEvent)
+      dom.clip.removeEventListener('ended', onVideoEnded)
       // **相机必须停**：不停的话相机灯一直亮、电量哗哗掉，而用户以为已经离开这一页了。
       if (st.stream) stopCamera(st.stream)
       dom.clip.pause()

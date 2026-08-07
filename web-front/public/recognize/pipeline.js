@@ -367,6 +367,19 @@ export class Pipeline {
       // 那件事已经在检测阶段做过了。这里只问"这些点还在不在同一个平面上"。
       const r = ransacPair(new Float32Array(keptSrc), new Float32Array(keptRef), 4)
       if (!r.h || r.inliers < MIN_TRACK_POINTS) return this._miss('homography_lost', r.inliers)
+      // 行列式范围复检 —— 大角度下漏出来的一个真洞。检测阶段的 `ransacPair.ok` 本来就查
+      // 这一条（`decideWith` 用它挑候选），但跟踪这条路只看了上面那一行的 `r.h`/`inliers`，
+      // 从没看过 `r.ok`。大角度意味着相机与照片近乎平行，可用的匹配点又少又弱
+      // （`MIN_TRACK_POINTS=12` 是数学下限，不是"匹配质量好"的门槛），RANSAC 在这种输入下
+      // 偶尔解出一个几何上不合理但**数值正常**的单应 —— 尤其是镜像解（行列式为负：
+      // `normalizedQuad` 只挡得住四个角同号为负的退化情形，挡不住"镶反了但仍在画幅内"
+      // 这种）。表现是贴合看着很稳（内点数、跟踪点都够），但视频镶的位置/朝向是错的。
+      // `[detMin,detMax]=[0.05,20]` 很宽（不会误伤真正的大角度取景，见 consts.js），
+      // 只挡数值上就说不通的解。判否走同一条 `homography_lost`：不是新失败模式，
+      // 是把已有的"跟丢了就等下一帧、丢太多次才放手"的容错接到这个漏检口上。
+      if (r.det < thresholds.detMin || r.det > thresholds.detMax) {
+        return this._miss('homography_lost', r.inliers)
+      }
 
       const quad = normalizedQuad(r.h, this._refSize, this._querySize)
       if (!quad) return this._miss('quad_implausible', r.inliers)
@@ -439,6 +452,13 @@ export class Pipeline {
     if (query.count === 0) return 0
     const r = verifyPair(query, photo, photo.id, RESEED_MIN_INLIERS)
     if (!r.h || r.inliers < RESEED_MIN_INLIERS || !r.matches) return 0
+    // 行列式范围复检，理由同 `_track` 里那一段：大角度下这一次重匹配的点又少又弱，
+    // RANSAC 偶尔会给一个数值正常但几何不合理的解（典型是镜像，行列式为负）。这里比
+    // `_track` 更值得查 —— reseed 是**整段重新跟外观匹配**（不像 `_track` 那样延续上一帧
+    // 已经跟对的点），一旦用错误的单应播种，后续几帧的跟踪会带着这个错误"看起来很稳"地
+    // 继续下去，直到下一次 reseed 或跟丢才有机会纠正。按"没补上"处理（继续用旧种子）
+    // 而不是当作硬失败，与下面这行的既有语义一致。
+    if (r.det < thresholds.detMin || r.det > thresholds.detMax) return 0
     // 复用命中那一帧的同一段筛选逻辑：只留重投影误差在 RANSAC 阈值内的点。
     this._seedTracking(src, query, r)
     return this._seedCount
