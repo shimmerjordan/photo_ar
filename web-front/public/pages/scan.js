@@ -50,6 +50,9 @@ const TIPS = {
   flow_lost: '跟丢了，正在重新识别…',
   homography_lost: '跟丢了，正在重新识别…',
   quad_implausible: '角度太斜了，正一点。',
+  // 跟踪本身没断，但连着几次外观重锚都对不上 —— 多半是大角度下贴偏了（见
+  // pipeline.MAX_REANCHOR_FAILS）。所以说的不是"跟丢了"，而是让用户正过来重认。
+  appearance_lost: '贴合可能偏了，正对照片重新识别…',
   no_seed: '重新识别…',
   forbidden: '认出来了，但这张没有授权给你。',
 }
@@ -327,6 +330,7 @@ export default {
         (m.streak ? ` 累积 ${m.streak.n}/${m.streak.need}` : '') +
         (m.tracked ? ` 光流存活=${m.tracked}` : '') +
         (m.reseeded ? ` 补种子→${m.reseeded}` : '') +
+        (m.reanchorFails ? ` 重锚失败 ${m.reanchorFails}/3` : '') +
         (m.corrected ? ' 纠正帧' : '') +
         (m.gaveUp ? ' 放手' : ''))
       // 累积命中要与单帧命中**分得开**。不分的话，跨帧累积带来的误识别会混进单帧

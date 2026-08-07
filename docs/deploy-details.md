@@ -1,20 +1,20 @@
-# 部署背后的取舍、实测数据与排障
+# 部署背后的取舍与实测数据
 
-[deploy.md](deploy.md) 只讲怎么做。这份讲**为什么这么做**、数字是怎么量出来的、
-以及出问题时怎么定位。不必顺着读，按需要翻。
+[deploy.md](deploy.md) 讲怎么做，[faq.md](faq.md) 讲出问题怎么办。**这份只讲为什么** ——
+每个数字是怎么量出来的、每个取舍舍了什么。不必顺着读，按需要翻。
 
-- [三条通道为什么这么分](#三条通道为什么这么分)
+- [两条外网通道，各跑什么](#两条外网通道各跑什么)
 - [隧道的三条硬限制](#隧道的三条硬限制)
-- [客户端选通道的规则（和一个兜底）](#客户端选通道的规则和一个兜底)
-- [要不要再加一层 Cloudflare Access](#要不要再加一层-cloudflare-access)
+- [证书不是可选项](#证书不是可选项--它同时管着相机和缓存)
+- [CDN：该缓存什么、绝对不该缓存什么](#cdn该缓存什么绝对不该缓存什么)
 - [转码与核显硬编](#转码与核显硬编)
 - [入库为什么会被拒](#入库为什么会被拒)
 - [打印那一侧：两件影响成败的事](#打印那一侧两件影响成败的事)
 - [批量入库脚本的几个设计](#批量入库脚本的几个设计)
 - [Cloudflare 加速：两篇博客的方法逐条过](#cloudflare-加速两篇博客的方法逐条过)
-- [排障](#排障)
 - [这台机器上量到的基线](#这台机器上量到的基线)
 - [升级、备份、恢复](#升级备份恢复)
+- [在开发机上跑](#在开发机上跑)
 - [不用 SSH 的那条路](#不用-ssh-的那条路)
 - [不用 GHCR 镜像的两条老路](#不用-ghcr-镜像的两条老路)
 
@@ -23,8 +23,7 @@
 ## 两条外网通道，各跑什么
 
 网页版只有**一个源、一个端口**（`/` 网页、`/admin` 管理台、`/v1/*` API），所以"走哪条
-路"完全由用户打开哪个地址决定 —— 没有客户端探活那一层了（那是已下线的安卓客户端的
-`EndpointResolver`）。
+路"完全由用户打开哪个地址决定，没有客户端探活那一层。
 
 | 通道 | 跑什么 | 什么时候用 |
 |---|---|---|
@@ -164,21 +163,13 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 
 ## 入库为什么会被拒
 
-| 状态码 | 原因 | 怎么办 |
-|---|---|---|
-| 422 `no_features` | 这张图提不出任何特征点 | 换一张纹理丰富的照片；大片天空、纯色墙面基本提不出来 |
-| 409 `already_ingested` | 同内容已入库 | photoId 是内容哈希，同内容必然同 id |
-| 409 `near_duplicate` | 与库中某张过于相似 | 会列出冲突对象。两张都留着的后果是**两张都永远认不出来** |
-| 403 `path_denied` | 路径在 `roots` 白名单外 | 响应体不回显被拒路径（免得变成探测工具），看 NAS 日志 |
+逐条对照表在 [faq.md](faq.md#入库被拒了)。这里只说**写库顺序**，因为它决定了失败时
+库会处在什么状态：
 
-`path_denied` 最常见的成因是 `/share/Photo` 和 `/share/CACHEDEV1_DATA/Photo` 混用：
-前者是符号链接。挂载时冒号两边写成一样、白名单写 `/share/Photo`，然后**别用 `find`
-出来的 CACHEDEV 路径提交**。批量脚本的 `--map` 就是为已经不一致的情况准备的。
+特征 → 自匹配 / 近重复闸门 → 缩略图 → 素材 → 转码 → **最后**写 catalog 和识别库。
 
-**写库顺序**是：特征 → 自匹配 / 近重复闸门 → 缩略图 → 素材 → 转码 →
-**最后**写 catalog 和识别库。前面任何一步失败都不留半条记录。catalog 先于识别库是
-故意的：那样失败的形状是「catalog 里有、识别不到」，`check` 能报出来、`reindex`
-能修好。
+前面任何一步失败都不留半条记录。catalog 先于识别库是故意的：那样失败的形状是
+「catalog 里有、识别不到」，`check` 能报出来、`reindex` 能修好。
 
 ## 打印那一侧：两件影响成败的事
 
@@ -189,10 +180,8 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 齐，**不是「认不出来」**，所以很容易被当成别的问题查半天。
 
 **二、能不能认出来是照片本身决定的。** 密集且分布均匀的高对比纹理最好认；大片天空、
-纯色墙面、逆光剪影、糊掉的老照片难认。（曾经有一道 arcoreimg 质量分闸门做这个预筛，
-869 张真实照片里 65% 被拒 —— 那是 ARCore 对增强图像的硬要求，随安卓客户端一起删了，
-见 decisions §46。现在的判据是**实际扫一遍**：入库后拿手机对着屏幕上的原图扫，
-几秒内锁定的就没问题。）所以：
+纯色墙面、逆光剪影、糊掉的老照片难认。**判据是实际扫一遍**：入库后拿手机对着屏幕上
+的原图扫，几秒内锁定的就没问题。所以：
 
 - **先入库、先试扫，再决定送哪几张。** 不要先把照片印好送出去了才发现认不出来
 - 一张照片印两份送两个人可以（同一份文件 → 同一个 photoId → 播同一条视频）；但
@@ -330,57 +319,7 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 
 ## 排障
 
-| 症状 | 先查什么 | 命令 |
-|---|---|---|
-| `/v1/ping` 通、识别一直未命中 | 词汇树和库对不上 | `photoar-server -c /config/config.json check`，必要时 `reindex --rebuild-words` |
-| 入库全部 422 | 正常（实测 65% 会被拒），不是故障 | 看响应里的分数，换纹理更丰富的照片 |
-| 转码特别慢 | 是不是回退软编了 | deploy.md 第 4 步那一行；`docker stats` 看 CPU 是否打满 |
-| 隧道 524 | 请求超过 125 秒 | 带视频的入库走 LAN。注意照片其实已经入进去了 |
-| 隧道 413 `upload_via_tunnel` | 单个文件超 95MiB | 那一个文件走 LAN 或 Tailscale。**小文件也报这个 = 镜像太老**（v0.1.0 及之前是"带 `CF-Ray` 就一律拒"，跟体积无关），升级镜像 |
-| 上传/入库 403 `path_denied`，什么都传不上 | `PHOTOAR_UPLOAD_DIR` 不在任何 `PHOTOAR_ROOTS` 根**里面**（典型：inbox 是 photos/videos 的兄弟目录） | 新镜像启动时会**自动收编**上传目录为一个根并打警告（看启动日志有没有"自动收编"）；老镜像要把上传目录显式加进 `PHOTOAR_ROOTS` 或挪到某个根下面 |
-| 启动日志 `[fetch-models] 取不到 XFeat 模型` | 镜像太老（那时模型要启动时从 GitHub 下载，而 NAS 连不上 github.com） | 升级镜像 —— 模型现在**打在镜像里**（4.3MB），启动时本地拷贝 + sha256 校验，不需要外网。另：**这条从来不影响网页版**，浏览器识别用的是 ORB，xfeat 是服务端识别与已下线安卓客户端用的 |
-| 隧道 502，但**容器完全健康** | ingress 写了 `http://` 而容器在说 TLS | 见下面「502 而容器是绿的」 |
-| **发了新版但行为还是旧的**（接口 400、样式没生效） | Cloudflare 的 Browser Cache TTL 覆盖了源站的 `no-cache` | 见下面「新版发了，用户拿到的还是旧的」 |
-| 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |
-| 扫描时整台 NAS 发木 | CPU 配额 | compose 里 `cpus: "3.0"` 是故意留一核给 cloudflared / QTS 的，别调到 4 |
-| `docker images` 里一堆 `<none>`，每次升级多一个 | **正常，不是故障** —— `pull` 挪走 `latest` 后上一份镜像就没 tag 了（1.1GB 一个） | 升级完跟一句带 `--filter` 的 `docker image prune`，见[升级、备份、恢复](#升级备份恢复)。别用不带过滤的版本，那会连别的服务的一起清 |
-| 容器被 OOM kill | 内存 | 本地实测峰值 1061MB / 3g 上限，还有两倍余量；真 OOM 说明库规模远超一万，调 `mem_limit` |
-| 服务拒绝启动，说三份记录条数不齐 | 入库中途断电了 | 跑 `reindex`。**这个拒绝是故意的** —— 错位一位的后果是「识别命中后播的是别人的视频」 |
-| 手机上所有通道都 401 | token 不一致 | 改了 `.env` 并重启了容器，但手机里还是旧的 |
-
-### 502 而容器是绿的
-
-2026-08-06 真踩到的，值得单列 —— 因为**所有常规检查都告诉你一切正常**：
-`docker ps` 是 `Up (healthy)`、`docker logs` 干干净净、healthcheck 也过
-（它在容器**内部**探，走的是回环，根本不经过隧道那条路）。
-
-根因：容器配了 `WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`，于是网页版在 8964 上说的是
-**TLS**；而隧道的 ingress 写的是 `service: http://localhost:8964`。cloudflared 拿明文
-去打一个 TLS 端口，连接被对端在握手阶段丢掉 → 502。
-
-**一句话确诊**（在 NAS 上）：
-
-```bash
-curl -s  -o /dev/null -w 'http  %{http_code}\n'  http://127.0.0.1:8964/healthz   # 挂掉 / 000
-curl -sk -o /dev/null -w 'https %{http_code}\n' https://127.0.0.1:8964/healthz   # 200
-```
-
-`http` 那条报 `curl: (52) Empty reply from server`、而 `https` 那条 200，就是它。
-
-两条修法，**必须二选一并保持两侧一致**：
-
-| | 容器侧 | ingress |
-|---|---|---|
-| **走隧道（推荐）** | 不设 `WEBFRONT_TLS_*` | `service: http://localhost:8964` |
-| 要保住局域网直连开相机 | 设 `WEBFRONT_TLS_*` | `service: https://localhost:8964` + `originRequest: {noTLSVerify: true}` |
-
-推荐第一条：走隧道时证书由 Cloudflare 提供，容器再包一层对公网访问**零收益**——浏览器
-看到的是 Cloudflare 的证书，容器那层它根本看不见。代价是局域网直连
-`http://192.168.x.x:8964` 不是安全上下文、**相机用不了**；但入库和管理台都不需要相机，
-所以只影响「断网退回局域网给宾客扫」这个备份方案。
-
-⚠️ 改 `WEBFRONT_TLS_*` 之后要 **`docker compose up -d`**，不能 `docker compose restart`
-—— 后者不重新读 `.env`，容器还带着老环境变量跑。
+症状对照表和逐条展开都在 [faq.md](faq.md)。这份只讲「为什么是这个数」。
 
 ## 这台机器上量到的基线
 
@@ -505,7 +444,7 @@ Run workflow，版本号在界面上填）——往 main 推代码、甚至打 g
 （HTML 与 js 都是 `no-cache`，只有 `vendor/` 和字体是 immutable）。
 
 **备份**：值钱的只有 `data/`（每个文件的作用见 [deploy/README.md](../deploy/README.md)
-的表）。`imgdb/`、`thumb/`、`playable/` 丢了只能重新入库再生成，所以别只备份
+的表）。`thumb/`、`playable/` 丢了只能重新入库再生成，所以别只备份
 `catalog.db`。SQLite 正在被写时拷出来的文件可能是坏的，停一下再拷最省心：
 
 ```bash
@@ -515,7 +454,7 @@ docker compose start
 ```
 
 一万张量级下 `data/` 的大头是 `playable/`（每条最大 16.24MiB）。空间紧的话可以只备份
-`catalog.db` + `library/` + `imgdb/` + `thumb/`，排除 `playable/` —— 它能从原视频重新
+`catalog.db` + `library/` + `thumb/`，排除 `playable/` —— 它能从原视频重新
 转码出来（代价是每条几十秒）。
 
 **恢复到一台新 NAS**：`data/` 拷回去、`vocab.npz` 用**同一份**、照片和视频原文件放回
@@ -523,6 +462,38 @@ docker compose start
 
 **换 token**：改 `.env` → `docker compose up -d` → 手机「设置」里改成新的。旧 token
 立刻失效，客户端表现是所有通道 401（原因会写在卡片下面）。
+
+## 在开发机上跑
+
+不碰 NAS，在自己机器上起同一套服务端，手机走 Tailscale 或 `adb reverse` 连过来。用的是
+覆盖层 `deploy/compose.local.yml`，和 NAS 那份的差别只有两样：照片/视频目录、镜像本地构建。
+
+```bash
+cd photo-ar
+mkdir -p local/photos/_inbox local/videos          # 素材放这儿，local/ 在 .gitignore 里
+cp .env.example .env                                # 至少填 PHOTOAR_ADMIN_PASSWORD
+
+# 把文件列表写进 .env，之后这个目录里直接 docker compose，覆盖层自动带上
+echo 'COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml' >> .env
+
+docker compose up -d --build
+```
+
+**别漏掉那个覆盖层，漏掉的后果不可逆**：主文件挂的是 NAS 的 `/share/Photo`，开发机上
+没有那个路径，dockerd 会**以 root 在你的根目录下建出来**（空目录，不报错，服务还真去
+索引它）。写进 `.env` 就没机会忘；合并规则见
+[deploy/compose.local.yml](../deploy/compose.local.yml) 顶部。
+
+起来之后 `http://127.0.0.1:8964/` 是网页版、`/admin` 是管理台，同一个端口。手机上要开
+相机就得 https，或者 `adb reverse tcp:8964 tcp:8964` 后打开 `http://localhost:8964`
+（不用证书，调试时最顺手，见 [faq.md](faq.md#局域网里自测没有隧道也没有真证书)）。
+
+两个容易踩的点：
+
+- **管理员口令写在 `.env` 里，不在 compose 里。** 这个仓库是公开的，固定口令写进
+  compose 就等于发布出去了（见 decisions.md §16）。留空就是每次去日志里翻随机口令。
+- **cpus / mem 刻意不放宽。** 验收条件之一是「在 NAS 的资源预算内跑得动」（N5095 四核）。
+  开发机放开了怎么测都快，到 NAS 上才发现撞超时 —— 那就白测了。
 
 ## 不用 SSH 的那条路
 
@@ -560,42 +531,3 @@ docker save photo-ar-server:dev | gzip -1 | ssh admin@<NAS> 'gunzip | docker loa
 
 然后在 NAS 的 `.env` 里写 `PHOTOAR_IMAGE=photo-ar-server:dev`，`up -d` 就会用它。
 
-## 新版发了，用户拿到的还是旧的
-
-**症状**：容器日志里版本号是新的，`curl` 拿到的文件是新的，边缘节点上的也是新的 ——
-只有浏览器里是旧的。表现是接口报 400（旧客户端打新服务端）、改的样式没生效、
-或者"这个功能明明修了啊"。**排查会全部指向别处**，因为三个能查的地方都显示正常。
-
-**原因**：Cloudflare 的 **Browser Cache TTL** 会**覆盖源站的 `Cache-Control`**。
-
-```
-$ curl -sI https://<你的域名>/api.js | grep -iE 'cache-control|cf-cache-status'
-cache-control: max-age=14400      ← 源站发的是 no-cache，被换掉了
-cf-cache-status: REVALIDATED
-```
-
-`max-age=14400` = 四小时内浏览器**连问都不会问**。普通刷新（F5）也不会 —— 只有
-"硬刷新"（长按刷新键 / Ctrl+Shift+R）才绕得过去，而那件事没人知道要做。
-
-HTML 不受影响（Cloudflare 默认不缓存 HTML，`/` 是 DYNAMIC），所以页面框架是新的、
-里面的 JS 是旧的 —— 这个组合让症状更难认。
-
-### 修
-
-**Cloudflare 控制台 → Caching → Configuration → Browser Cache TTL → `Respect Existing Headers`。**
-
-源站已经发的是正确的头（`no-cache` + ETag：每次问一句，没变就 304，没有下载成本），
-让 Cloudflare 别改它就行。改完再 `curl -I` 确认一次 —— 上面那行应该变成 `no-cache`。
-
-`.wasm` / `.woff2` 那两个是 URL 带内容哈希的，源站给的是
-`max-age=31536000, immutable`，Respect 之后它们仍然被长缓存，不受影响。
-
-### 应用自己也会说
-
-`web-front/public/staleguard.js`：`/staleguard.js` 带着一个**跟 JS 包一起被缓存**的
-版本号，`/api/config`（`no-store`，CDN 不缓存）带着服务端**当下**的版本号。两个不等
-就在第一屏停住并说明白，同时给一个能真正自救的按钮（`fetch(url, {cache:'reload'})`
-逐个重取再刷新 —— 普通 `location.reload()` 对还在有效期内的资源不发任何请求）。
-
-**它不能替代把 CDN 配对**：加这个探测的那一版自己救不了自己（用户手上如果是"还没有
-这段代码"的旧包，这段代码就不会跑），从下一次部署开始才生效。

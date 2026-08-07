@@ -150,6 +150,35 @@ const RESEED_COOLDOWN_MS = 400
  */
 const RESEED_MIN_INLIERS = MIN_TRACK_POINTS + 4
 
+/**
+ * 连续多少次**外观重锚失败**就判定"贴错了"，放手回到检测。
+ *
+ * ## 它解决什么
+ *
+ * 光流跟踪只保证"这些点帧间跟得住"，不保证"跟的还是那张照片"。大角度下点少又弱，
+ * 漂移与反光锁点会让四角慢慢偏到错的地方，而**内点数与跟踪点数一路都是正常的** ——
+ * 屏幕上是"贴得很稳，但贴错了"。用户报的就是这个。
+ *
+ * 而"再检查一次"这件事管线里本来就在做：`_reseed` 每 `REANCHOR_MS` 拿当前帧**重新跟
+ * 参考图做一次外观匹配**。它失败（`return 0`）意味着"照这个位置看过去，长得不像那张
+ * 照片了"—— 这正是贴错的直接证据。以前这个返回值被完全忽略（"没补上就继续用旧种子"），
+ * 于是错误的贴合可以无限期维持下去。现在连续失败到这个次数就放手。
+ *
+ * ## 为什么这次不会重蹈 §49.3 的覆辙
+ *
+ * 上一版在**每帧**的单应上查行列式幅度，而那个区间是拿检测阶段几百个点标定的；
+ * 跟踪只有十几个点，行列式估计方差大，于是在"点少"（= 大角度，正是要保护的场景）时
+ * 误伤率最高，`MAX_TRACK_MISSES=5` 又只有 ~170ms，刚锁上就被打掉。
+ *
+ * 这一版三处都不一样：判据是**外观**（ORB 重匹配）而不是数值幅度；节奏是 1.5 秒一次
+ * 而不是每帧；而且要求**连续** 3 次都失败（≈ 4.5 秒外观持续对不上）才动手。单次因为
+ * 运动模糊、遮挡而匹配不上是常态，连续 4.5 秒对不上则几乎只有一种解释。
+ *
+ * 放手的代价也小：回到检测后，如果照片其实还在画面里，下一两帧就会重新命中并重新贴上；
+ * 真的贴错了才会停在"认不出来"。
+ */
+const MAX_REANCHOR_FAILS = 3
+
 export class Pipeline {
   /**
    * @param lib `library.unpack()` 的产物
@@ -177,6 +206,12 @@ export class Pipeline {
     this._refSize = null
     this._seedCount = 0     // 命中那一帧拿到多少个种子。补种子的判据是它的比例
     this._lastReseedAt = 0
+    // 连续几次外观重锚失败（见 MAX_REANCHOR_FAILS）。**构造函数里也必须初始化** ——
+    // 只在 `reset()` 里给初值的话，第一次锁定期间它是 undefined，`undefined++` 得到
+    // NaN：`NaN >= 3` 恒假（永远不放手）、NaN 又是 falsy（诊断行也不打印），整条路
+    // 静默失效。真机上抓到的，测试与静态检查都不会响。
+    this._reseedFails = 0
+    this._corrNext = false
   }
 
   /**
@@ -204,6 +239,7 @@ export class Pipeline {
     this._prevPts = null
     this._refPts = null
     this._corrNext = false
+    this._reseedFails = 0
   }
 
   _detect(imageData) {
@@ -367,19 +403,6 @@ export class Pipeline {
       // 那件事已经在检测阶段做过了。这里只问"这些点还在不在同一个平面上"。
       const r = ransacPair(new Float32Array(keptSrc), new Float32Array(keptRef), 4)
       if (!r.h || r.inliers < MIN_TRACK_POINTS) return this._miss('homography_lost', r.inliers)
-      // 行列式范围复检 —— 大角度下漏出来的一个真洞。检测阶段的 `ransacPair.ok` 本来就查
-      // 这一条（`decideWith` 用它挑候选），但跟踪这条路只看了上面那一行的 `r.h`/`inliers`，
-      // 从没看过 `r.ok`。大角度意味着相机与照片近乎平行，可用的匹配点又少又弱
-      // （`MIN_TRACK_POINTS=12` 是数学下限，不是"匹配质量好"的门槛），RANSAC 在这种输入下
-      // 偶尔解出一个几何上不合理但**数值正常**的单应 —— 尤其是镜像解（行列式为负：
-      // `normalizedQuad` 只挡得住四个角同号为负的退化情形，挡不住"镶反了但仍在画幅内"
-      // 这种）。表现是贴合看着很稳（内点数、跟踪点都够），但视频镶的位置/朝向是错的。
-      // `[detMin,detMax]=[0.05,20]` 很宽（不会误伤真正的大角度取景，见 consts.js），
-      // 只挡数值上就说不通的解。判否走同一条 `homography_lost`：不是新失败模式，
-      // 是把已有的"跟丢了就等下一帧、丢太多次才放手"的容错接到这个漏检口上。
-      if (r.det < thresholds.detMin || r.det > thresholds.detMax) {
-        return this._miss('homography_lost', r.inliers)
-      }
 
       const quad = normalizedQuad(r.h, this._refSize, this._querySize)
       if (!quad) return this._miss('quad_implausible', r.inliers)
@@ -421,14 +444,29 @@ export class Pipeline {
       const corrected = this._corrNext === true
       this._corrNext = false
       let reseeded = 0
+      let reanchorFails = 0
       if (decayed || overdue) {
         reseeded = this._reseed(src)
-        if (reseeded) this._corrNext = true
+        if (reseeded) {
+          this._corrNext = true
+          this._reseedFails = 0
+        } else {
+          // 外观对不上了。单次不算数（运动模糊、遮挡、手抖都会让这一次匹配不上），
+          // 连续几次才判"贴错了"—— 见 MAX_REANCHOR_FAILS。
+          this._reseedFails++
+          reanchorFails = this._reseedFails
+          if (this._reseedFails >= MAX_REANCHOR_FAILS) {
+            const photoId = this.locked.photoId
+            this.reset()
+            return { quad: null, reason: 'appearance_lost', inliers: r.inliers, gaveUp: true, photoId }
+          }
+        }
       }
       return {
         quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
         photo: this.locked.photo, tracked: kept,
         ...(corrected ? { corrected: true } : {}),
+        ...(reanchorFails ? { reanchorFails } : {}),
         ...(reseeded ? { reseeded, reanchored: overdue && !decayed } : {}),
       }
     } finally {
@@ -452,13 +490,6 @@ export class Pipeline {
     if (query.count === 0) return 0
     const r = verifyPair(query, photo, photo.id, RESEED_MIN_INLIERS)
     if (!r.h || r.inliers < RESEED_MIN_INLIERS || !r.matches) return 0
-    // 行列式范围复检，理由同 `_track` 里那一段：大角度下这一次重匹配的点又少又弱，
-    // RANSAC 偶尔会给一个数值正常但几何不合理的解（典型是镜像，行列式为负）。这里比
-    // `_track` 更值得查 —— reseed 是**整段重新跟外观匹配**（不像 `_track` 那样延续上一帧
-    // 已经跟对的点），一旦用错误的单应播种，后续几帧的跟踪会带着这个错误"看起来很稳"地
-    // 继续下去，直到下一次 reseed 或跟丢才有机会纠正。按"没补上"处理（继续用旧种子）
-    // 而不是当作硬失败，与下面这行的既有语义一致。
-    if (r.det < thresholds.detMin || r.det > thresholds.detMax) return 0
     // 复用命中那一帧的同一段筛选逻辑：只留重投影误差在 RANSAC 阈值内的点。
     this._seedTracking(src, query, r)
     return this._seedCount

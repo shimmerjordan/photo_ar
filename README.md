@@ -90,8 +90,10 @@ comments for why and how.
 |---|---|
 | [docs/deploy.md](docs/deploy.md) | Step-by-step deployment: SSH → compose → hardware encoding → ingest → Tailscale → Cloudflare → open the page on a phone. Every step says what "it worked" looks like |
 | [docs/decisions.md](docs/decisions.md) | **Decision record**: why XFeat, why no global descriptor, how the thresholds were measured, how users and permissions are designed, measured latencies, and the **known risks plus what still has to be measured on real hardware** |
-| [docs/deploy-details.md](docs/deploy-details.md) | The reasoning and the numbers: why the certificate governs both the camera and the disk cache, what the CDN should and must not cache, why VAAPI instead of QuickSync, measured baselines, troubleshooting table |
-| [web-front/README.md](web-front/README.md) | The browser half: running ORB in wasm, tracking and fitting, and why there is no ARCore equivalent on the web |
+| [docs/usage.md](docs/usage.md) | Running it day to day: the admin panel, accounts and grants, uploading from a phone, bulk import |
+| [docs/faq.md](docs/faq.md) | Symptom-to-cause table and the fixes |
+| [docs/deploy-details.md](docs/deploy-details.md) | The reasoning and the numbers: why the certificate governs both the camera and the disk cache, what the CDN should and must not cache, why VAAPI instead of QuickSync, measured baselines |
+| [web-front/README.md](web-front/README.md) | The browser half: running ORB in wasm, tracking and fitting entirely in the browser |
 | [deploy/README.md](deploy/README.md) | Command cheat sheet, maintenance commands, what each file under `data/` is worth |
 | [bench/README.md](bench/README.md) | The measurement scripts behind every number quoted above |
 
@@ -136,15 +138,12 @@ surrounding comment always states the actual reason, so nothing is lost.
 
 Recognition feasibility, the NAS server, the web app (recognition, tracking,
 fitting, pixel-art UI), users and permissions, and the web admin panel are all
-done and running, with the full chain verified on a real Android/Chromium phone.
-The one-container, one-port deployment is verified locally under the NAS resource
-budget (3 CPU / 3 GiB).
+done and running, with the full chain verified on a real phone. The one-container,
+one-port deployment is verified locally under the NAS resource budget
+(3 CPU / 3 GiB).
 
-**The native Android client was retired on 2026-08-05** so that all effort goes
-into the web version: nothing to install, and it works on iOS and HarmonyOS too,
-with recognition and fitting quality that is already good enough. That code lives
-on in git history (`android/`); the reasoning is in
-[docs/decisions.md](docs/decisions.md).
+There is nothing to install: the web app is the product, and it runs on Android,
+iOS and HarmonyOS alike.
 
 Not yet verified on the target hardware: the XFeat backend's latency on the N5095
 (measured 800 ms p50 under a 3-CPU budget on a faster machine — likely too slow
