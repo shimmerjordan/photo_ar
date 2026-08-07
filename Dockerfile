@@ -111,6 +111,30 @@ COPY web-front/package.json ./web-front/
 ARG PHOTOAR_VERSION=
 ENV PHOTOAR_VERSION=$PHOTOAR_VERSION
 
+# OCI 标准标签。**主要目的不是好看，是让升级后的清理能"只清自己的"。**
+#
+# 每次 `docker compose pull` 拿到新的 `latest`，上一份镜像会**丢掉 tag 变成
+# `<none>`**（1.1GB 一个，随升级次数线性堆积）—— 这是 docker 移动 tag 的固有行为，
+# 不是配置错误。清理办法是 `docker image prune`，但**不带过滤的 prune 会清掉这台机器
+# 上所有服务的无 tag 镜像**（NAS 上还跑着 CloudDrive2 / Calibre / cloudflared /
+# explore_journal 那几个），而它是要写进文档、每次升级都跑的命令 —— 一条会伸手到项目
+# 外面的常规命令，出事时最难追。
+#
+# 有了 source 标签，清理就能精确到这个项目：
+#
+#   docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
+#
+# 顺带的好处：GHCR 靠这个标签把镜像包关联回仓库（包页面才会出现 Source repository
+# 与 README）。仓库名是 `photo_ar`（下划线），与镜像名 `photo-ar-server` 不同 ——
+# 写错的话标签在，但两头都对不上，而且不会有任何报错。
+#
+# 位置与上面的 ARG 同理：在所有 COPY 之后。version 那条每次构建都变，放这里只让
+# 这几行元数据失效（LABEL 不产生文件系统层）。
+LABEL org.opencontainers.image.source="https://github.com/shimmerjordan/photo_ar" \
+      org.opencontainers.image.title="photo-ar-server" \
+      org.opencontainers.image.description="扫一张打印出来的照片，视频就贴在照片上播" \
+      org.opencontainers.image.version="$PHOTOAR_VERSION"
+
 # 8964：spec §9.1 的 LAN endpoint 端口。合并之后**它是唯一对外的端口** ——
 # 网页版、管理台、API 全在这一个上，按 URI 分（见 docker/entrypoint.py）。
 # 后端自己退到容器内的 127.0.0.1:8965，那个端口不 EXPOSE、也打不到。

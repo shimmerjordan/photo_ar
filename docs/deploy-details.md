@@ -343,6 +343,7 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 | **发了新版但行为还是旧的**（接口 400、样式没生效） | Cloudflare 的 Browser Cache TTL 覆盖了源站的 `no-cache` | 见下面「新版发了，用户拿到的还是旧的」 |
 | 隧道 502 / 偶发失败 | Tunnel 是否 Degraded | `cloudflared tunnel info <tunnel 名>`，看连接是否分布在两个 region |
 | 扫描时整台 NAS 发木 | CPU 配额 | compose 里 `cpus: "3.0"` 是故意留一核给 cloudflared / QTS 的，别调到 4 |
+| `docker images` 里一堆 `<none>`，每次升级多一个 | **正常，不是故障** —— `pull` 挪走 `latest` 后上一份镜像就没 tag 了（1.1GB 一个） | 升级完跟一句带 `--filter` 的 `docker image prune`，见[升级、备份、恢复](#升级备份恢复)。别用不带过滤的版本，那会连别的服务的一起清 |
 | 容器被 OOM kill | 内存 | 本地实测峰值 1061MB / 3g 上限，还有两倍余量；真 OOM 说明库规模远超一万，调 `mem_limit` |
 | 服务拒绝启动，说三份记录条数不齐 | 入库中途断电了 | 跑 `reindex`。**这个拒绝是故意的** —— 错位一位的后果是「识别命中后播的是别人的视频」 |
 | 手机上所有通道都 401 | token 不一致 | 改了 `.env` 并重启了容器，但手机里还是旧的 |
@@ -402,8 +403,85 @@ curl -sk -o /dev/null -w 'https %{http_code}\n' https://127.0.0.1:8964/healthz  
 
 ## 升级、备份、恢复
 
-**升级服务端**：`docker compose pull && docker compose up -d`（自己改了代码就
-`build` 而不是 `pull`，依赖层有缓存，通常几十秒）。
+**升级服务端**。先 `cd` 到 `docker-compose.yml` 所在的那个目录 —— 照 deploy.md 第 2
+步的默认路径就是：
+
+```bash
+cd /share/Container/photo-ar
+```
+
+记不清当时选的是哪个目录，问正在跑的容器最准（这个 label 是 compose 自己打的，答案
+就是当初 `docker compose up -d` 时所在的目录，不管你实际选了哪条路径）：
+
+```bash
+docker inspect photo-ar-server --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
+
+到了那个目录（能看到 `docker-compose.yml`、`.env`、`data/`），跑：
+
+```bash
+docker compose pull && docker compose up -d
+# 清掉刚被顶掉 tag 的那份旧镜像（1.1GB 一个）
+docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
+```
+
+（自己改了代码就 `build` 而不是 `pull`，依赖层有缓存，通常几十秒。）
+
+**第三行是必须的，不是卫生习惯。** `pull` 拿到新的 `latest` 时，docker 把这个 tag
+挪到新镜像上，上一份就**丢掉全部 tag 变成 `<none>`** —— 它没被删，只是没名字了，
+1.1GB 一个，随升级次数线性堆积。这是 docker 移动 tag 的固有行为，compose 没有开关
+能关掉它（`pull` / `up --pull always` / 换 compose 版本都一样）。
+
+**为什么带那一长串 `--filter`**：不带过滤的 `docker image prune -f` 会清掉**这台机器
+上所有服务**的无 tag 镜像。在这台 NAS 上那还有 CloudDrive2、Calibre、cloudflared、
+explore_journal 的两个服务 —— 它们的孤儿镜像多半也是垃圾，但这是一条写进文档、每次
+升级都跑的命令，让它伸手到项目外面去，出事的那次最难追。过滤用的是镜像自带的
+`org.opencontainers.image.source` 标签（在 `Dockerfile` 里打，见那段注释），所以它
+**只可能**命中 photo-ar 自己的镜像。
+
+> **一次性**：标签是这次才加的，**在此之前发布的所有镜像都没有它**（`0.1.0` 与那一批
+> `sha-*` 全都没有），所以已经堆在机器上的那些 `<none>` 过滤不到。先看一眼再决定，
+> `prune` 只删无 tag 的、不碰任何正在用的镜像：
+>
+> ```bash
+> docker images -f dangling=true      # 先看要删什么，确认里面没有你手工留着的
+> docker image prune -f               # 清掉（这一次是不带过滤的全机清理）
+> ```
+>
+> 之后升级用上面那条带过滤的就够了。
+
+**如果 `<none>` 每次升级涨的不止一个**，那就不只是 tag 被顶掉，八成是这台机器在**自己
+构建**（见下一段）。这条能分辨它们 —— 老镜像没有标签，但都带着 `PHOTOAR_DATA` 这个
+环境变量，照样认得出来：
+
+```bash
+for id in $(docker images -f dangling=true -q); do
+  if docker image inspect "$id" --format '{{range .Config.Env}}{{.}} {{end}}' | grep -q PHOTOAR_DATA
+  then echo "$id  photo-ar 旧版镜像"
+  else echo "$id  别的（构建中间层 / 别的服务）"; fi
+done
+```
+
+**升级不会更新 `docker-compose.yml`。** `docker compose pull` 更新的只有镜像。这台机器
+上那份 compose 是安装时 `curl` 下来、然后你**手工改过挂载和 `PHOTOAR_ROOTS`** 的本地
+副本 —— 仓库里对它的修正不会自己过来。有一条修正**恰好和这个症状有关**：主 compose
+里曾经有 `build: .`，而 `image:` 与 `build:` 并存时，本地一旦没有那个镜像，compose 会
+**转去构建而不是 pull**（表现是突然开始拉 `node:22-trixie-slim` 和 `python:3.11-slim`
+两个基底、跑几分钟构建，还额外留下中间层镜像）。确认一句就够：
+
+```bash
+grep -nE '^[[:space:]]*build:' docker-compose.yml     # 应该什么都不输出
+```
+
+（`^[[:space:]]*` 不能省 —— 现在这份 compose 的注释里就写着"这里刻意没有 `build: .`"，
+不锚定行首的话每次都命中那行注释，然后你会去查一个不存在的问题。）
+
+有输出就把那一行（和它上面的注释）删掉 —— 部署机永远只该 `pull`。顺便对一下仓库里的
+新版，只看差异、别整份覆盖（会冲掉你改的挂载）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shimmerjordan/photo_ar/main/docker-compose.yml | diff -u docker-compose.yml - | head -40
+```
 
 镜像**只在手动跑 workflow 且勾了 publish 时**才发新的（Actions → server →
 Run workflow，版本号在界面上填）——往 main 推代码、甚至打 git tag，都不会动镜像。

@@ -3136,3 +3136,70 @@ quadfilter 原本是自适应低通（One-Euro 那一族）—— 它只会处�
 直接决定量）。**只在不稳时说话**（<16 很不稳 / <28 一般），而且说的是"怎么办"
 （正对、靠近、角度小一点）不是数字 —— 稳的时候这行字本身就是干扰。调试模式下
 另有毛刺计数与滑行状态。
+
+## 48. 第 26 轮：升级后堆积的 `<none>` 镜像
+
+用户报「NAS 部署之后**还是**会有 `<none>` 的冗余镜像」——「还是」是因为 §44 已经修过
+两样（匿名卷、主 compose 里的 `build:`），但这一样没被覆盖。
+
+### 48.1 排查过程（先排除，再确认）
+
+三条可能的成因，逐条用证据判：
+
+1. **buildx 的 attestation manifest**（provenance/SBOM 会在镜像索引里挂"unknown/unknown"
+   平台的清单，某些 docker 版本下就显示成 `<none>`）—— **排除**。直接向 GHCR 匿名取
+   `latest` 的清单，回的是 `application/vnd.docker.distribution.manifest.v2+json`
+   单一清单，不是 OCI index。原因是发布那一步用的是 `docker tag` + `docker push`
+   （见 workflow 里"不再跑一次 build-push-action"那段注释），根本没有 attestation。
+2. **多阶段构建的中间层** —— 在部署机上**不成立**（只 pull 不 build），但在"compose
+   还带 `build:`"的机器上会成立，见 48.3。
+3. **tag 被顶掉的旧镜像** —— **确认，就是它**。开发机上现成的证据：111 个 `<none>`、
+   7.9GB，其中 1.1GB 那一档全都带 `PHOTOAR_DATA` 环境变量 = 历次被顶掉的服务端镜像。
+
+机制：`docker compose pull` 拿到新的 `latest` 时，docker 把这个 tag 挪到新镜像上，
+上一份**丢掉全部 tag 变成 `<none>`**。它没被删，只是没名字了。这是 docker 移动 tag
+的固有行为，compose 侧没有开关能关掉（`pull` / `up --pull always` 都一样），所以
+**每次升级精确留下一个 1.1GB 的孤儿**。
+
+反过来说，"不让它产生"的那条路更差：钉版本号 tag 的话，旧镜像**留着 tag**，连
+`prune` 都不会碰它 —— 从"自动可清"变成"必须手动 `rmi`"。移动 `latest` 是对的，
+要补的是清理。
+
+### 48.2 为什么加 OCI 标签，而不是直接 `docker image prune -f`
+
+不带过滤的 prune 会清掉**这台机器上所有服务**的无 tag 镜像。NAS 上还跑着 CloudDrive2、
+Calibre、cloudflared、explore_journal 那两个 —— 它们的孤儿多半也是垃圾，但这是一条要
+写进文档、**每次升级都跑**的命令，让常规命令伸手到项目外面，出事的那次最难追。
+
+所以在 Dockerfile 里补了 `org.opencontainers.image.*`（此前镜像上**一个标签都没有**：
+workflow 里的 metadata-action 只产出 tag，而发布走 `docker tag` + `push`，它算出来的
+labels 从没落到镜像上）。清理于是能精确到本项目：
+
+```bash
+docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
+```
+
+验证不是推理：造一个 `FROM scratch` 的探针镜像打同样的标签，构建两次让 tag 被顶掉 ——
+dangling 从 111 涨到 112，带 label 过滤在 112 个里**精确选中 1 个**，prune 之后回到
+111，其余 111 个孤儿与 10 个在用镜像一个没动。
+
+顺带的好处：GHCR 靠 `source` 标签把镜像包关联回仓库。仓库名是 **`photo_ar`（下划线）**
+而镜像名是 `photo-ar-server` —— 按镜像名去猜正好写错，而写错不会有任何报错。
+
+**过渡**：此前发布的镜像没有标签，所以已经堆在机器上的那些过滤不到，需要一次不带
+过滤的 `docker image prune -f`（文档里给了"先 `docker images -f dangling=true` 看一眼"
+的两步版本）。
+
+### 48.3 顺带发现：升级从不更新 `docker-compose.yml`
+
+`docker compose pull` 更新的只有镜像。NAS 上那份 compose 是安装时 `curl` 下来、然后
+手工改过挂载与 `PHOTOAR_ROOTS` 的**本地副本**，仓库里对它的修正不会自己过来 ——
+也就是说 §44 删掉 `build: .` 的那次修复**很可能根本没到那台机器**。而它恰好和这个
+症状有关：`image:` 与 `build:` 并存时本地一旦缺镜像就转去构建，于是多拉两个基底镜像、
+还留下中间层孤儿。文档里因此加了三样：`^[[:space:]]*build:` 的自查、与仓库 compose
+的 `diff`（只看差异，别整份覆盖，会冲掉自己改的挂载）、以及一段能分辨孤儿来历的脚本
+（老镜像没标签，但都带 `PHOTOAR_DATA` 环境变量，照样认得出来）。
+
+那条自查命令的锚定 `^[[:space:]]*` 不是洁癖：现在这份 compose 的**注释里**就写着
+"这里刻意没有 `build: .`"，不锚定行首的话每次都命中那行注释 —— 照着文档做的人会去
+查一个不存在的问题。（写完照抄执行了一遍才发现，所以留在这儿。）

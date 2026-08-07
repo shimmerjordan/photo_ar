@@ -714,9 +714,17 @@ tcp:8964` 之后在手机上打开 `http://localhost:8964` —— 后者不用�
 
 ## 之后
 
-- **升级**：`docker compose pull && docker compose up -d`。什么时候需要动库（换
-  `vocab.npz` 必须 `reindex --rebuild-words`，否则**识别率突然掉到底而日志一切正常**）
-  见 [deploy-details.md](deploy-details.md#升级备份恢复)
+- **升级**：`docker compose pull && docker compose up -d`，然后**清掉被顶掉 tag 的
+  旧镜像** —— `pull` 会把上一份 1.1GB 的镜像变成没名字的 `<none>` 留在盘上，不清就随
+  升级次数堆积：
+
+  ```bash
+  docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
+  ```
+
+  那个 `--filter` 不能省：不带它就会连这台机器上**别的服务**的无 tag 镜像一起清。
+  什么时候需要动库（换 `vocab.npz` 必须 `reindex --rebuild-words`，否则**识别率突然
+  掉到底而日志一切正常**）见 [deploy-details.md](deploy-details.md#升级备份恢复)
 - **备份**：值钱的只有 `data/`，停机再拷：`docker compose stop && sudo tar czf
   /share/Backup/photo-ar-$(date +%F).tar.gz data/ && docker compose start`
 - **日常命令速查**（verify / check / reindex、`data/` 里每个文件的作用）：
