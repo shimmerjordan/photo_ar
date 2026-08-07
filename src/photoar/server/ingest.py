@@ -4,33 +4,33 @@
 
   1. 路径解析（白名单）→ 参考图必须是图片、必须能解开
   2. 同一张参考图已入库 → 409，不重复建条目
-  3. `arcoreimg eval-img` 质量分 < 75 → **拒绝**（spec §7/§13），返回分数与建议
-  4. 提 ORB 特征（零特征 → 拒绝）
-  5. 算自匹配分（20 张扰动查询图，`dedup.self_score`）
-  6. **近重复闸门**（`library.conflicts`）→ 有冲突 → 409，列出冲突照片
-  7. `arcoreimg build-db` 产出单目标 `.imgdb`、生成 640px 兜底缩略图
-  8. 视频：探测 → 需要则转码（产物落服务自有目录，不污染用户视频目录）
-  9. 写 catalog → 追加进识别库（重建倒排索引）
+  3. 提 ORB 特征（零特征 → 拒绝）
+  4. 算自匹配分（20 张扰动查询图，`dedup.self_score`）
+  5. **近重复闸门**（`library.conflicts`）→ 有冲突 → 409，列出冲突照片
+  6. 生成 640px 缩略图
+  7. 视频：探测 → 需要则转码（产物落服务自有目录，不污染用户视频目录）
+  8. 写 catalog → 追加进识别库（重建倒排索引）
 
-第 6 步是 Phase 0 的第一条硬结论，不是可选的健壮性措施：`asset.nas_path UNIQUE`
+第 5 步是 Phase 0 的第一条硬结论，不是可选的健壮性措施：`asset.nas_path UNIQUE`
 只挡得住同一路径重复入库，内容哈希只挡得住字节完全相同的重复。**重新编码或
 裁切过的近似重复会两份都入库，然后在识别时互相触发 ratio test 判 ambiguous，
 两份都永久漏检** —— 而用户看到的现象是"识别器坏了"，无从追查。判据的两次
 返工过程见 `photoar.dedup` 的模块 docstring。
 
-第 3 步与第 5、6 步的顺序是刻意的：质量分是一次 `arcoreimg` 调用（快），自匹配分
-要 20 次 ORB 提取 + RANSAC（约 1 秒），近重复闸门还要对 50 个候选各做两次
-RANSAC。先用便宜的检查把明显不合格的照片挡掉。
+第 5 步有一个能在管理台上关掉的开关（`appconfig` 的 `ingest.dedup_gate`），由
+HTTP 层从热配置读出来传进 `ingest_photo`。**默认必须是开的**，关掉不是"宽松
+一点"，是让两张照片双双永久扫不出来（见参数注释）。
 
-第 3 步与第 6 步各自有一个能在管理台上关掉的开关（`appconfig` 的
-`ingest.quality_gate` / `ingest.dedup_gate`），由 HTTP 层从热配置读出来传进
-`ingest_photo`。**它们默认必须是开的**，关掉的后果分别写在下面那两个参数的注释
-里 —— 尤其 dedup 那个，关掉不是"宽松一点"，是让两张照片双双永久扫不出来。
+⚠️ 这条流水线上**曾经**还有 arcoreimg 的两步：`eval-img` 质量分闸门（< 75 拒）
+和 `build-db` 产出 `.imgdb`。整条删掉了（2026-08-07，decisions §46）：两个消费方
+都是已下线的安卓客户端（质量分预测的是 ARCore 的跟踪质量、`.imgdb` 是 ARCore 的
+目标库），而那个闭源二进制因授权不入 git、发布镜像里必然没有 —— 它把每一台按文档
+部署的机器的入库都挡在 503 上。网页版识别（ORB 库 + 浏览器光流）从头到尾不碰它们；
+"太糊认不出"仍有防线：零特征拒绝 + 自匹配分 + 近重复闸门。
 
 阈值一律作为参数传进来、不在这里读 `appconfig`：本模块也被 CLI 的批量入库路径
 调（那条路径没有 AppConfig 实例），而且"谁决定阈值"只该有一处 —— 让入库自己去
-读配置的话，同一次入库的质量分下限和 HTTP 层刚校验过的那个值可能来自两次不同
-的缓存快照。
+读配置的话，同一次入库的阈值和 HTTP 层刚校验过的那个值可能来自两次不同的缓存快照。
 """
 
 import time
@@ -39,20 +39,12 @@ from pathlib import Path
 
 import cv2
 
-from .. import dedup, quality, synth, transcode
+from .. import dedup, synth, transcode
 from . import fsbrowser
 from .config import ServerConfig
 from .db import Catalog, new_id
 from .integrity import sha256_file, stat_fingerprint
 from .library import Conflict, PhotoLibrary
-
-
-# 两处 quality_too_low 共用（分数偏低、以及连关键点都不够）。用户该做的事一样，
-# 文案就该一样 —— 抄两份迟早只改一处。
-_LOW_QUALITY_SUGGESTION = (
-    "换一张纹理更丰富的照片；大片天空、纯色背景、过曝或严重模糊的"
-    "照片都拿不到高分。也可以给照片加一圈细纹理边框再打印。"
-)
 
 
 class IngestRejected(Exception):
@@ -73,9 +65,7 @@ class IngestRejected(Exception):
 @dataclass(frozen=True)
 class IngestResult:
     photo_id: str
-    quality_score: int
     self_score: int
-    imgdb_bytes: int
     print_width_m: float
     ref_asset_id: str
     video_asset_id: str | None
@@ -121,14 +111,9 @@ def ingest_photo(
     video_path: Path | None,
     print_width_m: float,
     title: str | None,
-    # ⚠️ 关掉它照片能入库，但 ARCore 跟踪会明显抖动 —— 而这个后果要等到有人举着
-    # 手机扫的时候才看得到，那时早已忘了关过这个开关。关掉只关**判定**，仍然会跑
-    # 一次 `arcoreimg eval-img` 把分数记进库（见下面那段），也仍然生成 .imgdb。
-    quality_gate: bool = True,
-    min_quality_score: int = quality.MIN_QUALITY_SCORE,
     # ⚠️ 关掉它的后果是 Phase 0 的第一条硬结论，不是"宽松一点"：两张近重复照片都
     # 入库之后，识别时它们会互相触发 ratio 检验判 ambiguous，**两张都永久扫不
-    # 出来**，而用户看到的现象是"识别器坏了"，无从追查（见模块 docstring 第 6 步
+    # 出来**，而用户看到的现象是"识别器坏了"，无从追查（见模块 docstring 第 5 步
     # 与 `library.conflicts`）。只在"我确定这两张不是同一张"或"临时排查闸门本身
     # 是不是误拦"时关，关完记得开回来。
     dedup_gate: bool = True,
@@ -175,46 +160,6 @@ def ingest_photo(
     except fsbrowser.ThumbFailed as exc:
         raise IngestRejected(415, "ref_undecodable", str(exc)) from exc
 
-    # --- 质量分（便宜，先做）---
-    #
-    # `quality_gate=False` 只关掉**判定**，eval-img 照样要跑。两个理由：
-    # `photo.quality_score` 是 NOT NULL 的，得有个真数字；而且管理台上"这张多少分"
-    # 正是用户判断"要不要换一张打印"的唯一依据 —— 闸门关着时更需要看得到分数。
-    # 想省掉这次调用的话就得往那一列写个 0 或 -1，那是往库里写假事实。
-    try:
-        score = quality.eval_img(ref_path, arcoreimg=cfg.arcoreimg)
-    except quality.ArcoreimgMissing as exc:
-        # 与闸门无关：工具本身不在，后面 build-db 一样跑不了。
-        raise IngestRejected(503, "arcoreimg_missing", str(exc)) from exc
-    except quality.NotEnoughKeypoints as exc:
-        # 连关键点都提不够 —— 就是 quality_too_low 最下面那一档，**不是**服务端故障。
-        # 用同一个 code 而不是新开一个：对调用方和用户，该做的事一模一样（换图），
-        # 多一个分支只会多一处要各自处理的地方。score=0 表达「连分都没算出来」。
-        # 实测这类照片占 `clean` 数据集的 2.1%，放量入库时不是个别现象。
-        if quality_gate:
-            raise IngestRejected(
-                422,
-                "quality_too_low",
-                f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
-                score=0,
-                minScore=min_quality_score,
-                suggestion=_LOW_QUALITY_SUGGESTION,
-            ) from exc
-        # 闸门关着：记 0 分继续走，不在这里替用户判"这张不行"。这张图大概率会在
-        # `build-db` 上失败，那时报的是 build-db 自己的错 —— 比在这里把它归到
-        # "质量不达标"更接近事实，而闸门关着的人要的正是"别拿质量拦我"。
-        score = 0
-    if quality_gate and score < min_quality_score:
-        raise IngestRejected(
-            422,
-            "quality_too_low",
-            f"这张照片的 AR 跟踪质量分只有 {score}，低于 "
-            f"{min_quality_score}，跟踪会明显抖动",
-            score=score,
-            minScore=min_quality_score,
-            suggestion=_LOW_QUALITY_SUGGESTION,
-        )
-
     # 提特征、配对、算自匹配分都必须走**库自己那个后端**，不能用模块级的
     # `features.extract`（那是 ORB）。用错的后果不是"稍微不准"：XFeat 的库 slot 是
     # 512×64 float32，把 300×32 的 uint8 描述子塞进去会在
@@ -229,7 +174,7 @@ def ingest_photo(
             f"这张照片提不出任何 {backend.name} 特征，无法识别",
         )
 
-    # --- 自匹配分 + 近重复闸门（贵，放在质量分之后）---
+    # --- 自匹配分 + 近重复闸门（这条流水线上最贵的一步）---
     #
     # 自匹配分**无论闸门开关都要算**，虽然它是这条流水线上最贵的一步（20 次 ORB
     # 提取 + RANSAC，约 1 秒）：它是**别人**入库时的分母（`library.conflicts` 的
@@ -289,19 +234,6 @@ def ingest_photo(
     photo_id = new_id()
 
     # --- 生成物 ---
-    imgdb_path = cfg.imgdb_dir / f"{photo_id}.imgdb"
-    try:
-        imgdb_bytes = quality.build_single_target_db(
-            ref_path,
-            name=photo_id,
-            print_width_m=print_width_m,
-            out_path=imgdb_path,
-            arcoreimg=cfg.arcoreimg,
-        )
-    except quality.InvalidListingField as exc:
-        # 路径里有字面 '|' 或换行。这不是服务端缺陷，用户改文件名即可。
-        raise IngestRejected(422, "bad_ref_path", str(exc)) from exc
-
     thumb_path = cfg.thumb_dir / f"{photo_id}.jpg"
     thumb_path.parent.mkdir(parents=True, exist_ok=True)
     thumb_path.write_bytes(
@@ -361,9 +293,6 @@ def ingest_photo(
         playable_asset_id=playable_asset_id,
         title=title,
         print_width_m=print_width_m,
-        quality_score=score,
-        imgdb_path=str(imgdb_path),
-        imgdb_bytes=imgdb_bytes,
         thumb_path=str(thumb_path),
         self_score=self_score,
         fit_mode=fit_mode,
@@ -377,9 +306,7 @@ def ingest_photo(
 
     return IngestResult(
         photo_id=photo_id,
-        quality_score=score,
         self_score=self_score,
-        imgdb_bytes=imgdb_bytes,
         print_width_m=print_width_m,
         ref_asset_id=ref_asset_id,
         video_asset_id=video_asset_id,
@@ -392,9 +319,7 @@ def ingest_photo(
 @dataclass(frozen=True)
 class ReplaceRefResult:
     photo_id: str
-    quality_score: int
     self_score: int
-    imgdb_bytes: int
     ref_asset_id: str
     slot: int
     elapsed_ms: int
@@ -407,8 +332,6 @@ def replace_ref(
     library: PhotoLibrary,
     photo_id: str,
     ref_path: Path,
-    quality_gate: bool = True,
-    min_quality_score: int = quality.MIN_QUALITY_SCORE,
     dedup_gate: bool = True,
     synth_long_edge: int = synth.SYNTH_LONG_EDGE,
 ) -> ReplaceRefResult:
@@ -429,15 +352,14 @@ def replace_ref(
 
     ## 顺序与失败形态
 
-    和 `ingest_photo` 同一个原则：所有可能失败的重活（质量分、特征、自匹配分、
-    去重、imgdb、缩略图）都在写库之前做完。写库分两步 —— catalog 先、library 后，
-    与 `ingest_photo` 一致，理由也一样（反过来失败会留下一个「识别得到但 catalog
+    和 `ingest_photo` 同一个原则：所有可能失败的重活（特征、自匹配分、去重、
+    缩略图）都在写库之前做完。写库分两步 —— catalog 先、library 后，与
+    `ingest_photo` 一致，理由也一样（反过来失败会留下一个「识别得到但 catalog
     里没有」的 photo_id，而那不会被任何检查报出来）。
 
     这里 catalog 先写还有一个额外的好处：`library.replace` 失败时，库里还是旧特征，
-    而 catalog 指向新的 imgdb/缩略图 —— 那是一个 `check_consistency` 之外的软不一致
-    （识别仍然按旧图工作，只是管理台上的缩略图换了）。反过来（library 先）则是
-    「识别按新图走，但 imgdb 还是旧的」，端上离线识别会拿到对不上的目标库。
+    而 catalog 指向新的缩略图 —— 那是一个 `check_consistency` 之外的软不一致
+    （识别仍然按旧图工作，只是管理台上的缩略图换了），比反过来温和。
 
     ## 去重要排除自己
 
@@ -468,33 +390,6 @@ def replace_ref(
         img = fsbrowser.decode_for_thumb(ref_path, "image")
     except fsbrowser.ThumbFailed as exc:
         raise IngestRejected(415, "ref_undecodable", str(exc)) from exc
-
-    # --- 质量分 ---
-    try:
-        score = quality.eval_img(ref_path, arcoreimg=cfg.arcoreimg)
-    except quality.ArcoreimgMissing as exc:
-        raise IngestRejected(503, "arcoreimg_missing", str(exc)) from exc
-    except quality.NotEnoughKeypoints as exc:
-        if quality_gate:
-            raise IngestRejected(
-                422,
-                "quality_too_low",
-                f"这张照片连 AR 需要的关键点都提不出来（{exc}）",
-                score=0,
-                minScore=min_quality_score,
-                suggestion=_LOW_QUALITY_SUGGESTION,
-            ) from exc
-        score = 0
-    if quality_gate and score < min_quality_score:
-        raise IngestRejected(
-            422,
-            "quality_too_low",
-            f"这张照片的 AR 跟踪质量分只有 {score}，低于 {min_quality_score}，"
-            "跟踪会明显抖动。原来那张没有被换掉。",
-            score=score,
-            minScore=min_quality_score,
-            suggestion=_LOW_QUALITY_SUGGESTION,
-        )
 
     backend = library.backend
     features = backend.extract(img)
@@ -546,19 +441,6 @@ def replace_ref(
             )
 
     # --- 生成物。文件名按 photo_id，所以是原地覆盖旧的那份 ---
-    photo = catalog.get_photo(photo_id) or {}
-    imgdb_path = cfg.imgdb_dir / f"{photo_id}.imgdb"
-    try:
-        imgdb_bytes = quality.build_single_target_db(
-            ref_path,
-            name=photo_id,
-            print_width_m=float(photo.get("print_width_m") or 0.0),
-            out_path=imgdb_path,
-            arcoreimg=cfg.arcoreimg,
-        )
-    except quality.InvalidListingField as exc:
-        raise IngestRejected(422, "bad_ref_path", str(exc)) from exc
-
     thumb_path = cfg.thumb_dir / f"{photo_id}.jpg"
     thumb_path.parent.mkdir(parents=True, exist_ok=True)
     thumb_path.write_bytes(
@@ -572,19 +454,14 @@ def replace_ref(
     catalog.set_photo_ref(
         photo_id,
         ref_asset_id=ref_asset_id,
-        quality_score=score,
         self_score=self_score,
-        imgdb_path=str(imgdb_path),
-        imgdb_bytes=imgdb_bytes,
         thumb_path=str(thumb_path),
     )
     slot = library.replace(photo_id, features)
 
     return ReplaceRefResult(
         photo_id=photo_id,
-        quality_score=score,
         self_score=self_score,
-        imgdb_bytes=imgdb_bytes,
         ref_asset_id=ref_asset_id,
         slot=slot,
         elapsed_ms=int((time.perf_counter() - t0) * 1000),

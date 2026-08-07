@@ -35,7 +35,6 @@ from typing import Any
 
 from .. import backend as backend_mod
 from .. import transcode, xfeat
-from ..quality import ARCOREIMG
 from .mediaresolve import DEFAULT_STRATEGIES
 
 DEFAULT_PORT = 8964  # spec §9.1 的 LAN endpoint 用的端口
@@ -160,7 +159,6 @@ class ServerConfig:
     models_dir: Path | None = None
     bind: str = "0.0.0.0"
     port: int = DEFAULT_PORT
-    arcoreimg: str = ARCOREIMG
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     # 转码编码器。"auto"（缺省）探测到核显就走 h264_vaapi，否则静默回退
@@ -235,22 +233,6 @@ class ServerConfig:
         return self.model_dir / vocab_file
 
     @property
-    def imgdb_dir(self) -> Path:
-        return self.data_dir / "imgdb"
-
-    @property
-    def targets_dir(self) -> Path:
-        """整库多目标 `.imgdb` 的落地目录（`server/targets.py`）。
-
-        与 `imgdb_dir` 分开：那里一张照片一个文件、文件名是 photo_id、生命周期跟着
-        照片；这里一个**授权集**一个文件、文件名是内容哈希、生命周期是"最近几个
-        版本"（会被主动清理）。混在一个目录里的话，那个清理逻辑就得学会区分两种
-        命名，而它删错的后果是把某张照片的单目标库删掉 —— 表现是那张照片进入
-        AR 之后跟踪不上，而 catalog 里一切正常。
-        """
-        return self.data_dir / "targets"
-
-    @property
     def thumb_dir(self) -> Path:
         return self.data_dir / "thumb"
 
@@ -262,8 +244,10 @@ class ServerConfig:
         # model_dir 也建出来：`build-vocab` 要往里写词表，而它可能在词表还不存在
         # （= 目录也不存在）时被调用。不建的话那次训练会在最后一步 save 失败，
         # 而训练本身可能已经跑了几分钟。
+        # 老部署的 data/ 下可能还躺着 imgdb/ 与 targets/（arcoreimg 链的产物，
+        # decisions §46 删掉了）。不主动删 —— 那是用户数据目录，留着无害。
         for d in (
-            self.data_dir, self.library_dir, self.imgdb_dir, self.targets_dir,
+            self.data_dir, self.library_dir,
             self.thumb_dir, self.playable_dir, self.model_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
@@ -344,7 +328,6 @@ class ServerConfig:
             # 于是后端在容器网络里仍然是 0.0.0.0：前面那层反代就绕得过去了。
             bind=str(os.environ.get("PHOTOAR_BIND") or doc.get("bind", "0.0.0.0")),
             port=int(os.environ.get("PHOTOAR_PORT") or doc.get("port", DEFAULT_PORT)),
-            arcoreimg=str(doc.get("arcoreimg", ARCOREIMG)),
             ffmpeg=str(doc.get("ffmpeg", "ffmpeg")),
             ffprobe=str(doc.get("ffprobe", "ffprobe")),
             video_encoder=str(doc.get("video_encoder", transcode.ENCODER_AUTO)),
@@ -379,6 +362,8 @@ class ServerConfig:
                 not in {
                     "token", "roots", "data_dir", "vocab_path", "models_dir",
                     "bind", "port",
+                    # arcoreimg 已删（decisions §46），键名留在这里是为了老
+                    # config.json 写过它的部署照常启动（落进 extra、被忽略）。
                     "arcoreimg", "ffmpeg", "ffprobe", "media", "self_score_samples",
                     "upload_dir_root", "version",
                     "video_encoder", "video_preset", "vaapi_device",

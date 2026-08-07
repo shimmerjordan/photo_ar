@@ -1,7 +1,7 @@
 """服务端测试的公共装置。
 
 spec §14.4 要求"完整入库→识别→解析→取流闭环，不依赖真实 NAS 或网盘"。这里
-把外部依赖全部替换成假二进制（arcoreimg / ffprobe / ffmpeg），因此整套服务端
+把外部依赖全部替换成假二进制（ffprobe / ffmpeg），因此整套服务端
 测试在任何机器上都能跑，不需要装 ARCore 工具链，也不需要 ffmpeg。假视频用
 "moov 在 mdat 之前"的字节头伪造 faststart —— `transcode.has_faststart` 是真的
 去读文件头的，不能靠假 ffprobe 糊过去。
@@ -376,16 +376,6 @@ class Env:
     def body_json(resp: app.Response) -> dict:
         return json.loads(resp.body.decode("utf-8"))
 
-    @property
-    def arcoreimg_calls_path(self) -> Path:
-        """假 arcoreimg 记下的 build-db 清单日志。
-
-        用途见 `tests/server/test_app_replace_ref.py` 里那条 imgdb 的用例：这个 fake
-        产出的 .imgdb 内容与输入图无关，所以「imgdb 有没有按新图重建」只能靠「build-db
-        这次拿到的清单里写的是哪张图」来验。
-        """
-        return self.tmp / "arcoreimg-calls.log"
-
     @staticmethod
     def body_bytes(resp: app.Response) -> bytes:
         if resp.file is None:
@@ -416,12 +406,11 @@ class Env:
 
 
 @pytest.fixture
-def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg, fake_video):
+def make_env(tmp_path, textured_image, fake_ffprobe, fake_ffmpeg, fake_video):
     """造一套完整服务环境。词汇树用合成图的真实 ORB 描述子训练。"""
 
     def _make(
         *,
-        quality_score: int = 85,
         self_score_samples: int = 6,
         media: dict | None = None,
         upload_dir_root: str | None = None,
@@ -465,7 +454,6 @@ def make_env(tmp_path, textured_image, fake_arcoreimg, fake_ffprobe, fake_ffmpeg
             "token": token,
             "roots": {"nas": str(nas)},
             "data_dir": str(tmp_path / "data"),
-            "arcoreimg": fake_arcoreimg(score=quality_score),
             "ffprobe": fake_ffprobe(),
             "ffmpeg": fake_ffmpeg(),
             # 指到一个不存在的路径，让编码器解析**确定地**落到软编。

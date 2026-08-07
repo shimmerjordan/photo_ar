@@ -17,14 +17,14 @@ NAS 那侧（第 1～6 步）大约半小时；手机那侧（第 7 步）十分
 
 ---
 
-## 先准备两样东西
+## 先准备一样东西
 
 | 东西 | 怎么来 |
 |---|---|
-| `arcoreimg` | ARCore SDK for Android 里的 `tools/arcoreimg/linux/arcoreimg`。闭源二进制，不可再分发，所以镜像里没有，要自己拷。**名字里的 ARCore 是历史**：安卓客户端已经下线，它现在只干一件事 —— 入库时给参考图打一个纹理质量分，把"太糊、认不出来"的照片拦在库外（那个闸门对网页版同样有用）。缺了它入库会 503 |
 | 照片、视频在 NAS 上的路径 | 例：`/share/Photo`、`/share/Video`、CloudDrive2 的 `/share/CloudDrive` |
 
-**就这两样。** 以下三样以前是必须的，现在都不是了：
+**就这一样。**（`arcoreimg` 曾经在这张表里 —— 那是已下线安卓客户端的依赖，
+整条链删掉了，见 decisions §46。）以下三样以前是必须的，现在都不是了：
 
 - **`vocab.npz`（词汇树）** —— 服务现在**没有词表也能起**，用一个空词表跑，识别结果
   完全正确，只是每次识别会全量扫描整个库（库大了变慢）。入库几十张之后在 NAS 上
@@ -79,13 +79,6 @@ curl -fsSL $R/tools/batch_ingest.py -o tools/batch_ingest.py    # 第 5 步用
 > `read-only file system`）。不需要上传功能就把 `.env` 里的 `PHOTOAR_UPLOAD_DIR`
 > 留空、并删掉 compose 里那条挂载。
 
-然后从开发机把那个不在仓库里的二进制传上来：
-
-```bash
-scp tools/arcoreimg admin@<NAS>:/share/Container/photo-ar/tools/
-ssh admin@<NAS> chmod +x /share/Container/photo-ar/tools/arcoreimg
-```
-
 改一处配置：
 
 **`.env`** —— **只有 `PHOTOAR_ROOTS` 必须看一眼**，写的是**容器内**路径：
@@ -114,7 +107,7 @@ PHOTOAR_ROOTS=照片=/share/Photo,视频=/share/Video,网盘=/share/CloudDrive
 > 挂载可写、宿主机上的目录要先 `mkdir -p`（不建的话 dockerd 会以 root 建一个空目录，
 > 不报错，然后服务真的去索引它）。
 
-**看到什么算成**：`ls tools/arcoreimg .env docker-compose.yml` 三个都在。
+**看到什么算成**：`ls .env docker-compose.yml` 都在。
 
 最后长这样：
 
@@ -123,7 +116,6 @@ PHOTOAR_ROOTS=照片=/share/Photo,视频=/share/Video,网盘=/share/CloudDrive
 ├── docker-compose.yml
 ├── .env                  ← PHOTOAR_ROOTS（token 可选）
 ├── data/                 ← 持久卷，索引、SQLite、词表、模型、缩略图、转码产物都落这里
-└── tools/arcoreimg
 ```
 
 ---
@@ -187,7 +179,7 @@ WebDAV 地址的常见写法：群晖是 `https://<host>:5006/`，Nextcloud 是
 现在配的是哪段视频，并问你要不要换成刚挑的这段。
 
 照片列表**下面**还有一段「传上来但还没入库的文件」。手机传上来的东西先落到落地目录再入库，
-中间断了（超时、质量分不过、被判近重复、或者人退出了）就会躺在那儿 —— 原来管理台上哪儿都
+中间断了（超时、被判近重复、或者人退出了）就会躺在那儿 —— 原来管理台上哪儿都
 看不到它。图片可以在那儿直接入库，视频可以挑几张照片配上去。
 
 > 媒体页在你**切回这个标签页**时会自动重取。所以在手机上加完照片，转回电脑看一眼就是新的，
@@ -588,7 +580,7 @@ adb reverse tcp:8964 tcp:8964      # 手机上的 8964 转到这台机器
 - **换视频** / **配视频** —— 当时忘了配就在这儿补
 - **试播** —— 全屏放一遍确认配对没错，不开相机
 
-> 换照片要重算特征，几十秒是正常的。如果被拒，服务端会说清原因（质量分太低 /
+> 换照片要重算特征，几十秒是正常的。如果被拒，服务端会说清原因（提不出特征 /
 > 和库里另一张近重复），并且明确告诉你**原来那张没有被换掉**。
 
 历史只记这台手机传的（换个浏览器就看不到了）。全库的映射在管理台的「媒体」页。
@@ -684,8 +676,6 @@ tcp:8964` 之后在手机上打开 `http://localhost:8964` —— 后者不用�
   compose 就等于发布出去了（理由见 [decisions.md §16](decisions.md#16-开发机上的固定口令为什么不写在-compose-里)）。
   `.env` 里填 `PHOTOAR_ADMIN_PASSWORD=admin` 就能省掉每次重建容器去日志里翻随机口令。
   留空也行，那就是每次去翻。
-- **`arcoreimg` 要自己放到 `tools/arcoreimg`。** 它是 ARCore SDK 里的闭源二进制、不可
-  再分发，所以不在仓库里；缺了入库会 503。compose 里那条挂载把它送进容器。
 - **cpus / mem 刻意不放宽。** 验收条件之一是「在 NAS 的资源预算内跑得动」（N5095 四核）。
   开发机放开了怎么测都快，然后到 NAS 上才发现撞超时 —— 那就白测了。只有专门压测上限时
   才临时放宽，改完记得改回来。
@@ -698,7 +688,7 @@ tcp:8964` 之后在手机上打开 `http://localhost:8964` —— 后者不用�
 | # | 做什么 | 看到什么算成 | 步骤 |
 |---|---|---|---|
 | 1 | 开 SSH，找到 docker | `docker compose version` 打出 v2.x | 1 |
-| 2 | 拷来 `arcoreimg`、建 `_arphoto_inbox` | 两个都在 | 准备 |
+| 2 | 建 `_arphoto_inbox` | 目录在 | 准备 |
 | 3 | 拉 compose 与 `.env`，填 `PHOTOAR_ROOTS` | 三个文件都在，冒号两边一样 | 2 |
 | 4 | `docker compose pull && up -d` | 日志 `监听 0.0.0.0:8964`，约 20s 后 `healthy` | 3 |
 | 5 | **抄走日志里那行随机管理员口令** | 登进 `/admin` 并立刻改掉 | 3 |

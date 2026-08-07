@@ -15,7 +15,7 @@ import json
 import pytest
 
 from photoar import backend as recog_backend
-from photoar import quality, recognizer, verify
+from photoar import recognizer, verify
 from photoar.server import appconfig, auth, db
 
 
@@ -66,12 +66,10 @@ def test_defaults_come_from_the_code_constants(cfg):
     assert cfg.get("recog.min_inliers") == verify.MIN_INLIERS
     assert cfg.get("recog.ratio") == verify.RATIO
     assert cfg.get("recog.top_k") == recognizer.TOP_K
-    assert cfg.get("ingest.min_quality_score") == quality.MIN_QUALITY_SCORE
     assert cfg.get("recog.backend") == recog_backend.ORB
     assert cfg.get("video.fit_mode") == db.FIT_FILL
     assert cfg.get("session.viewer_days") == auth.VIEWER_TTL_DAYS
     assert cfg.get("session.admin_hours") == auth.ADMIN_TTL_HOURS
-    assert cfg.get("ingest.quality_gate") is True
     assert cfg.get("ingest.dedup_gate") is True
 
 
@@ -104,7 +102,7 @@ def test_required_keys_exist():
     keys = {f.key for f in appconfig.FIELDS}
     assert keys >= {
         "recog.backend", "recog.min_inliers", "recog.ratio", "recog.top_k",
-        "ingest.quality_gate", "ingest.min_quality_score", "ingest.dedup_gate",
+        "ingest.dedup_gate",
         "video.fit_mode", "session.viewer_days", "session.admin_hours",
     }
 
@@ -119,7 +117,7 @@ def test_backend_switch_needs_restart_but_thresholds_do_not():
     assert by_key["session.admin_hours"].needs_restart
     assert not by_key["recog.min_inliers"].needs_restart
     assert not by_key["recog.ratio"].needs_restart
-    assert not by_key["ingest.quality_gate"].needs_restart
+    assert not by_key["ingest.dedup_gate"].needs_restart
     assert not by_key["video.fit_mode"].needs_restart
 
 
@@ -197,10 +195,10 @@ def test_string_forms_from_html_forms_are_accepted(cfg):
     assert cfg.get("recog.min_inliers") == 45
     cfg.patch({"recog.ratio": " 2.5 "})
     assert cfg.get("recog.ratio") == 2.5
-    cfg.patch({"ingest.quality_gate": "off"})
-    assert cfg.get("ingest.quality_gate") is False
-    cfg.patch({"ingest.quality_gate": "on"})
-    assert cfg.get("ingest.quality_gate") is True
+    cfg.patch({"ingest.dedup_gate": "off"})
+    assert cfg.get("ingest.dedup_gate") is False
+    cfg.patch({"ingest.dedup_gate": "on"})
+    assert cfg.get("ingest.dedup_gate") is True
 
 
 def test_int_field_rejects_non_integers(cfg):
@@ -227,9 +225,9 @@ def test_bool_is_not_an_integer_and_vice_versa(cfg):
     with pytest.raises(appconfig.BadConfigValue):
         cfg.patch({"recog.ratio": True})
     with pytest.raises(appconfig.BadConfigValue):
-        cfg.patch({"ingest.quality_gate": 2})
+        cfg.patch({"ingest.dedup_gate": 2})
     with pytest.raises(appconfig.BadConfigValue):
-        cfg.patch({"ingest.quality_gate": "maybe"})
+        cfg.patch({"ingest.dedup_gate": "maybe"})
 
 
 def test_ranges_are_enforced_at_both_ends(cfg):
@@ -238,13 +236,9 @@ def test_ranges_are_enforced_at_both_ends(cfg):
     with pytest.raises(appconfig.BadConfigValue):
         cfg.patch({"recog.min_inliers": 501})
     with pytest.raises(appconfig.BadConfigValue):
-        cfg.patch({"ingest.min_quality_score": -1})
-    with pytest.raises(appconfig.BadConfigValue):
-        cfg.patch({"ingest.min_quality_score": 101})
-    with pytest.raises(appconfig.BadConfigValue):
         cfg.patch({"recog.ratio": 0.9})
     # 边界本身是合法的（闭区间）
-    cfg.patch({"recog.min_inliers": 1, "ingest.min_quality_score": 100, "recog.ratio": 1.0})
+    cfg.patch({"recog.min_inliers": 1, "recog.ratio": 1.0})
 
 
 def test_non_finite_floats_are_rejected(cfg):
@@ -363,5 +357,5 @@ def test_unknown_stored_key_is_ignored(catalog, cfg):
 
 
 def test_stored_wrong_type_falls_back(catalog, cfg):
-    catalog.put_app_config({"ingest.quality_gate": json.dumps("maybe")})
-    assert cfg.get("ingest.quality_gate") is True
+    catalog.put_app_config({"ingest.dedup_gate": json.dumps("maybe")})
+    assert cfg.get("ingest.dedup_gate") is True

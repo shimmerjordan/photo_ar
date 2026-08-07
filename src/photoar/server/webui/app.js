@@ -1165,8 +1165,8 @@ function renderConfig() {
 
   box.appendChild(el('div', { id: 'cfg-restart' }));
 
-  // 按前缀分组，组内保持服务端给的顺序（那个顺序是 FIELDS 的声明顺序，有意义：
-  // 「质量分下限」紧跟在「要不要检查质量」后面）。
+  // 按前缀分组，组内保持服务端给的顺序（那个顺序是 FIELDS 的声明顺序，相关的
+  // 字段在声明里挨着）。
   const groups = [];
   const byPrefix = new Map();
   for (const f of c.fields) {
@@ -1402,7 +1402,7 @@ function showRestartBanner(keys) {
  *
  * 这一页原来是两个页签：「照片」（只读的库清单）和「映射」（照片↔视频）。合并了，
  * 因为它们本来就是**同一份数据的两种看法** —— 分开的结果是同一行信息在两处各显示
- * 一半：这边有质量分和贴合模式，那边有配的视频和被授权人数，而人想问的是
+ * 一半：这边有打印宽度和贴合模式，那边有配的视频和被授权人数，而人想问的是
  * 「这张照片现在到底怎么样」。
  *
  * 数据全部来自 `/v1/admin/mapping`（一次拿齐，含 fitMode / refStale / createdAt）
@@ -1495,7 +1495,6 @@ function renderByPhoto(box) {
         cls: 'mono',
         text: FIT_LABEL[p.fitMode] ? `${p.fitMode} · ${FIT_LABEL[p.fitMode]}` : String(p.fitMode),
       })),
-      td('质量分', el('span', { cls: 'mono', text: String(p.qualityScore) }), 'num'),
       td('被授权', el('span', { cls: 'mono', text: String(p.grantCount) }), 'num'),
       td('入库时间', el('span', { text: fmtTime(p.createdAt) })),
       td('操作', el('span', { cls: 'acts' }, [change, p.videoPath ? detach : null, del])),
@@ -1506,7 +1505,7 @@ function renderByPhoto(box) {
   box.appendChild(el('p', { cls: 'note', text:
     `共 ${photos.length} 张，${withVideo} 张配了视频，${photos.length - withVideo} 张还没配。` }));
   box.appendChild(table(
-    [{ sr: '缩略图' }, '照片', '视频', '打印宽度', '贴合模式', '质量分', '被授权', '入库时间', '操作'],
+    [{ sr: '缩略图' }, '照片', '视频', '打印宽度', '贴合模式', '被授权', '入库时间', '操作'],
     rows,
   ));
   renderInbox(box);
@@ -1555,7 +1554,7 @@ async function deletePhoto(p, btn) {
  * 「传上来但还没入库」那一段。
  *
  * 为什么要有：手机传上来的文件先落到落地目录，然后才入库。中间任何一步断了（入库超时、
- * 质量分不过、近重复被拒、或者人挑完视频就退出了），那个文件就躺在那儿，而**管理台上
+ * 近重复被拒、或者人挑完视频就退出了），那个文件就躺在那儿，而**管理台上
  * 任何一处都看不到它**。用户看到的是「我传上去了，但哪儿都找不到」。
  *
  * 画在照片列表**下面**而不是单开一页：它回答的是同一个问题（「我的素材在哪」）的另一半。
@@ -1602,7 +1601,7 @@ async function useInboxFile(f, btn) {
       const t = toast('ok', '正在入库…（要跑特征提取，几十秒）', null, true);
       try {
         const created = await api('POST', '/photo', body);
-        ok(`入库成功，质量分 ${created.qualityScore}。`);
+        ok('入库成功。');
       } catch (e) {
         await explainIngestFailure(e, f.path, video);
       } finally {
@@ -2541,7 +2540,7 @@ $('add-photo').addEventListener('click', async () => {
   const t = toast('ok', video ? '正在入库并配视频…（要跑特征提取，几十秒）' : '正在入库…（要跑特征提取，几十秒）', null, true);
   try {
     const created = await api('POST', '/photo', body);
-    ok(`入库成功，质量分 ${created.qualityScore}。` +
+    ok('入库成功。' +
        (video ? '' : ' 还没配视频 —— 在下面那一行点「配视频」补上，否则扫到它不会播。'));
   } catch (e) {
     await explainIngestFailure(e, ref, video);

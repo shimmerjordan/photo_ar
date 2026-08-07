@@ -62,6 +62,14 @@ MAX_TARGETS_PER_DB = 1000
 
 _SCORE_RE = re.compile(r"(\d{1,3})")
 
+# `photo.quality_score` 的哨兵：**没测过**（arcoreimg 不在，测不了）。
+#
+# 不是 0 —— 0 是一个真实的测量结果（"连关键点都提不够"那一档记的就是 0）。
+# 列是 NOT NULL（那是对的：有工具时必须写真数字，见 ingest 里的注释），所以
+# "没测过"需要一个列内哨兵而不是 NULL。API 层把它转成 null（`app._score_out`），
+# 界面显示"未测"。选 -1 是因为它在"分数"这个值域（0..100）之外，一眼假。
+UNMEASURED = -1
+
 
 class ArcoreimgMissing(RuntimeError):
     pass

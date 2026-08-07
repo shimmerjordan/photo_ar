@@ -207,7 +207,7 @@ export const createPhoto = (payload) => req('/v1/photo', { method: 'POST', body:
 export const attachVideo = (id, payload) =>
   req(`/v1/photo/${id}/video`, { method: 'POST', body: payload })
 
-/** 换参考图。服务端会重算特征与质量分，见 §21。 */
+/** 换参考图。服务端会重算特征与自匹配分，见 §21。 */
 export const replaceRef = (id, payload) =>
   req(`/v1/photo/${id}/ref`, { method: 'POST', body: payload })
 

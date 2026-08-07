@@ -205,10 +205,6 @@ services:
       # 目录不存在时 compose 会自动建一个空目录，里面没有 config.json，
       # entrypoint 于是走环境变量 —— 所以这条挂载留着是无害的。
       - ./deploy:/config:ro
-      # arcoreimg：ARCore SDK 里的闭源二进制，不可再分发，所以镜像里没有它，
-      # 由宿主机送进去（记得 chmod +x）。本地构建的镜像里已经有一份，这条挂载
-      # 只是覆盖成同一个文件，无害。
-      - ./tools/arcoreimg:/opt/photoar/tools/arcoreimg:ro
       # 照片与视频。只读挂载：这个服务永远不改用户的原始文件
       # （唯一的写入是 /v1/upload，落在下面单独一条可写挂载里）。
       - /share/Photo:/share/Photo:ro

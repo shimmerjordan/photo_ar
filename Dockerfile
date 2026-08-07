@@ -35,11 +35,8 @@
 #   h264_vaapi 是这台机器上唯一走得通的硬编。没挂 /dev/dri 时这两个包只是
 #   多占约 40MB，服务自动回退 libx264（见 transcode.resolve_encoder）。
 #   vainfo 留着是为了部署时能一条命令确认核显透进来了。
-# * arcoreimg 是 ARCore SDK 里的闭源二进制，不在仓库里（.gitignore 排除）。
-#   构建前自己放到 tools/arcoreimg。它只依赖 libstdc++/libc，能直接跑。
-# * xfeat.onnx **不进镜像**：它是几 MB 的运行时资产，进镜像等于每次发版都重传一遍，
-#   也让"换模型"必须重建镜像。由 docker/entrypoint.py 在启动时取到数据卷里
-#   （tools/fetch_models.py，幂等 + sha256 校验）。取不到不影响启动，会回退 ORB。
+# * xfeat.onnx 随镜像分发（models/，4.3MB）：曾经是启动时下载，死于"release 没发 +
+#   NAS 连不上 github.com"的叠加。entrypoint 装它时仍过 sha256 校验（_model_source）。
 
 # Node 运行时的来源。**tag 里的 trixie 必须与下面 python 那行的基底一致**（见文件头）。
 FROM node:22-trixie-slim AS nodert
@@ -80,10 +77,9 @@ COPY src/ ./src/
 # opencv-python 再装一遍普通版会白占 200MB 并覆盖掉 headless。
 RUN pip install --no-cache-dir --no-deps .
 
-# tools/ 整个目录拷进来（而不是单独拷 tools/arcoreimg）：仓库里那个文件是
-# gitignore 的，单文件 COPY 在没放二进制的构建上下文里会直接失败，而失败信息
-# 指向 Docker 而不是"你忘了放 arcoreimg"。缺了它服务照样起，只有入库会报
-# ArcoreimgMissing，信息里写着去哪儿取。
+# tools/ 整个目录拷进来（batch_ingest.py / fetch_models.py 在里面）。开发机上这个
+# 目录里可能还躺着一个 gitignore 的 arcoreimg 二进制（已删的安卓客户端时代遗产，
+# decisions §46）—— 被顺带拷进来也没关系，没有代码再引用它。
 COPY tools/ ./tools/
 COPY docker/ ./docker/
 # XFeat 模型（4.3MB，sha256 由 tools/fetch_models.py 钉住）。**打进镜像是刻意的**：
@@ -91,7 +87,6 @@ COPY docker/ ./docker/
 # 那个 release 一直没发布，而且用户的 NAS 根本连不上 github.com。模型跟着镜像走，
 # 启动就不再需要任何外网。entrypoint 仍会过一遍 sha256 校验（见 _model_source）。
 COPY models/ ./models/
-RUN chmod +x ./tools/arcoreimg 2>/dev/null || true
 
 # ---- 网页版 ----
 #

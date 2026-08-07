@@ -32,7 +32,7 @@
 #   docker compose -f docker-compose.yml -f deploy/compose.local.yml config
 #
 # 为什么是覆盖层而不是另写一份完整的 compose：主文件里那些注释（为什么限 3 核、
-# 为什么 arcoreimg 得从宿主机送进去、为什么 PHOTOAR_BACKEND 只是初始值）是真正的
+# 为什么 PHOTOAR_BACKEND 只是初始值）是真正的
 # 部署知识，抄第二份迟早分叉。这里只写「开发机和 NAS 到底哪里不一样」。
 #
 # 和 NAS 的差别就两样：
@@ -65,9 +65,6 @@ services:
     volumes: !override
       - ./data:/data
       - ./deploy:/config:ro
-      # arcoreimg 是 ARCore SDK 里的闭源二进制，不可再分发（所以 .gitignore 里有它）。
-      # 镜像里没有，由宿主机送进去。缺了不会崩，只是入库时拿不到目标图质量分。
-      - ./tools/arcoreimg:/opt/photoar/tools/arcoreimg:ro
       # 开发机上的素材。第一次跑之前先建出来：
       #   mkdir -p local/photos/_inbox local/videos
       # 想直接用现成的相册，把左半边换成真实路径即可（右半边别动，
@@ -85,8 +82,8 @@ services:
       PHOTOAR_ROOTS: 照片=/media/photos,视频=/media/videos
       # 必须落在 ROOTS 之内，且那条挂载得可写（photos 那条故意没加 :ro）
       PHOTOAR_UPLOAD_DIR: /media/photos/_inbox
-      # 0 = 启动时不碰网络找模型。orb 后端不需要任何模型文件，而 xfeat.onnx 的
-      # 默认下载地址目前是 404 —— 开着只会让每次启动多等一次超时。
+      # 0 = 启动时不装模型（本地构建的镜像里必然有内置副本，开着也只是拷 4MB，
+      # 关掉是为了让"手工放模型进卷"的调试路保持可用，见文件头）。
       PHOTOAR_FETCH_MODELS: "0"
       # 引导管理员。开发机上想用固定口令（省得每次重建容器去翻日志找那个只打印一次
       # 的随机口令），就在**仓库根目录的 `.env`** 里写：

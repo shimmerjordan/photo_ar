@@ -68,9 +68,6 @@ def test_content_change_marks_referencing_photo_stale(cat, tmp_path):
         playable_asset_id=None,
         title=None,
         print_width_m=0.152,
-        quality_score=85,
-        imgdb_path="/tmp/x.imgdb",
-        imgdb_bytes=4300,
         thumb_path="/tmp/x.jpg",
         self_score=60,
     )
@@ -101,9 +98,6 @@ def test_video_content_change_does_not_mark_photo_stale(cat, tmp_path):
         playable_asset_id=vid_id,
         title=None,
         print_width_m=0.152,
-        quality_score=85,
-        imgdb_path="/tmp/x.imgdb",
-        imgdb_bytes=4300,
         thumb_path="/tmp/x.jpg",
         self_score=60,
     )

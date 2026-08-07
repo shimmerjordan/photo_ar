@@ -227,11 +227,10 @@ export default {
           await api.attachVideo(pid, { videoPath: videoUp.nasPath })
         }
 
-        const q = created?.qualityScore
         if (videoUp) {
-          say(`成了：照片已入库${q !== undefined ? `（质量分 ${q}）` : ''}，视频已配上。`, 'ok')
+          say('成了：照片已入库，视频已配上。', 'ok')
         } else {
-          say(`照片已入库${q !== undefined ? `（质量分 ${q}）` : ''}，但**还没配视频** —— ` +
+          say('照片已入库，但**还没配视频** —— ' +
             '扫到它不会播任何东西。回来这一页挑一段视频再传一次就能补上。', 'warn')
         }
         ctx.shell.libraryChanged()

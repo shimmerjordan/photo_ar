@@ -46,7 +46,6 @@ from . import (
     integrity,
     ingest,
     mediaresolve,
-    targets,
 )
 from .appconfig import AppConfig, ConfigRejected
 from .auth import (
@@ -397,12 +396,6 @@ class Server:
         # 有人登录或跑脚本时才表现出来。让构造点必须显式给。
         auth: Auth,
         config: AppConfig,
-        # 整库多目标 `.imgdb` 的缓存。**这个**可以有默认值（与上面那两个不同）：
-        # 它没有任何外部配置，全部输入就是同一个 cfg/catalog/config，所以"自己造
-        # 一个"和"外面造一个传进来"必然等价 —— 不存在造出一个看起来正常、行为不同
-        # 的实例这种风险。可注入是为了测试能把 `max_targets` 调到 3 而不用真的入库
-        # 1001 张照片。
-        targets_store: "targets.TargetStore | None" = None,
         webui_dir: Path = WEBUI_DIR,
         # 配置里要的后端 vs 实际跑起来的后端。两者不同 = 降级（XFeat 模型不在，
         # 回退了 ORB）。**必须能从接口上看出来**，理由见 `_ping`。
@@ -416,7 +409,6 @@ class Server:
         self.resolver = resolver
         self.auth = auth
         self.config = config
-        self.targets = targets_store or targets.TargetStore(cfg, catalog, config)
         # 构造它不碰盘（目录在第一次真的要写帧时才建），所以即使这个开关一辈子
         # 不开，也不会在 data/ 下留一个空目录让人以为功能开着。
         self.frames = framedump.FrameDump(cfg.data_dir)
@@ -821,12 +813,9 @@ class Server:
             ("POST", ("recognize",), self._recognize),
             ("POST", ("recognize", "features"), self._recognize_features),
             ("GET", ("model", "xfeat"), self._model_xfeat),
-            ("GET", ("targets", "manifest"), self._targets_manifest),
-            ("GET", ("targets", "db"), self._targets_db),
             ("GET", ("photos",), self._list_photos),
             ("POST", ("photo",), self._create_photo),
             ("GET", ("photo", "*"), self._photo_detail),
-            ("GET", ("photo", "*", "imgdb"), self._photo_imgdb),
             ("GET", ("photo", "*", "thumb"), self._photo_thumb),
             ("GET", ("photo", "*", "ref"), self._photo_ref),
             ("POST", ("photo", "*", "ref"), self._photo_replace_ref),
@@ -1092,8 +1081,7 @@ class Server:
     # ---- 接口 ----
 
     def _ping(self, req: Request, prin: Principal) -> Response:
-        # spec §7："必须极轻"。探活频率由客户端的网络变化回调决定，且四个 endpoint
-        # 是并行探的。（"不查库"这一半已经**刻意**放弃了一点，见下面 targets 那段。）
+        # spec §7："必须极轻"：一次 SQL 都不查。探活频率由客户端的网络变化回调决定。
         #
         # 要鉴权、但不要任何授权：它的用途是"这条通道通不通"，viewer 也得能探
         # （客户端切网络时四个 endpoint 一起探，那是扫描前的准备动作）。
@@ -1106,16 +1094,8 @@ class Server:
         # 另开一个端点等于要求用户先怀疑有问题，而这里要防的恰恰是"用户完全没意识到
         # 跑的是另一个后端"。
         #
-        # `targets*` 那四个字段打破了"一次 SQL 都没有"：它们要一次
-        # `list_photo_targets`（一条走索引的 JOIN，行数被 ARCore 的库容量上限封在
-        # 1000 以内）加一次 sha256（几万字节的文本）。**这个代价是值得付的**，因为
-        # 现在"识别在端上"是主路径，而它的前提是那个库建好了 —— 没有这四个字段，
-        # 部署完确认这件事的唯一办法是拿手机去试。ping 的探活频率由客户端的网络变化
-        # 回调决定（不是每帧），所以"极轻"在量级上仍然成立。
-        # 它**不触发构建**（见 `TargetStore.status`）。
-        #
-        # 这四个字段是**按调用者的授权集**算的：一个 viewer 的 ping 报的是他自己那
-        # 一套的状态。这是对的 —— 他要确认的正是"我这台手机能不能离线识别"。
+        #（曾经还有四个 targets* 字段 —— 安卓端离线识别那套整库 .imgdb 的状态。
+        # 那条链整个删了，见 decisions §46；网页版对应的自检是 /api/lib 的 ETag。）
         active = self.library.backend.name
         return json_response(
             200,
@@ -1134,9 +1114,6 @@ class Server:
                 "vocabTrained": not isinstance(self.library.vocab, NullVocab),
                 "vocabWords": int(self.library.vocab.n_words),
                 "photos": len(self.library),
-                # 端上离线识别的前提：targetsVersion / targetsCount /
-                # targetsOverflow / targetsBuilding。一条 curl 就能确认它就绪。
-                **self.targets.status(prin),
             },
             **{"Cache-Control": "no-store"},
         )
@@ -1379,7 +1356,6 @@ class Server:
             "inliers": decision.inliers,
             "printWidthM": float(photo["print_width_m"]),
             "fitMode": self._fit_mode_of(photo),
-            "imgdbUrl": f"/v1/photo/{pid}/imgdb",
             "refThumbUrl": f"/v1/photo/{pid}/thumb",
             "mediaUrl": f"/v1/photo/{pid}/media",
             # 客户端「保存到相册」拿它当文件名。没有的话相册里全是
@@ -1433,88 +1409,11 @@ class Server:
 
     # ---- 端上离线识别用的整库目标 ----
 
-    def _targets_manifest(self, req: Request, prin: Principal) -> Response:
-        """`GET /v1/targets/manifest`：这个人可见的那一套整库目标的元数据。
-
-        **按调用者的授权集**给结果 —— 这是 ACL 的一部分，不是"顺手过滤一下"：
-        manifest 里有标题，而标题本身可能是隐私（"外婆生日"）。判据走
-        `targets.TargetStore`，它内部绕 `auth.photo_filter`（"谁能看全部"的唯一
-        实现处）。
-
-        要鉴权但**不要求 admin**：需要它的人正是拿着手机扫照片的 viewer。
-
-        `no-store` 而不是 ETag：这份 JSON 里有 title / fitMode / hasVideo，而它们
-        **刻意不在版本号里**（改个标题不该让全体客户端重下一遍整库，理由写在
-        `targets` 的模块 docstring）。拿版本号当 ETag 的话，改完标题的客户端会一直
-        拿到 304 —— 一个"改了但看不到"的状态。这份 JSON 是现算的，代价只有一次
-        SQL + 一次哈希。
-        """
-        return json_response(
-            200, self.targets.manifest(prin), **{"Cache-Control": "no-store"}
-        )
-
-    def _targets_db(self, req: Request, prin: Principal) -> Response:
-        """`GET /v1/targets/db`：那套整库目标的 `.imgdb` 字节。
-
-        三种正常结果，各自的状态码都有具体理由：
-
-        - **200 + ETag: "<version>"**。ETag 就是版本号本身（不是 `_static_file`
-          默认的 mtime 派生值），这样客户端能把它与 manifest 里的 `version` 直接
-          对比 —— 那是"这一对是配好的"的唯一判据（推理见 `targets` 模块 docstring
-          的"一致性"一节）。mtime 派生的 ETag 在这里还有第二个毛病：同一个版本被
-          清理后重建一次，字节完全相同而 ETag 变了，全体客户端白重下一遍。
-        - **503 + Retry-After**：正在建。这是**正常状态**而不是失败（真实建库耗时
-          未测量，可能是几十秒），所以客户端应该按 Retry-After 再来，不要报错给用户。
-        - **404 `no_targets`**：这个人一张照片都没被授权（新部署，或者管理员还没
-          发授权）。不回一个 0 字节的文件：客户端拿到 200 会认为离线识别已就绪，
-          然后每一帧都不命中，而"没有权限"与"库有问题"看起来一模一样。
-        """
-        try:
-            got = self.targets.resolve(prin)
-        except targets.BuildFailed as exc:
-            # 构建失败是**服务端故障**（arcoreimg 不在、磁盘满），不是"还没好"。
-            # 用 503 的话客户端会一直重试一个必然失败的东西，而运维那边没有任何
-            # 信号。500 + 原文让它一次就能被看见。
-            raise HttpError(
-                500, "targets_build_failed", exc.reason, version=exc.version
-            ) from exc
-        if isinstance(got, targets.Building):
-            resp = _error(
-                503,
-                "targets_building",
-                f"整库目标 {got.version} 正在构建，{got.retry_after_s} 秒后再来。"
-                f"这不是错误：端上离线识别的库是按需建的。",
-                version=got.version,
-                retryAfterS=got.retry_after_s,
-            )
-            resp.headers["Retry-After"] = str(got.retry_after_s)
-            resp.headers["Cache-Control"] = "no-store"
-            return resp
-        if not got.photo_ids:
-            raise HttpError(
-                404,
-                "no_targets",
-                "你还没有被授权任何照片，没有可下发的整库目标。"
-                "管理员在管理台发一下授权即可。",
-                version=got.version,
-            )
-        return self._static_file(
-            req,
-            got.path,
-            "application/octet-stream",
-            immutable=False,
-            # 库是会被换掉的（入库一张就是一个新版本），所以每次问一句 ETag 变了没。
-            # `immutable` 在这里会让手机上那份缓存永远不再回源。
-            cache="no-cache",
-            etag=f'"{got.version}"',
-        )
-
     def _ref_aspect(self, photo: dict[str, Any]) -> float | None:
         asset = self.catalog.get_asset(str(photo["ref_asset_id"]))
         if not asset:
             return None
-        # 取整精度在 `db.ref_aspect` 里只写一次：整库 manifest 那条路
-        # （`targets.py`）给的是同名字段，两处各自 round 一次迟早会不一样。
+        # 取整精度在 `db.ref_aspect` 里只写一次。
         return ref_aspect(asset["width_px"], asset["height_px"])
 
     def _fit_mode_of(self, photo: dict[str, Any]) -> str:
@@ -1558,7 +1457,6 @@ class Server:
                     "photoId": str(p["id"]),
                     "title": p["title"],
                     "printWidthM": float(p["print_width_m"]),
-                    "qualityScore": int(p["quality_score"]),
                     "refAspect": self._ref_aspect(p),
                     "refThumbUrl": f"/v1/photo/{p['id']}/thumb",
                     "hasVideo": p["video_asset_id"] is not None,
@@ -1583,7 +1481,6 @@ class Server:
                 "title": photo["title"],
                 "printWidthM": float(photo["print_width_m"]),
                 "fitMode": self._fit_mode_of(photo),
-                "qualityScore": int(photo["quality_score"]),
                 "selfScore": int(photo["self_score"]),
                 "refAspect": self._ref_aspect(photo),
                 "refPath": ref.get("nas_path"),
@@ -1591,7 +1488,6 @@ class Server:
                 "refStale": bool(photo["ref_stale"]),
                 "videoPath": video["nas_path"] if video else None,
                 "videoMissing": bool(video["missing"]) if video else None,
-                "imgdbBytes": int(photo["imgdb_bytes"]),
                 "createdAt": int(photo["created_at"]),
                 "updatedAt": int(photo["updated_at"]),
             },
@@ -1614,10 +1510,8 @@ class Server:
         比给这一种情况另写一遍"检查存在 → 算 ETag → 比 If-None-Match → 304"要好，
         那四步里任何一步抄漏了都只表现为"缓存偶尔不对"。
 
-        `etag` 同理，是为了 `/v1/targets/db`：那个文件的身份是**内容哈希**
-        （文件名就是它），而默认的 `fsbrowser.etag_for` 是 mtime 派生的。默认值在
-        那里有两个毛病，写在 `_targets_db` 里。给一个参数比让它自己拼一遍 304 逻辑
-        好 —— 理由与 `cache` 完全一样。
+        `etag` 让调用方能给一个**内容派生**的标识（`fsbrowser.etag_for` 的默认值
+        是 mtime 派生的），理由与 `cache` 完全一样。
         """
         if not path.is_file():
             raise HttpError(404, "not_found", f"文件不存在：{path.name}")
@@ -1629,18 +1523,6 @@ class Server:
         if (req.header("if-none-match") or "").strip() == etag:
             return Response(status=304, headers=headers)
         return Response(status=200, headers=headers, file=path)
-
-    def _photo_imgdb(self, req: Request, prin: Principal, photo_id: str) -> Response:
-        photo = self._photo_or_404(photo_id, prin)
-        # spec §7：ETag + Cache-Control immutable。.imgdb 是照片内容的函数，
-        # 内容变了 photo 会被标 ref_stale 并重新入库（换 photo_id），所以
-        # immutable 在这里是真的成立，不是图省事。
-        return self._static_file(
-            req,
-            Path(str(photo["imgdb_path"])),
-            "application/octet-stream",
-            immutable=True,
-        )
 
     def _photo_thumb(self, req: Request, prin: Principal, photo_id: str) -> Response:
         photo = self._photo_or_404(photo_id, prin)
@@ -1846,7 +1728,7 @@ class Server:
         )
 
     def _create_photo(self, req: Request, prin: Principal) -> Response:
-        # admin only：入库要读 NAS 上任意白名单路径、跑 arcoreimg 与 ffmpeg
+        # admin only：入库要读 NAS 上任意白名单路径、跑特征提取与 ffmpeg
         # （几十秒的 CPU），而且它是"库里有哪些照片"这件事的唯一入口。
         self._require_admin(prin, "入库")
         doc = req.json_body()
@@ -1899,8 +1781,6 @@ class Server:
             video_path=video,
             print_width_m=print_width_m,
             title=doc.get("title"),
-            quality_gate=bool(values["ingest.quality_gate"]),
-            min_quality_score=int(values["ingest.min_quality_score"]),
             dedup_gate=bool(values["ingest.dedup_gate"]),
             synth_long_edge=int(values["ingest.synth_long_edge"]),
             # 把**入库那一刻**的全局默认写进 photo.fit_mode，而不是留 NULL 跟随全局。
@@ -1918,9 +1798,7 @@ class Server:
             201,
             {
                 "photoId": result.photo_id,
-                "qualityScore": result.quality_score,
                 "selfScore": result.self_score,
-                "imgdbBytes": result.imgdb_bytes,
                 "printWidthM": result.print_width_m,
                 "transcoded": result.transcoded,
                 "elapsedMs": result.elapsed_ms,
@@ -1956,8 +1834,6 @@ class Server:
             library=self.library,
             photo_id=photo_id,
             ref_path=ref,
-            quality_gate=bool(values["ingest.quality_gate"]),
-            min_quality_score=int(values["ingest.min_quality_score"]),
             dedup_gate=bool(values["ingest.dedup_gate"]),
             synth_long_edge=int(values["ingest.synth_long_edge"]),
         )
@@ -1965,9 +1841,7 @@ class Server:
             200,
             {
                 "photoId": result.photo_id,
-                "qualityScore": result.quality_score,
                 "selfScore": result.self_score,
-                "imgdbBytes": result.imgdb_bytes,
                 "slot": result.slot,
                 "elapsedMs": result.elapsed_ms,
             },
@@ -2437,7 +2311,7 @@ class Server:
         就是这个形状，而 multipart 只是为了在一个请求里塞多个字段，这里只有一个文件。
 
         为什么只解析不执行：见 `batch` 模块的 docstring。要点是几十行的表逐行执行要
-        几分钟（每张照片都要跑 arcoreimg + 特征，视频还可能转码），做成一个同步接口
+        几分钟（每张照片都要跑特征提取 + 自匹配分，视频还可能转码），做成一个同步接口
         会先被反向代理的超时掐断，而且第 37 行才发现路径写错时前 36 行已经落库了。
         由浏览器拿着这份计划去逐个调既有接口，预演、进度、逐行重试就都是免费的。
         """
@@ -2996,7 +2870,6 @@ class Server:
                 "title": as_ref["title"],
                 "refThumbUrl": f"/v1/photo/{pid}/thumb",
                 "videoPath": (video or {}).get("nas_path"),
-                "qualityScore": int(as_ref["quality_score"]),
                 "createdAt": int(as_ref["created_at"]),
             }
         used = []
@@ -3176,9 +3049,6 @@ class Server:
         self._require_admin(prin, "删除照片")
         slot = self.library.retire(photo_id)
         self.catalog.delete_photo(photo_id)
-        # 整库 imgdb 不用显式作废：它的版本号是从**条目内容**算出来的
-        # （`targets._version_of`），少一张照片 → 版本变 → 端上下次同步会发现自己
-        # 那份过期。这里如果自己去删缓存文件，反而会把正在下载那一份的手机打断。
         return json_response(200, {"photoId": photo_id, "deleted": True, "slot": slot})
 
     def _mapping_snapshot(self) -> list[dict[str, Any]]:
@@ -3211,7 +3081,6 @@ class Server:
                     "videoPath": (video or {}).get("nas_path"),
                     "videoMissing": bool((video or {}).get("missing")),
                     "printWidthM": float(p["print_width_m"]),
-                    "qualityScore": int(p["quality_score"]),
                     "grantCount": grants_count.get(pid, 0),
                     # 下面这三项是给管理台的「照片」页用的。那一页把「库里有什么」和
                     # 「各自配了哪段视频」合成了一张表 —— 它们本来就是同一份数据的

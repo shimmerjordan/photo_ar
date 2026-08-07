@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .. import backend as recog_backend
-from .. import quality, recognizer, streak, synth, verify
+from .. import recognizer, streak, synth, verify
 from . import auth, db, framedump
 
 # 进程内缓存的默认 TTL（秒）。
@@ -173,29 +173,6 @@ FIELDS: tuple[Field, ...] = (
             "「举着手机晃过去偶尔扫到」也会被攒成一次命中。"
             "调低会让更多帧参与累积（更容易命中，也更容易误识别），"
             "调到「命中所需最少内点数」以上等于关掉这条路。"
-        ),
-    ),
-    Field(
-        key="ingest.quality_gate",
-        kind=KIND_BOOL,
-        default=True,
-        label="入库时检查图像质量",
-        help=(
-            "开启时质量分低于下面那个阈值的照片会被拒绝入库。关掉它照片能入库，"
-            "但 ARCore 跟踪会明显抖动 —— 而这个后果要等到有人举着手机扫的时候才看得到，"
-            "那时已经忘了是因为关过这个开关。"
-        ),
-    ),
-    Field(
-        key="ingest.min_quality_score",
-        kind=KIND_INT,
-        default=quality.MIN_QUALITY_SCORE,
-        minimum=0,
-        maximum=100,
-        label="最低图像质量分",
-        help=(
-            f"arcoreimg 给出的 0-100 分，默认 {quality.MIN_QUALITY_SCORE}。"
-            "只在上面那个开关打开时起作用。"
         ),
     ),
     Field(

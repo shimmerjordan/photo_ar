@@ -88,9 +88,6 @@ def photo_ids(catalog):
             playable_asset_id=None,
             title=f"照片{i}",
             print_width_m=0.152,
-            quality_score=90,
-            imgdb_path=f"/data/imgdb/{pid}.imgdb",
-            imgdb_bytes=4300,
             thumb_path=f"/data/thumb/{pid}.jpg",
             self_score=60,
         )
@@ -704,8 +701,7 @@ def test_backend_column_is_recorded_at_insert(catalog):
     pid = "e" * 32
     catalog.insert_photo(
         photo_id=pid, ref_asset_id=asset_id, video_asset_id=None,
-        playable_asset_id=None, title=None, print_width_m=0.1, quality_score=80,
-        imgdb_path="/x", imgdb_bytes=1, thumb_path="/t", self_score=1,
+        playable_asset_id=None, title=None, print_width_m=0.1, thumb_path="/t", self_score=1,
         backend="xfeat", fit_mode=db.FIT_FIT,
     )
     row = catalog.get_photo(pid)

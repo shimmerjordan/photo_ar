@@ -12,11 +12,6 @@
  * - 还没关联视频 → 识别出来也没东西可播
  * - 关联的视频文件不见了 → 同上，但要找的是另一个文件
  *
- * ## 质量分**不是**"扫不出来"的判据
- *
- * §35.1 推翻过这件事：一张质量分 0 的照片正常贴合，而 55 分那张从头到尾没贴上。
- * 那个分数是 `arcoreimg` 的**建议值**，与实际能不能认出来相关性很弱（实测对比度
- * r=+0.45 最强，清晰度 r=+0.10 基本没关系）。所以这里只**显示**它，不据此警示。
  */
 import * as api from '../api.js'
 import { Page } from '../navpolicy.js'
@@ -65,13 +60,11 @@ export default {
       })))
       el.appendChild(h('h1', { class: 'ttl', text: d.title || '（未命名）' }))
 
-      el.appendChild(section('尺寸与质量',
+      el.appendChild(section('尺寸与指标',
         // 0 表示"未知"，服务端与 Android 都以 0 为未知（见 §13）。显示成"未填"
         // 而不是 0mm —— 后者看起来像一个真的测量值。
         row('打印宽度', d.printWidthM > 0 ? `${Math.round(d.printWidthM * 1000)} mm` : '未填（扫的时候要轻轻晃一下手机）'),
-        row('质量分', String(d.qualityScore ?? '—'), { mono: true }),
         row('自匹配', String(d.selfScore ?? '—'), { mono: true }),
-        row('索引大小', bytes(d.imgdbBytes), { mono: true }),
         row('入库时间', when(d.createdAt))))
 
       el.appendChild(section('NAS 上的文件',

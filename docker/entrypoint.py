@@ -193,7 +193,6 @@ def _summary(cfg, layout: "Layout") -> str:
         f"{os.environ.get('PHOTOAR_BACKEND') or '（不指定，用库里 recog.backend 的值）'}",
         f"[entrypoint]   编码器      {cfg.video_encoder}（preset {cfg.video_preset}，"
         f"vaapi {cfg.vaapi_device}）",
-        f"[entrypoint]   arcoreimg   {cfg.arcoreimg}",
         f"[entrypoint]   cookie 安全 {'Secure 开' if cfg.cookie_secure else 'Secure 关（http 直连也能登录）'}",
         f"[entrypoint]   引导管理员  {cfg.admin_name}（口令：{_mask('PHOTOAR_ADMIN_PASSWORD')}）",
         f"[entrypoint]   运维凭证    {_mask('PHOTOAR_TOKEN')}",

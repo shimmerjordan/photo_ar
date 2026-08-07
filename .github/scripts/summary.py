@@ -304,18 +304,18 @@ def caveats() -> str:
 * 容器 `restart` 一次，原来的会话仍然有效 → `/data` 真的持久
 * 容器报出来的版本号确实是 `{VERSION}`（不然设置页那行是假的）
 
-覆盖不到的：`arcoreimg` 不在镜像里，所以**入库那条路在 CI 上会回 503**。这是预期的，
-那一整条的覆盖在单元测试里（`fake_arcoreimg` fixture）。
+覆盖不到的：入库全流程（特征、去重、转码）。那一整条的覆盖在单元测试里。
 
 </details>
 """
-    return f"""### 镜像里**故意**没有的三样
+    return f"""### 镜像里**故意**没有的一样
 
 | 缺什么 | 后果 | 怎么给 |
 |---|---|---|
-| `tools/arcoreimg` | 入库回 **503 `arcoreimg_missing`**，其余一切正常 | ARCore SDK 里的闭源二进制，不可再分发。自己取来挂到 `/opt/photoar/tools/arcoreimg`（记得 `chmod +x`） |
 | `vocab.npz` | 能起、能识别，但扫一扫读数显示**「无词表」**，走全量比对、慢 | 入完库再训（用的是你这批照片自己的描述子）：`docker compose exec photo-ar-server photoar-server build-vocab` |
-| `xfeat.onnx` | 自动回退 ORB，`/v1/ping` 的 `backendDegraded` 会说明 | ORB 是通过出口条件的基线，**不需要任何模型文件**；要 xfeat 见 {doc(".env.example")} |
+
+（xfeat.onnx **在**镜像里 —— 曾经要启动时下载，改成随镜像分发了；arcoreimg
+那条已下线安卓客户端的依赖链整个删了，见 {doc("docs/decisions.md", "decisions §46")}。）
 
 <details><summary><b>出问题时先看这三条</b></summary>
 

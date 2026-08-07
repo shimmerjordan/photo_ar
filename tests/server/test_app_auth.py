@@ -211,12 +211,12 @@ def test_grant_all_sees_everything_without_being_admin(env, two_photos):
 def test_viewer_cannot_reach_an_ungranted_photo(env, two_photos):
     a, b = two_photos
     viewer = env.viewer("只看 a 的人", photo_ids=[a])
-    for suffix in ("", "/imgdb", "/thumb", "/media"):
+    for suffix in ("", "/thumb", "/media"):
         r = env.get(f"/v1/photo/{b}{suffix}", as_=viewer)
         assert r.status == 403, suffix
         assert env.body_json(r)["error"] == "forbidden", suffix
     # 授权过的那张一切正常（否则上面的 403 可能只是"全都不行"）
-    for suffix in ("", "/imgdb", "/thumb", "/media"):
+    for suffix in ("", "/thumb", "/media"):
         assert env.get(f"/v1/photo/{a}{suffix}", as_=viewer).status == 200, suffix
 
 
@@ -294,8 +294,7 @@ def test_访客能做的只有登录_识别_看自己被授权的那些(env, two
     白名单里为什么是这些：
       - `ping` / `auth/*`：不登录就没有别的可谈。
       - `recognize` / `recognize/features` / `model/xfeat`：扫这件事本身。
-      - `targets/*`：端上离线识别要拉自己那份目标库（按授权范围裁过）。
-      - `photos` / `photo/<id>` 及其派生（thumb / ref / imgdb / media）与 `asset/*/stream`：
+      - `photos` / `photo/<id>` 及其派生（thumb / ref / media）与 `asset/*/stream`：
         「扫出结果」之后要能看到那张照片和播那段视频。这些全都过 `photo_filter` 或
         `_photo_or_404`，只给他被授权的那些。
     """
@@ -310,12 +309,10 @@ def test_访客能做的只有登录_识别_看自己被授权的那些(env, two
     allowed = [
         ("GET", "/v1/ping"),
         ("GET", "/v1/auth/me"),
-        ("GET", "/v1/targets/manifest"),
         ("GET", "/v1/photos"),
         ("GET", f"/v1/photo/{a}"),
         ("GET", f"/v1/photo/{a}/thumb"),
         ("GET", f"/v1/photo/{a}/ref"),
-        ("GET", f"/v1/photo/{a}/imgdb"),
         ("GET", f"/v1/photo/{a}/media"),
     ]
     if asset_id:
@@ -466,33 +463,6 @@ def test_top_k_is_passed_through(env):
     env.ingest_ok(ref)
     query, _ = synth.generate(img, count=1, seed=6)[0]
     assert env.post_frame("/v1/recognize", env.jpeg_of(query)).status == 200
-
-
-def test_quality_gate_can_be_turned_off_but_imgdb_is_still_built(make_env):
-    """闸门只关**判定**。仍然要产出 .imgdb，否则 AR 端拿不到识别目标 —— 一个
-    "入库成功"却永远播不了的条目。"""
-    env = make_env(quality_score=40)
-    ref = env.write_image("photos/lowq.jpg", seed=231)
-    assert env.ingest(ref).status == 422
-
-    assert env.patch_json("/v1/admin/config", {"ingest.quality_gate": False}).status == 200
-    pid = env.ingest_ok(ref)
-    r = env.get(f"/v1/photo/{pid}/imgdb")
-    assert r.status == 200 and len(env.body_bytes(r)) == 4300
-    # 分数仍然如实记下来：闸门关着时更需要看得到它
-    assert env.body_json(env.get(f"/v1/photo/{pid}"))["qualityScore"] == 40
-
-
-def test_min_quality_score_is_read_from_config(make_env):
-    env = make_env(quality_score=60)
-    ref = env.write_image("photos/mid.jpg", seed=232)
-    r = env.ingest(ref)
-    assert r.status == 422 and env.body_json(r)["minScore"] == 75
-
-    assert env.patch_json(
-        "/v1/admin/config", {"ingest.min_quality_score": 50}
-    ).status == 200
-    assert env.ingest(ref).status == 201
 
 
 def test_dedup_gate_can_be_turned_off(env):

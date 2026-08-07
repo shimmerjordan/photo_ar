@@ -18,7 +18,7 @@ Phase 0 的 `corpus.build_corpus` 是**全量**构建：一次扫完所有照片
 
 代价是入库路径上的一次 O(全库总词数) 重建（实测数字见 `bench/library_scan.py`
 的输出与 Phase 1 计划文档），换来的是查询路径上与 Phase 0 完全相同的语义。
-入库本来就要跑 `arcoreimg` + `ffmpeg`（秒级到分钟级），重建不是瓶颈；批量
+入库本来就要跑特征提取 + `ffmpeg`（秒级到分钟级），重建不是瓶颈；批量
 入库用 `add(..., defer_reindex=True)` 加一次 `reindex()`，只付一次。
 
 **3. 重建需要每张照片的词序列，而 `InvertedIndex` 不保留它。**

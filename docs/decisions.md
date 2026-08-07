@@ -2972,3 +2972,81 @@ compose 在本地没有 `image:` 指的那个镜像时，如果同 service 还�
 **项目目录**（第一个 -f 文件所在目录），不是覆盖层文件自己的目录 —— 第一版写了
 `build: ..`，`config` 展开后上下文跑到了仓库外面。所以 overlay 里写的是 `build: .`，
 注释里把这条规则钉住了。`docker compose config` 是唯一可信的确认方式，别猜。
+
+## 45. 第 22 轮：arcoreimg 降级为可选 —— 别让已下线客户端的依赖挡住现役客户端
+
+用户在纯网页部署上传素材，撞上 503「找不到 arcoreimg…从 ARCore SDK for Android 取」，
+问得很对：**客户端是纯网页端，为什么涉及到 ARCore Android？**
+
+### 45.1 它是怎么漏进网页版的路径的
+
+arcoreimg 在入库链上干两件事：`eval-img` 打质量分（ARCore 跟踪质量的预测器，也是
+"太糊"预筛），`build-db` 出 `.imgdb`（ARCore 的目标库）。两个消费方都是**安卓客户端**，
+而安卓客户端已下线；网页版识别用 ORB 库 + 浏览器端光流，一个字节不碰它们。
+
+要害在部署事实：这个二进制**因授权不入 git**（闭源、不可再分发），而 CI 从干净
+checkout 构建 —— **发布镜像里必然没有它**。原代码对"工具不在"一律 503，等于每一台
+按文档部署的机器都被一个已下线客户端的依赖挡住入库。开发机上从来撞不到（本地有一份、
+本地构建的镜像也有），只在真实部署上炸。
+
+### 45.2 降级的形状，三条都有讲究
+
+- **质量分记 `quality.UNMEASURED`（-1）**：列是 NOT NULL（有工具时必须写真数字），
+  "没测过"需要列内哨兵。不是 0 —— 0 是一个真实测量结果（"连关键点都提不够"那档）。
+  API 层 `_score_out` 把 -1 转成 null，界面显示「未测」；把 -1 原样发出去的话界面
+  会把"没测过"显示成负分。**不改 schema**：允许 NULL 要动 user_version，而用户刚
+  经历过一次 SchemaTooNew，为一个哨兵付一次迁移不值。
+- **`.imgdb` 不建**（imgdb_path 记空串）：唯一消费方已下线。`GET /v1/photo/<id>/imgdb`
+  对这张 404 —— 诚实，文件确实不存在。
+- **质量闸门跳过，但只跳它**：它闸的是一个测不了的属性；网页版真正的防线（自匹配分 +
+  近重复闸门）照常在跑，有测试钉住"降级时近重复仍然拦"。
+
+有工具时行为完全不变 —— 那道"65% 真实照片过不了"的预筛对网页版依然有用（纹理质量
+与 ORB 可识别性相关），文档从"必须"改成"建议"。
+
+### 45.3 一处易漏的坑，顺手写进 compose 注释
+
+compose 挂载 `./tools/arcoreimg:...` 时宿主机上没这个文件的话，dockerd 会替你建一个
+**同名空目录**挂进去。`shutil.which` 与 `Path.is_file()` 对目录都是假，所以服务端把
+它当"不存在"处理 —— 行为正确，但值得写明，免得有人看到容器里"有 arcoreimg"却报未测。
+
+## 46. 第 23 轮：整条 arcoreimg 链连根删掉（推翻 §45 的降级方案）
+
+§45 把 arcoreimg 降级成可选。用户看完的裁决是：**"把这些不需要的逻辑都删去"** ——
+既然两个消费方（质量分、`.imgdb`）都只服务已下线的安卓客户端，留一条"有工具时照旧"
+的分支就是留一份没有使用者的代码，外加一个永远显示「未测」的界面栏位。删。
+
+### 46.1 删掉的清单
+
+- **`server/targets.py` 整个模块** + `/v1/targets/manifest`、`/v1/targets/db` 两个
+  端点 + `/v1/ping` 的四个 `targets*` 字段（安卓端离线识别那套整库 `.imgdb`）；
+- **`/v1/photo/<id>/imgdb`** 端点与单目标 `.imgdb` 生成；
+- **质量分**：`eval-img` 调用、`ingest.quality_gate` / `ingest.min_quality_score`
+  两个热配置键、API 的 `qualityScore` / `imgdbBytes` 字段、两套 UI 的「质量分」
+  栏位与文案；
+- **`ServerConfig.arcoreimg`** 字段、compose 的挂载、Dockerfile 的 chmod、
+  entrypoint 摘要行、`cfg.imgdb_dir` / `cfg.targets_dir`；
+- 测试基建：`make_env` 的 `quality_score` / `arcoreimg` 参数、
+  `arcoreimg_calls_path`、以及一切断言已删行为的用例。
+
+### 46.2 刻意**没**删的
+
+- **`photoar/quality.py` 与 `tools/export_models.py` 同级的离线工具链**
+  （`corpus.py`、`cli.py` 的 `photoar build/eval`）：那是离线评测语料的工具，
+  arcoreimg 在那边**本来就是可选参数**、不在任何服务路径上，而离线重放是这个项目
+  量阈值的手段（photo-ar 的老规矩：阈值用「录一次离线重放」量）。
+- **`photo` 表的三个死列**（`quality_score` / `imgdb_path` / `imgdb_bytes`）：
+  删列要 rebuild 表 + bump `user_version`，老镜像读新库会 SchemaTooNew —— 用户刚
+  为这个吃过一次亏。列保留、恒写哨兵（-1 / '' / 0），`db.insert_photo` 的注释里
+  写明"下一次真的 schema 迁移时顺路捎走"。
+- **config.json 的 `arcoreimg` 键**在 extras 白名单里保留：老配置文件写过它的部署
+  照常启动（值落进 extra 被忽略），而不是 ConfigError 拒绝启动。
+- `.gitignore` 里的 `tools/arcoreimg` 一行：防那个 5MB 二进制哪天被顺手 add 进来。
+
+### 46.3 顺带修正的判断方法
+
+质量预筛删了之后，"这张照片认不认得出来"的判据回到**实际扫一遍**：入库后拿手机对着
+屏幕上的原图扫，几秒内锁定的就没问题（deploy-details「打印那一侧」改写了）。
+真正的防线本来就不是那个分数：零特征拒绝 + 自匹配分 + 近重复闸门都在服务端，
+浏览器端还有 streak 累积 —— §35.1 早就量过那个分数与识别成败的相关性很弱
+（对比度 r=+0.45 最强，清晰度 r=+0.10）。

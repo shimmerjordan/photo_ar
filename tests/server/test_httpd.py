@@ -342,10 +342,10 @@ def test_idle_connection_is_closed_by_socket_timeout(live, monkeypatch):
 def test_304_has_no_body(live):
     env, base = live
     pid = env.ingest_ok(env.write_image("photos/e.jpg", seed=9))
-    r1 = _open(_req(f"{base}/v1/photo/{pid}/imgdb"))
+    r1 = _open(_req(f"{base}/v1/photo/{pid}/thumb"))
     r1.read()
     etag = r1.headers["ETag"]
-    r2 = _open(_req(f"{base}/v1/photo/{pid}/imgdb", headers={"If-None-Match": etag}))
+    r2 = _open(_req(f"{base}/v1/photo/{pid}/thumb", headers={"If-None-Match": etag}))
     assert r2.status == 304
     assert r2.read() == b""
 

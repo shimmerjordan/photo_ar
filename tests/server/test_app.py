@@ -69,7 +69,6 @@ def test_ingest_then_recognize_then_resolve_then_stream(env):
     assert resp.status == 201, env.body_json(resp)
     created = env.body_json(resp)
     pid = created["photoId"]
-    assert created["qualityScore"] == 85
     assert created["printWidthM"] == 0.152
     assert created["transcoded"] is False, "1280x720/3s/faststart 不该触发转码"
     assert created["libraryPhotos"] == 1
@@ -81,7 +80,6 @@ def test_ingest_then_recognize_then_resolve_then_stream(env):
     hit = env.body_json(r)
     assert hit["matched"] is True and hit["photoId"] == pid
     assert hit["printWidthM"] == 0.152
-    assert hit["imgdbUrl"] == f"/v1/photo/{pid}/imgdb"
     assert hit["mediaUrl"] == f"/v1/photo/{pid}/media"
     assert abs(hit["refAspect"] - 1200 / 800) < 1e-3
     assert hit["inliers"] >= 40
@@ -164,41 +162,6 @@ def test_ingest_rejects_non_image(env):
     p.write_text("hello", encoding="utf-8")
     r = env.post_json("/v1/photo", {"refPath": str(p), "printWidthMm": 152})
     assert r.status == 415 and env.body_json(r)["error"] == "ref_not_image"
-
-
-def test_ingest_rejects_low_quality_with_actionable_detail(make_env):
-    """spec §13：质量分不足要返回分数与建议，不能只说 bad request。"""
-    env = make_env(quality_score=40)
-    ref = env.write_image("photos/d.jpg", seed=8)
-    r = env.ingest(ref)
-    assert r.status == 422
-    body = env.body_json(r)
-    assert body["error"] == "quality_too_low"
-    assert body["score"] == 40 and body["minScore"] == 75
-    assert body["suggestion"]
-
-
-def test_ingest_rejects_keypointless_photo_with_422_not_500(env, fake_arcoreimg):
-    """arcoreimg 连关键点都提不够 → 422，**不是** 500。
-
-    这一条是放量模拟里找到的：3030 次入库尝试有 65 次（2.1%）撞上纹理不足到
-    arcoreimg 拒绝出分的照片，全部返回 500 + 一整个 traceback。两个后果都真实：
-    调用方看到 5xx 会当成「服务端故障」去重试（同一张图重试一万次结果一样），
-    而一万张的批量入库会往日志里灌两百多个栈，把真正的服务端故障淹掉。
-
-    用 quality_too_low 这同一个 code：对调用方和用户，该做的事一模一样（换图）。
-    """
-    ref = env.write_image("photos/flat.jpg", seed=21)
-    env.cfg.arcoreimg = fake_arcoreimg(
-        exit_code=1, stderr="Failed to get enough keypoints from target image."
-    )
-    r = env.ingest(ref)
-    assert r.status == 422
-    body = env.body_json(r)
-    assert body["error"] == "quality_too_low"
-    # score 0 = 连分都没算出来，落在最差那一档
-    assert body["score"] == 0 and body["minScore"] == 75
-    assert body["suggestion"]
 
 
 def test_ingest_same_path_twice_is_409(env):
@@ -320,19 +283,6 @@ def test_recognize_reports_orphan_as_miss(env):
 # ---- 静态产物 ----
 
 
-def test_imgdb_is_served_with_immutable_etag(env):
-    pid = env.ingest_ok(env.write_image("photos/i.jpg", seed=40))
-    r = env.get(f"/v1/photo/{pid}/imgdb")
-    assert r.status == 200
-    assert r.headers["Content-Type"] == "application/octet-stream"
-    assert "immutable" in r.headers["Cache-Control"]
-    assert len(env.body_bytes(r)) == 4300
-    etag = r.headers["ETag"]
-
-    r2 = env.get(f"/v1/photo/{pid}/imgdb", headers={"if-none-match": etag})
-    assert r2.status == 304 and r2.content_length == 0
-
-
 def test_thumb_is_jpeg(env):
     pid = env.ingest_ok(env.write_image("photos/j.jpg", seed=41))
     r = env.get(f"/v1/photo/{pid}/thumb")
@@ -342,7 +292,7 @@ def test_thumb_is_jpeg(env):
 
 def test_bad_photo_id_is_404_not_500(env):
     for pid in ("nope", "../../etc/passwd", "z" * 32):
-        assert env.get(f"/v1/photo/{pid}/imgdb").status == 404
+        assert env.get(f"/v1/photo/{pid}/thumb").status == 404
 
 
 # ---- 文件浏览 ----

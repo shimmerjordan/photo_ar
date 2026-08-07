@@ -25,7 +25,7 @@
 
 schema v2（多用户 / 会话 / 按用户授权 / 热配置）在 `_DDL_V2` 里，设计取舍见那段
 注释。这里只记一条全局性的：v1 的库文件必须能**原地**升上来。家里那台 NAS 上
-已经躺着一个入过库的 catalog.db，"重建库"意味着重新跑一遍 arcoreimg 与转码
+已经躺着一个入过库的 catalog.db，"重建库"意味着重新跑一遍特征提取与转码
 （每张照片几十秒），所以"删库重来"从来不是一个可选项。
 """
 
@@ -487,9 +487,6 @@ class Catalog:
         playable_asset_id: str | None,
         title: str | None,
         print_width_m: float,
-        quality_score: int,
-        imgdb_path: str,
-        imgdb_bytes: int,
         thumb_path: str,
         self_score: int,
         fit_mode: str | None = None,
@@ -497,7 +494,13 @@ class Catalog:
     ) -> str:
         """`fit_mode=None` 表示跟随全局配置，`backend=None` 表示 ORB（见
         `_PHOTO_V2_COLUMNS`）。两个都给默认值是为了让 v1 时期的调用点一行不改
-        就继续成立 —— 它们当时的行为正好就是这两个 None 的含义。"""
+        就继续成立 —— 它们当时的行为正好就是这两个 None 的含义。
+
+        ⚠️ `quality_score` / `imgdb_path` / `imgdb_bytes` 是**死列**：整条 arcoreimg
+        链删掉之后（decisions §46）没有任何读者，恒写哨兵（-1 / '' / 0）。列本身
+        保留是刻意的 —— 删列要 rebuild 表 + bump user_version，老镜像读新库会
+        SchemaTooNew（用户刚为这个吃过一次亏），为三个死列付一次迁移不值。哪天真有
+        下一次 schema 迁移，顺路把它们捎走。"""
         if fit_mode is not None and fit_mode not in FIT_MODES:
             raise ValueError(f"photo.fit_mode 只能是 {FIT_MODES}，收到 {fit_mode!r}")
         ts = now_ms()
@@ -511,8 +514,8 @@ class Catalog:
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)",
                 (
                     photo_id, ref_asset_id, video_asset_id, playable_asset_id,
-                    title, float(print_width_m), int(quality_score), imgdb_path,
-                    int(imgdb_bytes), thumb_path, int(self_score), ts, ts,
+                    title, float(print_width_m), -1, "",
+                    0, thumb_path, int(self_score), ts, ts,
                     fit_mode, backend,
                 ),
             )
@@ -568,42 +571,6 @@ class Catalog:
             )
         ]
 
-    def list_photo_targets(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
-        """建整库 `.imgdb` 与它的 manifest 需要的**全部**信息，一次查询取完。
-
-        `photo.*` 加上参考图 asset 的 `nas_path` / `sha256` / `missing` / 宽高
-        （前缀 `ref_`）。
-
-        为什么是一次 JOIN 而不是"`list_photos()` 再逐张 `get_asset()`"：后者是
-        N+1 次查询，而这里的 N 上限是 1000（ARCore 的库容量上限），且这条路会被
-        `/v1/ping` 调到 —— ping 的契约是"极轻"。1000 次 SQLite 往返在本地磁盘上
-        是几十毫秒，在 QNAP 的机械盘上不好说，而这个代价完全是白付的。
-        （`list_photos` 那条路仍然是 N+1，那是既有行为，不在这次改动范围内。）
-
-        `ORDER BY created_at DESC, id DESC`：超出容量上限时要留下"最新的 N 张"
-        （理由见 `targets.TargetStore._plan`）。第二个排序键不是装饰 —— 批量入库
-        时同一毫秒里可以进好几张，只按 created_at 排的话这几张的相对顺序由 SQLite
-        决定，于是"截断后留下哪些"在两次调用之间可能不一样，而版本号是那个集合的
-        哈希：结果是版本号在没有任何东西改变的情况下来回跳，每跳一次全体客户端
-        重下一遍整库。
-        """
-        join, cond, args = self._grant_scope(user_id)
-        return [
-            dict(r)
-            for r in self._conn().execute(
-                "SELECT photo.*,"
-                " asset.nas_path AS ref_path,"
-                " asset.sha256   AS ref_sha256,"
-                " asset.missing  AS ref_missing,"
-                " asset.width_px AS ref_width_px,"
-                " asset.height_px AS ref_height_px"
-                " FROM photo JOIN asset ON asset.id = photo.ref_asset_id"
-                f"{join} WHERE {cond}"
-                " ORDER BY photo.created_at DESC, photo.id DESC",
-                args,
-            )
-        ]
-
     def count_photos(self, *, user_id: str | None = None) -> int:
         join, cond, args = self._grant_scope(user_id)
         return int(
@@ -654,10 +621,7 @@ class Catalog:
         photo_id: str,
         *,
         ref_asset_id: str,
-        quality_score: int,
         self_score: int,
-        imgdb_path: str,
-        imgdb_bytes: int,
         thumb_path: str,
     ) -> None:
         """换掉这张照片的参考图，以及跟着参考图变的那几列。
@@ -674,13 +638,12 @@ class Catalog:
         with self._write_lock:
             conn = self._conn()
             conn.execute(
-                "UPDATE photo SET ref_asset_id = ?, quality_score = ?,"
-                " self_score = ?, imgdb_path = ?, imgdb_bytes = ?,"
+                # quality_score/imgdb_* 是死列（见 insert_photo），这里同步写哨兵：
+                # 换参考图之后旧 .imgdb 已经不对应新图，留旧值比留哨兵更误导。
+                "UPDATE photo SET ref_asset_id = ?, quality_score = -1,"
+                " self_score = ?, imgdb_path = '', imgdb_bytes = 0,"
                 " thumb_path = ?, ref_stale = 0, updated_at = ? WHERE id = ?",
-                (
-                    ref_asset_id, int(quality_score), int(self_score),
-                    imgdb_path, int(imgdb_bytes), thumb_path, now_ms(), photo_id,
-                ),
+                (ref_asset_id, int(self_score), thumb_path, now_ms(), photo_id),
             )
             conn.commit()
 

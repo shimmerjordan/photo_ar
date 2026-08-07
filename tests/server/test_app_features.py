@@ -118,7 +118,6 @@ def test_ingest_then_recognize_by_features(xenv):
     hit = xenv.body_json(r)
     assert hit["matched"] is True and hit["photoId"] == pid
     assert hit["printWidthM"] == 0.152
-    assert hit["imgdbUrl"] == f"/v1/photo/{pid}/imgdb"
     assert hit["refThumbUrl"] == f"/v1/photo/{pid}/thumb"
     assert hit["mediaUrl"] == f"/v1/photo/{pid}/media"
     assert hit["inliers"] >= 40

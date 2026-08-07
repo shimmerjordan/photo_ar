@@ -68,8 +68,7 @@ def test_换完之后基本信息更新了(make_env):
     assert resp.status == 200, env.body_json(resp)
     doc = env.body_json(resp)
     assert doc["photoId"] == pid
-    assert doc["qualityScore"] > 0
-    assert doc["imgdbBytes"] > 0
+    assert doc["selfScore"] > 0
 
     detail = env.body_json(env.get(f"/v1/photo/{pid}"))
     assert detail["refPath"] == str(new_ref), "参考图路径要指向新文件"
@@ -156,29 +155,6 @@ def test_缩略图换成新图了(make_env):
     assert after != before, "缩略图要跟着换"
 
 
-def test_imgdb_按新图重建了(make_env):
-    # 端上离线识别用的是这份。不重建的话离线扫的还是旧图、在线扫的是新图 ——
-    # 一个只在没网时才现形的不一致。
-    #
-    # ⚠️ **不能**比较 imgdb 的字节：假 arcoreimg 产出的内容与输入图无关（固定一串 X），
-    # 前后必然相同，那样的断言恒绿等于没测。唯一的真实证据是「这次 build-db 拿到的清单
-    # 里写的是哪张图」，所以查 fake 记下的调用日志。
-    env = make_env()
-    pid = env.ingest_ok(env.write_image("photos/a.jpg", seed=1))
-    new_ref = env.write_image("photos/new.jpg", seed=42)
-    calls = env.arcoreimg_calls_path
-    before = calls.read_text("utf-8") if calls.exists() else ""
-
-    resp = env.post_json(f"/v1/photo/{pid}/ref", {"refPath": str(new_ref)})
-    assert resp.status == 200, env.body_json(resp)
-
-    added = calls.read_text("utf-8")[len(before):]
-    assert str(new_ref) in added, "build-db 应该拿新参考图重跑一次"
-    assert env.body_json(resp)["imgdbBytes"] > 0
-    # 而且那份 imgdb 仍然取得到（路径按 photo_id，是原地覆盖旧的那份）
-    assert env.get(f"/v1/photo/{pid}/imgdb").status == 200
-
-
 def test_换完之后新图能识别出来(make_env):
     env = make_env()
     pid = env.ingest_ok(env.write_image("photos/a.jpg", seed=1))
@@ -227,30 +203,6 @@ def test_和别人近重复时拒绝_并说明原图没被换掉(make_env):
     assert "没有被换掉" in doc["message"]
     # 而且真的没换
     assert env.body_json(env.get(f"/v1/photo/{pid_a}"))["refPath"] == before
-
-
-def test_质量分不够时拒绝_并说明原图没被换掉(make_env):
-    # 假 arcoreimg 给的分数是固定的（fixture 默认 85），所以「换的时候不达标」只能靠
-    # **把下限调到 85 以上**来造 —— 不能在 fixture 上把分数压低，那样连最初的入库都
-    # 会先失败，测不到替换这条路。
-    env = make_env()
-    pid = env.ingest_ok(env.write_image("photos/a.jpg", seed=1))
-    before = env.body_json(env.get(f"/v1/photo/{pid}"))["refPath"]
-    ok = env.patch_json(
-        "/v1/admin/config",
-        {"ingest.quality_gate": True, "ingest.min_quality_score": 95},
-    )
-    assert ok.status == 200, env.body_json(ok)
-
-    resp = env.post_json(
-        f"/v1/photo/{pid}/ref",
-        {"refPath": str(env.write_image("photos/new.jpg", seed=42))},
-    )
-    assert resp.status == 422
-    doc = env.body_json(resp)
-    assert doc["error"] == "quality_too_low"
-    assert "没有被换掉" in doc["message"]
-    assert env.body_json(env.get(f"/v1/photo/{pid}"))["refPath"] == before
 
 
 def test_不是图片(make_env):
