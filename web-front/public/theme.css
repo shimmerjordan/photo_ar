@@ -451,9 +451,19 @@ label { display: block; }
   overflow: hidden;
 }
 #bar[hidden] { display: none; }
-/* `.bar2` 是**面板内**的那一条（素材页），紧跟在按钮行下面。`#bar` 是扫描页压在
-   相机预览上的那条浮层，不能有外边距 —— 所以这里只给 `.bar2`。 */
+/* `.bar2` 是**面板内**的那一条（素材页），紧跟在按钮行下面。`#bar` 是压在相机预览上的
+   那条浮层，不能有外边距 —— 所以这里只给 `.bar2`。 */
 .bar2 { margin-top: 14px; }
+/* 全屏页（扫描）上它**真的**是浮层。
+   在这条之前它只是 `#app` flex 列里的一员，于是每次显示/隐藏都把下面的相机画布挤动
+   10px —— 而那要触发两次 `Renderer.resize()` 和视口重设。命中照片时进度条恰好要出现，
+   也就是说画面会在最不该抖的那一刻抖一下。
+   标记由 `shell.js` 打在 body 上（不用 `:has()`，老 WebView 上也要成立）。 */
+body.fullbleed #bar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: var(--z-hud);
+}
 #bar > i, .bar2 > i {
   display: block;
   height: 100%;

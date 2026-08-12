@@ -50,6 +50,11 @@ export function canStream() {
  *
  * @param onEvent 可选 `(name, detail)` —— 打点用。哪条路走通了、为什么退回去了，
  *   不报出来的话手机上无从判断（这一整个模块的存在理由就是一个只在手机上出现的问题）。
+ *
+ *   事件名：`fallback` / `progress` / `done`。**`progress` 是给界面用的，不只是打点**：
+ *   识别命中之后那几秒里唯一有真百分比的一步就是它（见 mediaload.js 的四个阶段）。
+ *   分母来自 `Content-Length` —— 拿不到时 `total` 是 0，调用方要按"不定长"处理而不是
+ *   拿它当分母（除以 0 会得到 Infinity，进度条会直接跳满）。
  * @returns 卸载函数。**必须调** —— 它要中止还在跑的 fetch，否则切页之后那 14MB
  *   还在下，而用户以为已经离开了。
  */
@@ -128,11 +133,16 @@ export function playStream(video, src, { onEvent, getFallbackUrl } = {}) {
         ? src
         : await fetch(src, { credentials: 'same-origin', signal: ac.signal })
       if (!res.ok || !res.body) return fallback('fetch', { status: res.status })
+      // 分母。缓存命中的 Response 与网络来的都带 Content-Length（前者是 put 时存下的
+      // 那一份响应头），拿不到就是 0 —— 调用方据此走不定长那一支。
+      const total = Number(res.headers.get('content-length')) || 0
       const reader = res.body.getReader()
+      onEvent?.('progress', { loaded: 0, total })
       for (;;) {
         const { done: eof, value } = await reader.read()
         if (eof || done) break
         bytes += value.byteLength
+        onEvent?.('progress', { loaded: bytes, total })
         await append(value)
         // 第一块进去就能起播。**这一句是"边下边播"与"下完再播"的全部差别** ——
         // 14MB 在 Tailscale 上要 40 秒，等下完再播还不如原来的坏法。

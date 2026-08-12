@@ -1467,6 +1467,17 @@ class Server:
         return json_response(200, {"photos": out, "total": len(out)})
 
     def _photo_detail(self, req: Request, prin: Principal, photo_id: str) -> Response:
+        """一张照片的详情。**运维字段只给 admin。**
+
+        `refPath` / `videoPath` 是 NAS 上的绝对路径，`selfScore` 是入库时的自匹配分。
+        这三样对看照片的人没有任何用处，而路径会把服务器的目录结构告诉他 —— 那正是
+        `/v1/fs/*` 定成 admin only 想避免的事（那边的注释写着「给 viewer 等于开放一个
+        文件浏览器」）。一个被授权了一张照片的人不该顺带知道它存在 NAS 的哪个目录下。
+
+        裁掉而不是整个接口转成 admin only：`refMissing` / `videoMissing` / `refStale`
+        这些**状态**要留着 —— 它们回答的是"为什么扫了没反应"，那是任何人都该能看到的。
+        泄露的是路径本身，不是"文件不在了"这个事实。
+        """
         photo = self._photo_or_404(photo_id, prin)
         ref = self.catalog.get_asset(str(photo["ref_asset_id"])) or {}
         video = (
@@ -1474,24 +1485,23 @@ class Server:
             if photo["video_asset_id"]
             else None
         )
-        return json_response(
-            200,
-            {
-                "photoId": photo_id,
-                "title": photo["title"],
-                "printWidthM": float(photo["print_width_m"]),
-                "fitMode": self._fit_mode_of(photo),
-                "selfScore": int(photo["self_score"]),
-                "refAspect": self._ref_aspect(photo),
-                "refPath": ref.get("nas_path"),
-                "refMissing": bool(ref.get("missing")),
-                "refStale": bool(photo["ref_stale"]),
-                "videoPath": video["nas_path"] if video else None,
-                "videoMissing": bool(video["missing"]) if video else None,
-                "createdAt": int(photo["created_at"]),
-                "updatedAt": int(photo["updated_at"]),
-            },
-        )
+        body = {
+            "photoId": photo_id,
+            "title": photo["title"],
+            "printWidthM": float(photo["print_width_m"]),
+            "fitMode": self._fit_mode_of(photo),
+            "refAspect": self._ref_aspect(photo),
+            "refMissing": bool(ref.get("missing")),
+            "refStale": bool(photo["ref_stale"]),
+            "videoMissing": bool(video["missing"]) if video else None,
+            "createdAt": int(photo["created_at"]),
+            "updatedAt": int(photo["updated_at"]),
+        }
+        if prin.is_admin:
+            body["selfScore"] = int(photo["self_score"])
+            body["refPath"] = ref.get("nas_path")
+            body["videoPath"] = video["nas_path"] if video else None
+        return json_response(200, body)
 
     def _static_file(
         self,

@@ -25,10 +25,17 @@ const PAGES = {
   [Tab.ADMIN]: () => import('./pages/admin.js'),
   [Tab.SETTINGS]: () => import('./pages/settings.js'),
   [Page.DETAIL]: () => import('./pages/detail.js'),
+  [Page.VIEW]: () => import('./pages/view.js'),
   [Page.PLAY]: () => import('./pages/play.js'),
   [Page.HISTORY]: () => import('./pages/history.js'),
   [Page.CACHE]: () => import('./pages/cache.js'),
 }
+
+/**
+ * 注册了路由的页面名。**给测试用**：加了一个 `Page.*` 却忘了在上面这张表里注册，
+ * 表现是点进去一句「没有这一页：view」—— 那看起来像路由坏了，而不是像漏了一行。
+ */
+export const PAGE_NAMES = Object.keys(PAGES)
 
 export class Shell {
   /**
@@ -192,6 +199,9 @@ export class Shell {
     this.els.back.hidden = this.stack.length <= 1
     this.els.topbar.hidden = Boolean(mod.fullBleed)
     this.els.view.classList.toggle('full', Boolean(mod.fullBleed))
+    // 顶部那条进度金条在全屏页上要浮起来（理由见 theme.css 里 `body.fullbleed #bar`）。
+    // 标记打在 body 上而不是用 `:has()`：这一条在老一点的 WebView 上也得成立。
+    document.body.classList.toggle('fullbleed', Boolean(mod.fullBleed))
     this._paintActive()
 
     const teardown = await mod.mount(this.els.view, { ...this.ctx, params, shell: this })

@@ -693,3 +693,29 @@ def test_photo_ref_404_when_original_is_gone(env):
     got = env.get(f"/v1/photo/{pid}/ref")
     assert got.status == 404
     assert env.body_json(got)["error"] == "ref_missing"
+
+
+def test_详情里的运维字段只给管理员(make_env):
+    """`refPath` / `videoPath` / `selfScore` 是 NAS 路径与入库指标，viewer 不该看到。
+
+    路径本身就是泄露：一个被授权了一张照片的人，不该顺带知道服务器上的目录结构 ——
+    那正是 `/v1/fs/*` 定成 admin only 想避免的事。
+
+    但**状态**要留着（`refMissing` / `videoMissing` / `refStale`）：它们回答的是
+    "为什么扫了没反应"，那是任何人都该能看到的。泄露的是路径，不是"文件不在了"。
+    """
+    env = make_env()
+    ref = env.write_image("photos/detail.jpg", seed=77)
+    pid = env.ingest_ok(ref)
+
+    admin_doc = env.body_json(env.get(f"/v1/photo/{pid}"))
+    assert admin_doc["refPath"] == str(ref)
+    assert "selfScore" in admin_doc
+
+    v = env.viewer(name="有授权的", photo_ids=[pid])
+    doc = env.body_json(env.get(f"/v1/photo/{pid}", as_=v))
+    for leaked in ("refPath", "videoPath", "selfScore"):
+        assert leaked not in doc, f"{leaked} 不该发给 viewer"
+    # 这几样是他该看到的 —— 少了的话他不知道自己那张为什么扫不出来。
+    for kept in ("photoId", "title", "refMissing", "refStale", "videoMissing"):
+        assert kept in doc, f"{kept} 不该被一起裁掉"

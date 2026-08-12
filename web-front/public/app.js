@@ -49,8 +49,16 @@ const state = { me: null, worker: null, libInfo: null, shell: null, webCfg: {} }
 initDiag()
 
 // ── 进度条（引擎那 12MB 要下要编，不给进度等于卡死）────────────────────
-function progress(pct, { hide = false } = {}) {
+/**
+ * 顶部那条金条。**启动之后它并不退休** —— 扫描页命中照片后拿它报视频的下载进度，
+ * 起播之后又接着当播放进度（见 pages/scan.js）。所以它经 ctx 交给了页面。
+ *
+ * `label` 必须能换：这个元素上的 `aria-label` 在 HTML 里写死是「加载识别引擎」，
+ * 复用时不换的话读屏会在播视频的时候念"加载识别引擎 40%"。
+ */
+function progress(pct, { hide = false, label = null } = {}) {
   if (!els.bar) return
+  if (label) els.bar.setAttribute('aria-label', label)
   if (hide) return void (els.bar.hidden = true)
   els.bar.hidden = false
   if (typeof pct === 'number' && pct >= 0) {
@@ -311,6 +319,7 @@ function mountShell() {
       webCfg: () => state.webCfg,
       worker: state.worker,
       toast,
+      progress,
       bindDiagToggle: (el) => bindToggle(el),
     },
   )

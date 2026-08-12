@@ -21,7 +21,7 @@
  */
 import { bytes, button, h, row, section, toast } from '../ui.js'
 import { clearWasmCache } from '../recognize/wasmcache.js'
-import { clearPrefetched, prefetchStatus, prefetchedCount } from '../prefetch.js'
+import { budget, clearPrefetched, prefetchStatus, prefetchedCount } from '../prefetch.js'
 
 export default {
   title: '本机缓存',
@@ -42,16 +42,28 @@ export default {
         : null))
 
     // ── 预取的视频 ──────────────────────────────────────────────────
-    // 登录后后台拉的那些（prefetch.js）。这一层**是我们自己管的**，能精确报数。
-    const pre = section('预取的视频')
+    // 登录后后台拉的那些（prefetch.js）。这一层**是我们自己管的**，能精确报数 ——
+    // 与下面「浏览器给的存储配额」那一节形成对照：那一节只能报整个源的总量。
+    const pre = section('预取的媒体')
     el.appendChild(pre)
     {
       const st = prefetchStatus()
       pre.body.appendChild(row('状态', st.state))
       const n = await prefetchedCount()
       if (!alive) return
-      pre.body.appendChild(row('已在本机', `${n} 段`, { mono: true }))
-      pre.body.appendChild(h('p', { class: 'p dim', text: '扫到这些照片时视频直接从本机播，不走网络。宾客登录时取全部授权的；管理员只取最新几张。' }))
+      pre.body.appendChild(row('视频', `${n} 段`, { mono: true }))
+      if (st.thumbs) pre.body.appendChild(row('缩略图', `${st.thumbs} 张`, { mono: true }))
+      // 预算与已用分两行。**这一对是这一页新的主角**：它回答"为什么我的视频没全下下来"，
+      // 而那是按空间记账之后用户唯一会问的问题（上一版按张数切，问题是"为什么只有 8 段"）。
+      const limit = st.budget || await budget()
+      if (!alive) return
+      pre.body.appendChild(row('这次用掉', bytes(st.bytes), { mono: true }))
+      pre.body.appendChild(row('预算上限', bytes(limit), { mono: true }))
+      if (st.tooBig) {
+        pre.body.appendChild(row('超预算跳过', `${st.tooBig} 段`, { mono: true, bad: true }))
+      }
+      pre.body.appendChild(h('p', { class: 'p dim', text: '扫到这些照片时视频直接从本机播，不走网络。按入库时间从新到旧装，装满预算为止 —— 新入库的会把最老的挤出去。' }))
+      pre.body.appendChild(h('p', { class: 'p dim', text: '预算是浏览器给这个站点的配额的四分之一（钳在 64MB 到 1GB 之间）。两种角色同一套。' }))
       pre.body.appendChild(h('div', { class: 'actions' },
         button('清空预取', async () => {
           await clearPrefetched()

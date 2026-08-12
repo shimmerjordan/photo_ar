@@ -71,6 +71,35 @@ export const MAX_TRACK_MISSES = 5
 const FLOW_WIN = 21
 const FLOW_LEVELS = 3
 
+/**
+ * 光流跑在这个长边上，**而不是查询长边（1280）**。
+ *
+ * ## 为什么可以这么做
+ *
+ * 跟踪帧不碰描述子。`camera.js` 与 `orb.js` 里那条"缩放算法一个像素都不能换"的禁令
+ * 管的是**提特征**那条路 —— 像素决定 FAST 角点、角点决定描述子的每一位，而库里的
+ * `desc.bin` 是按那个特征空间算的。光流不查库、不比描述子，它只是在两张连续的画面之间
+ * 追同一块纹理。所以它有自己的分辨率，与特征空间无关。
+ *
+ * `_prevGray` / `_curGray` **只被光流用**（`_reseed` 走的是原始 RGBA 的 `src`），
+ * 所以把它们整体降到这个尺度不会波及任何其它东西。
+ *
+ * ## 为什么是它，不是别的
+ *
+ * 真机实测（M2012K11C）跟踪帧 27ms，而 `test:bench` 说光流占 94%。光流的成本随像素数
+ * 走（金字塔要一层层建），640 是 1280 的一半、像素数四分之一。
+ *
+ * 种子点仍然**存在查询空间**（1280）里：RANSAC、重投影、`normalizedQuad` 全都在那个
+ * 坐标系。只在喂给光流前后各换算一次，两次都是对着 ~80 个点的循环，量不出来。
+ *
+ * ## 代价，以及它被量过
+ *
+ * 亚像素精度在 640 空间里算，换回 1280 时误差乘 2。`test/golden/track-bench.html`
+ * 用一个**已知**的仿射位移造第二帧，所以那里能直接比"追出来的位移 vs 真值"——
+ * 两个尺度的误差都在那张表里，不是推的。
+ */
+export const TRACK_LONG_EDGE = 640
+
 /** 重解单应至少要剩多少个点。低于它这一帧就算跟丢 —— 4 点是数学下限，太接近下限的解不可信。 */
 const MIN_TRACK_POINTS = 12
 
@@ -197,9 +226,15 @@ export class Pipeline {
     this.stats = { detects: 0, tracks: 0, lastDetectMs: 0, lastTrackMs: 0 }
 
     // 跟踪状态。gray 是**上一帧**的灰度图，光流要用它。
+    // ⚠️ 这两张在**跟踪尺度**（TRACK_LONG_EDGE）上，不是查询尺度。
     this._prevGray = new this.cv.Mat()
     this._curGray = new this.cv.Mat()
+    this._grayFull = new this.cv.Mat()
     this._small = new this.cv.Mat()
+    /** 种子换算到跟踪空间的那一份（复用，避免每帧新建 Mat）。 */
+    this._flowPts = null
+    /** 查询空间 → 跟踪空间的比例，`_toTrackGray` 每帧维护。 */
+    this._trackScale = { sx: 1, sy: 1 }
     this._prevPts = null    // cv.Mat CV_32FC2，跟踪种子在查询空间的坐标
     this._refPts = null     // Float32Array，与种子一一对应的参考侧坐标
     this._querySize = null  // [w, h] 查询侧特征空间，四角换算要用
@@ -322,7 +357,7 @@ export class Pipeline {
    */
   _seedTracking(src, query, top) {
     const cv = this.cv
-    this._toGray(src)
+    this._toTrackGray(src)
     this._curGray.copyTo(this._prevGray)
 
     // 重跑一次配对拿 mask 太贵，所以这里用 top.h 自己筛：把 query 点投到 ref 空间，
@@ -383,17 +418,31 @@ export class Pipeline {
     const status = new cv.Mat()
     const err = new cv.Mat()
     try {
-      this._toGray(src)
-      cv.calcOpticalFlowPyrLK(this._prevGray, this._curGray, this._prevPts, nextPts, status, err,
+      this._toTrackGray(src)
+      const { sx, sy } = this._trackScale
+      const n = this._prevPts.rows
+      // 种子存在**查询空间**，光流跑在**跟踪空间** —— 进去之前换算一次。
+      // 复用同一块 Mat：每帧新建一个 80 行的 Mat 是给 wasm 堆添活，而这条路每秒几十次。
+      if (!this._flowPts || this._flowPts.rows !== n) {
+        this._flowPts?.delete()
+        this._flowPts = new cv.Mat(n, 1, cv.CV_32FC2)
+      }
+      const fp = this._flowPts.data32F
+      const sp = this._prevPts.data32F
+      for (let i = 0; i < n; i++) {
+        fp[i * 2] = sp[i * 2] * sx
+        fp[i * 2 + 1] = sp[i * 2 + 1] * sy
+      }
+      cv.calcOpticalFlowPyrLK(this._prevGray, this._curGray, this._flowPts, nextPts, status, err,
         new cv.Size(FLOW_WIN, FLOW_WIN), FLOW_LEVELS)
 
       // 跟丢的点必须剔掉。留着它们等于给 RANSAC 喂随机坐标。
-      const n = this._prevPts.rows
+      // 存活点顺手换回查询空间 —— 后面的 RANSAC、重投影、四角换算全在那个坐标系。
       const keptSrc = []
       const keptRef = []
       for (let i = 0; i < n; i++) {
         if (!status.data[i]) continue
-        keptSrc.push(nextPts.data32F[i * 2], nextPts.data32F[i * 2 + 1])
+        keptSrc.push(nextPts.data32F[i * 2] / sx, nextPts.data32F[i * 2 + 1] / sy)
         keptRef.push(this._refPts[i * 2], this._refPts[i * 2 + 1])
       }
       const kept = keptSrc.length / 2
@@ -514,17 +563,37 @@ export class Pipeline {
     return m
   }
 
-  /** 把当前帧缩到查询空间并转灰度，结果放 `_curGray`。跟踪与检测共用同一个坐标系。 */
-  _toGray(src) {
+  /**
+   * 当前帧 → **跟踪尺度**的灰度图，结果放 `_curGray`；顺带更新 `_trackScale`。
+   *
+   * ## 先转灰再缩，不是先缩再转灰
+   *
+   * 两条路的结果几乎一样，但代价差四倍：`resize` 的成本随通道数走，RGBA 是四通道。
+   * 先 `cvtColor` 把 1280×960×4 压成单通道，再缩那一张单通道的 —— 缩的数据量是
+   * 反过来那条的四分之一。
+   *
+   * 比例按**实际得到的尺寸**算（`tw/qw`），不用名义上的那个 s：两次取整之后它们能差
+   * 千分之几，而这个比例要拿去把点换回查询空间，差一点就是四角整体偏一点。
+   */
+  _toTrackGray(src) {
     const cv = this.cv
-    const [w, h] = this._querySize ?? this._queryDims(src.cols, src.rows)
-    if (src.cols !== w || src.rows !== h) {
-      cv.resize(src, this._small, new cv.Size(w, h), 0, 0,
-        w < src.cols ? cv.INTER_AREA : cv.INTER_LINEAR)
-      cv.cvtColor(this._small, this._curGray, cv.COLOR_RGBA2GRAY)
-    } else {
-      cv.cvtColor(src, this._curGray, cv.COLOR_RGBA2GRAY)
+    const [qw, qh] = this._querySize ?? this._queryDims(src.cols, src.rows)
+    cv.cvtColor(src, this._grayFull, cv.COLOR_RGBA2GRAY)
+
+    const longest = Math.max(qw, qh)
+    if (longest <= TRACK_LONG_EDGE && src.cols === qw && src.rows === qh) {
+      // 本来就不比跟踪尺度大：直接用，不白缩一次。
+      this._trackScale = { sx: 1, sy: 1 }
+      this._grayFull.copyTo(this._curGray)
+      return
     }
+    const s = Math.min(1, TRACK_LONG_EDGE / longest)
+    const tw = Math.max(1, Math.round(qw * s))
+    const th = Math.max(1, Math.round(qh * s))
+    // 相机帧本身可能比查询尺度大（相机给了 1920 而 longEdge 是 1280），所以比例要
+    // 相对**查询空间**算 —— 种子点就在那个空间里。
+    this._trackScale = { sx: tw / qw, sy: th / qh }
+    cv.resize(this._grayFull, this._curGray, new cv.Size(tw, th), 0, 0, cv.INTER_AREA)
   }
 
   /** 相机帧尺寸 → 查询侧特征空间尺寸。与 `pyparity.resizedSize` 同一条公式。 */
@@ -544,7 +613,9 @@ export class Pipeline {
     this.extractor.delete()
     this._prevGray?.delete()
     this._curGray?.delete()
+    this._grayFull?.delete()
     this._small?.delete()
     this._prevPts?.delete()
+    this._flowPts?.delete()
   }
 }

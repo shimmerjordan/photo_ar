@@ -29,16 +29,44 @@ import {
   FULL_RECT, TTL_MS, clipVertices, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
-import * as api from '../api.js'
-import { playStream } from '../mp4stream.js'
-import { cachedStream } from '../prefetch.js'
+import { Stage, loadPhotoVideo } from '../mediaload.js'
 import { button, h } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
 
-/** 多久送一帧给 Worker。Worker 忙时会丢帧（它只处理最新一帧），所以按 ~30fps 送就够。 */
-const SEND_INTERVAL_MS = 33
+/**
+ * 送帧的下限间隔。**它现在只是防暴走的地板，不再是节奏的决定者** —— 节奏由
+ * [MAX_INFLIGHT] 自己钟摆（worker 处理完一帧就腾出一个名额，主线程立刻补一帧）。
+ *
+ * 取 16ms：渲染就是 60fps，比这更密的观测画不出来，只是白付一次 `createImageBitmap`。
+ * 改造前这里是 33ms，而那个数字与串行的 `inflight` 布尔量一起把观测率钉死在 15Hz。
+ */
+const SEND_INTERVAL_MS = 16
+
+/**
+ * 允许多少帧同时在途。**这一条是"贴合帧率翻倍"的全部来源。**
+ *
+ * ## 改造前：抓帧与识别完全串行
+ *
+ * 老代码用一个布尔量 `inflight`：送出去之后一直等到结果回来才肯抓下一帧。于是时间线是
+ *
+ *     抓帧 6.5ms → [worker 转换 10ms + 光流 27ms，主线程干等] → 结果 → 再抓
+ *
+ * 两段一点都不重叠。真机实测（M2012K11C，12 秒）：**观测间隔 p50 65.6ms = 15.2Hz**，
+ * 而其中真正在算的只有 ~43.5ms —— 剩下三分之一是纯等待（还要再等一个 rAF tick）。
+ * 同一时刻这条链上只有一个核在动，而这台手机有八个。
+ *
+ * ## 现在：一帧在算，一帧在排队
+ *
+ * 取 **2**：一帧正在 worker 里算，一帧已经抓好排在它后面。worker 一算完立刻有下一帧
+ * 可吃，周期从「抓 + 算」变成「max(抓, 算)」。
+ *
+ * **不要调大。** 3 及以上没有任何收益（worker 只留最新一帧，多出来的当场被丢，
+ * 见 worker.js 的 `onFrame`），却要白付一次 `createImageBitmap` 的主线程时间，
+ * 而那正是渲染帧预算里最贵的一笔。
+ */
+const MAX_INFLIGHT = 2
 
 /** 每一句都必须**能照着做**，而且要区分原因。见 Android 那边的教训。 */
 const TIPS = {
@@ -55,6 +83,28 @@ const TIPS = {
   appearance_lost: '贴合可能偏了，正对照片重新识别…',
   no_seed: '重新识别…',
   forbidden: '认出来了，但这张没有授权给你。',
+}
+
+/**
+ * 视频装载各阶段在 HUD 大字上说的半句话（前半句是「认出了「娃娃」，」）。
+ *
+ * 每一句都在说**这一刻在等什么**，而不是笼统的"加载中"：等信息、等通道、等字节、
+ * 等第一帧。分开说的价值在网络烂的时候才显出来 —— 卡在"下载视频"和卡在"取视频信息"
+ * 是两种完全不同的故障，而它们过去长得一模一样。
+ */
+const STAGE_TIP = {
+  [Stage.INFO]: '正在取视频…',
+  [Stage.TICKET]: '正在准备播放…',
+  [Stage.DOWNLOAD]: '正在下载视频…',
+  [Stage.BUFFER]: '就快好了…',
+}
+
+/** 顶部那条金条的 `aria-label`。不换的话读屏会在播视频时念「加载识别引擎 40%」。 */
+const STAGE_LABEL = {
+  [Stage.INFO]: '取视频信息',
+  [Stage.TICKET]: '准备播放通道',
+  [Stage.DOWNLOAD]: '下载视频',
+  [Stage.BUFFER]: '缓冲首帧',
 }
 
 export default {
@@ -104,11 +154,16 @@ export default {
     const st = {
       quad: null, quadAt: 0, filter: new QuadFilter(), smoothOut: new Float32Array(8), lastRenderAt: 0,
       lockedPhoto: null, trackPoints: null,
-      frameSeq: 0, inflight: false, lastSentAt: 0, paused: false,
+      // `inflight` 是**计数**不是布尔量（见 MAX_INFLIGHT）。每送一帧 +1，
+      // 每收到一条 result 或 drop -1 —— 两种回执都要算，漏一种就会永久漏名额。
+      frameSeq: 0, inflight: 0, lastSentAt: 0, paused: false,
       fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0, lastGrabMs: 0,
       // 走不走 bitmap 那条路。一次失败就永久退回（见 sendFrame）。
       useBitmap: canGrabBitmap(),
-      raf: 0, stream: null, renderer: null, grabber: null, alive: true, stopStream: null,
+      raf: 0, stream: null, renderer: null, grabber: null, alive: true, stopLoad: null,
+      // 视频装载到哪一步了、以及那一步的细节数字。前者用来判"阶段变了没有"（播放进度
+      // 每秒来好几次，不判的话每次都会重写一遍 tip 并重放那颗星的动画）。
+      loadStage: null, loadNote: null,
     }
 
     /**
@@ -156,6 +211,7 @@ export default {
           if (st.trackPoints) parts.push(`跟踪点 ${st.trackPoints}`)
           if (st.filter?.correcting) parts.push('纠正滑行中')
           if (st.filter?.rejected) parts.push(`毛刺 ${st.filter.rejected}`)
+          if (st.loadNote) parts.push(`${st.loadStage} ${st.loadNote}`)
           if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
           else if (v.error) parts.push(`视频错误 ${v.error.code}`)
           else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
@@ -166,6 +222,10 @@ export default {
         // 认出来了但看不到画面时才说话。其余时候留空 —— 该说的话在上面那条 tip 里。
         if (!st.lockedPhoto.mediaUrl) parts.push('这张照片还没配视频')
         else if (v.error) parts.push('视频播不了')
+        // 装载过程中的细节数字（`3.2 / 8.1 MB`、`本机已有，秒开`）走这里而**不是** tip：
+        // tip 有 min-height: 40px，文字长度每 200ms 变一次会让整块木牌高度抖动，
+        // 而用户正在读它。阶段名留在 tip 上（每阶段才换一次）。
+        else if (st.loadNote) parts.push(st.loadNote)
         else if (v.readyState < 2) parts.push('视频加载中…')
         else if (v.paused) parts.push('视频已暂停')
         // 贴合准确度。**只在不稳时说话**（稳的时候这行字本身就是干扰），
@@ -232,8 +292,11 @@ export default {
       st.lockedPhoto = null
       // 先掐流再动元素：不掐的话上一段的 fetch 还在往一个已经换了 src 的
       // SourceBuffer 里喂，报的是一个跟「重新扫描」毫无关系的 append 错误。
-      st.stopStream?.()
-      st.stopStream = null
+      st.stopLoad?.()
+      st.stopLoad = null
+      st.loadStage = null
+      st.loadNote = null
+      ctx.progress?.(null, { hide: true })
       dom.clip.pause()
       dom.clip.removeAttribute('src')
       delete dom.clip.dataset.photo
@@ -244,9 +307,59 @@ export default {
     }
 
     /**
-     * 命中之后加载视频。**两步** —— `/v1/photo/<id>/media` 是元信息接口（返回 JSON），
-     * 真流在它的 `url` 上。直接把前者塞给 `<video src>` 会让浏览器拿 JSON 去喂解封装器，
-     * 报 `DEMUXER_ERROR_COULD_NOT_OPEN` 而 HTTP 是 200 —— 这个坑踩过。
+     * 把装载阶段画到这一页合适的位置去。**三个位置按变化频率分工，这是这段代码的全部内容。**
+     *
+     * | 位置 | 放什么 | 变化频率 |
+     * |---|---|---|
+     * | `#tip`（HUD 大字） | 阶段名：`正在取视频…` → `正在下载视频…` → `内点 42。` | 每阶段一次 |
+     * | `#meta`（HUD 小字） | 细节数字：`3.2 / 8.1 MB`、`本机已有，秒开` | 每 200ms |
+     * | `#bar`（顶部金条） | 百分比 / 扫描动画 / **起播后接着当播放进度** | 每帧 |
+     *
+     * 数字**不能**放进 tip：它有 `min-height: 40px`，文字长度每 200ms 变一次会让整块
+     * 木牌高度抖动 —— 而用户正在读它。
+     *
+     * 播放那一支要单独早退：`timeupdate` 每秒来好几次，每次都重写 tip 的话那颗庆祝的星
+     * 会被反复重放（`hit` 类一摘一挂就是一次动画）。
+     */
+    function paintStage(s, title, inliers) {
+      const changed = st.loadStage !== s.stage
+      st.loadStage = s.stage
+      // -1 = 不定长（走扫描动画）。**不给不定长的阶段编一个假百分比** —— 编出来的数字
+      // 会让用户对剩余时间形成一个必然错误的预期。理由与 ui.js 的 loading() 同一条。
+      const bar = (pct, label) =>
+        ctx.progress?.(typeof pct === 'number' ? pct * 100 : -1, { label })
+
+      if (s.stage === Stage.PLAYING) {
+        bar(s.pct, '播放进度')
+        if (!changed) return
+        st.loadNote = null
+        sound.hidden = false
+        tip(`认出了 <b>${title}</b>，内点 ${inliers}。`, { hit: true })
+        meta()
+        return
+      }
+
+      st.loadNote = s.text || null
+      if (s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR) {
+        st.loadNote = null
+        ctx.progress?.(null, { hide: true })
+        // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
+        tip(`认出了 ${title}，但${s.text}。`, { hit: true })
+      } else if (changed) {
+        tip(`认出了 <b>${title}</b>，${STAGE_TIP[s.stage] ?? '正在加载…'}`, { hit: true })
+        bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
+      } else {
+        bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
+      }
+      meta()
+    }
+
+    /**
+     * 命中之后加载视频。链路本身在 `mediaload.js`（扫描页、试播页、宾客页三处共用），
+     * 这里只负责把阶段画出来 —— 见 `paintStage`。
+     *
+     * 那条链路为什么绕（元信息与流是两个地址、票据、MediaSource）写在 `mediaload.js`
+     * 与 `mp4stream.js` 顶部，不在这里重复。
      */
     async function onHit(m) {
       const photo = m.photo
@@ -259,56 +372,18 @@ export default {
         return
       }
       if (dom.clip.dataset.photo === photo.id) {
-        tip(`认出了 <b>${title}</b>，内点 ${m.inliers}。`, { hit: true })
+        // 同一张照片再次命中：已经在播了，别重来一遍（重来会从头播）。
         return
       }
       dom.clip.dataset.photo = photo.id
       diagAlways(`命中 ${photo.id?.slice(0, 8)} 内点=${m.inliers} aspect=${photo.aspect ?? 'null'} → 取媒体信息`)
-      tip(`认出了 <b>${title}</b>，正在取视频…`, { hit: true })
-
-      let info
-      try {
-        info = await api.mediaOfPhoto(photo.id)
-      } catch (e) {
-        diagAlways(`媒体信息失败 ${e.status ?? ''} ${e.message}`)
-        tip(`认出了 ${title}，但取视频信息失败（${e.message}）。`, { hit: true })
-        return
-      }
-      if (!st.alive) return
-      diagAlways(`媒体信息 via=${info.via} absolute=${info.absolute} range=${info.supportsRange}` +
-        ` bytes=${info.bytes} ${info.durationMs}ms missing=${info.missing} integrity=${info.integrity}`)
-
-      if (info.missing) return tip(`认出了 ${title}，但视频文件不在了（服务端报 missing）。`, { hit: true })
-      if (!info.url) return tip(`认出了 ${title}，但服务端没给出视频地址。`, { hit: true })
-      if (info.integrity && info.integrity !== 'ok') {
-        diagAlways(`⚠️ integrity=${info.integrity}，视频可能不完整`)
-      }
-      if (info.absolute) {
-        diagAlways('⚠️ 媒体是绝对地址。跨源会被 COEP 拦，要在部署层代理成同源。')
-      }
-
-      // 预取缓存命中就直接从本机播（登录时后台拉的，见 prefetch.js）——
-      // 现场网络最差的那一刻，正好是唯一不需要网络的一刻。
-      // 未命中走原来的两层绕路，缺一不可（都是真机上量出来的，见 mp4stream.js 顶部那张表）：
-      //   1. `playableUrl` —— 换成自带凭证的票据地址，因为媒体组件拿不到会话 cookie；
-      //   2. `playStream`  —— 页面自己 fetch、经 MediaSource 喂，因为那个组件还有
-      //      独立的 TLS 栈，不认自签证书。
-      const cached = await cachedStream(info.url)
-      if (cached) diagAlways('视频从预取缓存播（零网络）')
-      const src = cached ?? await api.playableUrl(info.url)
-      if (!st.alive) return
       dom.clip.muted = true
-      st.stopStream?.()
-      st.stopStream = playStream(dom.clip, src, {
-        onEvent: (name, detail) => diagAlways(`流 ${name} ${JSON.stringify(detail ?? {})}`),
-        // MSE 走不通退回 <video src> 时，缓存的 Response 给不出地址，现取一张票。
-        getFallbackUrl: () => api.playableUrl(info.url),
+      st.stopLoad?.()
+      st.loadStage = null
+      st.stopLoad = loadPhotoVideo(dom.clip, photo.id, {
+        onStage: (s) => { if (st.alive) paintStage(s, title, m.inliers) },
+        onDiag: diagAlways,
       })
-      tip(`认出了 <b>${title}</b>，内点 ${m.inliers}。`, { hit: true })
-      // 起播交给 playStream（它在第一个分片到位时就 play）。这里只负责把「开声音」
-      // 露出来 —— 等 `playing` 而不是等 `play()` 返回：MSE 那条路上 play() 可能在
-      // 还没有可解码帧时就被调用，返回不代表真的在动。
-      dom.clip.addEventListener('playing', () => { sound.hidden = false }, { once: true })
     }
 
     function onWorkerMessage(ev) {
@@ -319,9 +394,18 @@ export default {
         tip(`<span class="bad">${m.message}</span>`)
         return
       }
+      // 丢帧回执：没有几何可用，只还名额然后立刻补一帧。
+      if (m.type === 'drop') {
+        st.inflight = Math.max(0, st.inflight - 1)
+        maybeSend()
+        return
+      }
       if (m.type !== 'result') return
       traceResult(performance.now(), m)
-      st.inflight = false
+      st.inflight = Math.max(0, st.inflight - 1)
+      // **立刻补下一帧，不等 rAF。** 这一行与 MAX_INFLIGHT 一起构成流水线：
+      // worker 刚腾出手，下一帧已经抓好在排队了。
+      maybeSend()
       if (m.state === 'locked' && m.ms) st.trackMs = m.ms
       else if (m.ms) st.detectMs = m.ms
       st.trackPoints = m.inliers ?? null
@@ -502,11 +586,26 @@ export default {
         meta()
       }
 
-      if (!st.paused && !st.inflight && now - st.lastSentAt >= SEND_INTERVAL_MS) {
-        st.lastSentAt = now
-        st.inflight = true
-        sendFrame(now)
-      }
+      // 这里仍留一次 `maybeSend`，但它只是**兜底**：正常节奏由 worker 的回执驱动
+      // （见 onWorkerMessage 末尾）。留着是为了盖住"一帧都没在途"的冷启动与
+      // 从暂停恢复那一刻 —— 那时没有任何回执会到来，只能靠渲染循环把泵重新压起来。
+      maybeSend()
+    }
+
+    /**
+     * 该送就送。**从两个地方调：渲染循环（兜底）与 worker 回执（正常节奏）。**
+     *
+     * 挂在 rAF 上是改造前的做法，它凭空加了一段等待：结果回来的时刻与下一个 rAF tick
+     * 之间平均差 8ms，而整个周期才 65ms。现在回执一到就立刻补帧，不必等下一帧渲染。
+     */
+    function maybeSend() {
+      if (!st.alive || st.paused || !st.stream || !st.grabber) return
+      if (st.inflight >= MAX_INFLIGHT) return
+      const now = performance.now()
+      if (now - st.lastSentAt < SEND_INTERVAL_MS) return
+      st.lastSentAt = now
+      st.inflight++
+      sendFrame(now)
     }
 
     /**
@@ -527,20 +626,23 @@ export default {
       }
       if (st.useBitmap) {
         st.grabber.grabBitmap().then((got) => {
-          if (!st.alive) { got?.bitmap?.close(); return }
-          if (!got) { st.inflight = false; return }
+          // 没送出去的每一条路都要**把名额还回来** —— 名额只会被 worker 的回执减掉，
+          // 而这几条根本走不到 worker。漏一条就少一个名额，漏够 MAX_INFLIGHT 次
+          // 贴合就彻底停住，且没有任何报错。
+          if (!st.alive) { got?.bitmap?.close(); st.inflight--; return }
+          if (!got) { st.inflight--; return }
           post({ width: got.width, height: got.height, bitmap: got.bitmap }, [got.bitmap])
         }).catch((e) => {
           // 一次失败就永久退回老路。`createImageBitmap` 在某些机型/某些 track 状态下
           // 会抛，而每帧都试一次然后 fallback 等于每帧都付一次异常的代价。
           diagAlways(`createImageBitmap 失败，退回 getImageData：${e?.message ?? e}`)
           st.useBitmap = false
-          st.inflight = false
+          st.inflight--
         })
         return
       }
       const img = st.grabber.grab()
-      if (!img) { st.inflight = false; return }
+      if (!img) { st.inflight--; return }
       const buf = img.data.buffer
       // transfer：1280×960 的 RGBA 是 4.9MB，每秒十几次，克隆不可接受。
       post({ width: img.width, height: img.height, buf }, [buf])
@@ -552,7 +654,10 @@ export default {
     function teardown() {
       st.alive = false
       // **必须停**：不停的话切页之后那十几 MB 还在下，而用户以为已经离开了。
-      st.stopStream?.()
+      st.stopLoad?.()
+      // 顶部那条金条是**全局的**（引擎加载时也用它）。不收的话，从扫描页切到别的页
+      // 之后它会带着上一段视频的播放进度停在那儿，而那一页跟它毫无关系。
+      ctx.progress?.(null, { hide: true })
       cancelAnimationFrame(st.raf)
       document.removeEventListener('visibilitychange', onVis)
       ctx.worker.removeEventListener('message', onWorkerMessage)

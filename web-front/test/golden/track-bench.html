@@ -7,6 +7,9 @@
 import { runPage, log, loadOpenCv } from '../bridge.js'
 import { OrbExtractor, _setOpenCv } from '../../public/recognize/orb.js'
 import { matchHamming, ransacPair } from '../../public/recognize/verify.js'
+// 线上真正用的那个跟踪尺度。从源码里取而不是这里再写一遍 —— 两处各写一个数的话，
+// 调了线上而没调这里，这个 bench 会继续为一个已经不存在的配置背书。
+import { TRACK_LONG_EDGE } from '../../public/recognize/pipeline.js'
 
 /**
  * ## 为什么要量这个
@@ -58,8 +61,19 @@ function median(xs) {
   const s = [...xs].sort((a, b) => a - b)
   return s[Math.floor(s.length / 2)]
 }
+function pct(xs, p) {
+  const s = [...xs].sort((a, b) => a - b)
+  return s[Math.min(s.length - 1, Math.floor(s.length * p))]
+}
 
 const REPEAT = 12
+
+/**
+ * 光流的窗口与层数。**必须与 `pipeline.js` 里那两个常量一致** —— 不一致的话这里量到的
+ * 就不是线上跑的那条路，而这个 bench 的全部意义就是拿它的数字去定线上的参数。
+ */
+const FLOW_WIN = 21
+const FLOW_LEVELS = 3
 
 runPage(async () => {
   const cv = await loadOpenCv('/public/vendor/opencv.js')
@@ -156,6 +170,73 @@ runPage(async () => {
     nextPts.delete(); status.delete(); err.delete()
   }
 
+  // ── 量：光流在别的尺度上跑（pipeline.TRACK_LONG_EDGE 那条改动）────────
+  //
+  // 这一组回答的是「降尺度换来多少速度、赔掉多少精度」。**精度有真值可比**：第二帧是
+  // 用一个已知的仿射变换造出来的，所以每个点的正确落点算得出来 —— 于是"追歪了多少像素"
+  // 是量出来的，不是感觉出来的。误差一律折算回**查询空间**（1280），两个尺度才可比。
+  const A = { cos: Math.cos(0.004), sin: Math.sin(0.004), tx: 3.0, ty: 1.5 }
+  const truePos = (x, y) => [
+    A.cos * x - A.sin * y + A.tx,
+    A.sin * x + A.cos * y + A.ty,
+  ]
+
+  function flowAt(longEdge) {
+    const s = Math.min(1, longEdge / Math.max(rs.w, rs.h))
+    const w = Math.max(1, Math.round(rs.w * s))
+    const h = Math.max(1, Math.round(rs.h * s))
+    const sx = w / rs.w
+    const sy = h / rs.h
+    let g0 = gray0
+    let g1 = gray1
+    const own = s !== 1
+    if (own) {
+      g0 = new cv.Mat(); g1 = new cv.Mat()
+      cv.resize(gray0, g0, new cv.Size(w, h), 0, 0, cv.INTER_AREA)
+      cv.resize(gray1, g1, new cv.Size(w, h), 0, 0, cv.INTER_AREA)
+    }
+    const pts = new cv.Mat(nInl, 1, cv.CV_32FC2)
+    for (let i = 0; i < nInl; i++) {
+      pts.data32F[i * 2] = inl[i * 4] * sx
+      pts.data32F[i * 2 + 1] = inl[i * 4 + 1] * sy
+    }
+    const ms = []
+    let errs = []
+    let survived = 0
+    for (let rep = 0; rep < REPEAT; rep++) {
+      const nextPts = new cv.Mat(); const status = new cv.Mat(); const err = new cv.Mat()
+      const t0 = performance.now()
+      cv.calcOpticalFlowPyrLK(g0, g1, pts, nextPts, status, err, new cv.Size(FLOW_WIN, FLOW_WIN), FLOW_LEVELS)
+      ms.push(performance.now() - t0)
+      if (rep === REPEAT - 1) {
+        errs = []; survived = 0
+        for (let i = 0; i < nInl; i++) {
+          if (!status.data[i]) continue
+          survived++
+          // 换回查询空间再比 —— 降尺度赔掉的精度正是在这一步现形的。
+          const qx = nextPts.data32F[i * 2] / sx
+          const qy = nextPts.data32F[i * 2 + 1] / sy
+          const [tx, ty] = truePos(inl[i * 4], inl[i * 4 + 1])
+          errs.push(Math.hypot(qx - tx, qy - ty))
+        }
+      }
+      nextPts.delete(); status.delete(); err.delete()
+    }
+    pts.delete()
+    if (own) { g0.delete(); g1.delete() }
+    return {
+      size: `${w}x${h}`, survived,
+      ms: +median(ms).toFixed(2),
+      errMed: +median(errs).toFixed(3),
+      errP90: +pct(errs, 0.9).toFixed(3),
+    }
+  }
+
+  const atFull = flowAt(rs.w)              // 查询尺度，也就是改造前那条路
+  const atTrack = flowAt(TRACK_LONG_EDGE)  // 线上现在真正用的
+  await log(`光流 ${atFull.size}：${atFull.ms}ms 误差中位 ${atFull.errMed}px`)
+  await log(`光流 ${atTrack.size}：${atTrack.ms}ms 误差中位 ${atTrack.errMed}px`)
+
   // ── 对照：跟踪帧如果重新走一遍全套精排 ──────────────────────────
   const fullMs = []
   for (let rep = 0; rep < 5; rep++) {
@@ -171,6 +252,9 @@ runPage(async () => {
   const track = flow + homo
   const full = median(fullMs)
 
+  // 降尺度之后的跟踪帧成本：光流换成 TRACK_LONG_EDGE 那一档，解单应不变。
+  const trackScaled = atTrack.ms + homo
+
   const metrics = {
     seedInliers: nInl,
     flowSurvived: lastOk,
@@ -179,6 +263,13 @@ runPage(async () => {
     trackFps: +(1000 / track).toFixed(1),
     fullPipelineMs: +full.toFixed(1),
     speedup: +(full / track).toFixed(1),
+    // ── 跟踪尺度这一档（pipeline.TRACK_LONG_EDGE）──────────────────────
+    flowByScale: { full: atFull, track: atTrack },
+    flowSpeedup: +(atFull.ms / atTrack.ms).toFixed(2),
+    // 误差放大倍数。这就是降尺度**赔掉的那部分**，折算回查询空间的像素。
+    errRatio: +(atTrack.errMed / Math.max(atFull.errMed, 1e-6)).toFixed(2),
+    trackFrameMsScaled: +trackScaled.toFixed(2),
+    trackFpsScaled: +(1000 / trackScaled).toFixed(1),
     note: '桌面 headless Chrome + SwiftShader，单线程 wasm。手机上按 2~4 倍慢外推。',
   }
 
@@ -191,6 +282,32 @@ runPage(async () => {
     { name: `跟踪帧比全套精排快 ≥8 倍（实测 ${metrics.speedup}×）`, ok: full / track >= 8 },
     // 20 FPS 是"贴得住"的下限。桌面上必须有很大余量，才可能在手机上还够。
     { name: `跟踪帧 ≥60 FPS（桌面，实测 ${metrics.trackFps}）`, ok: 1000 / track >= 60 },
+
+    // ── 降尺度那条改动的收益与代价，两头都钉住 ────────────────────────
+    // 收益：不到 2 倍就不值得多这一层换算与一次 resize。
+    {
+      name: `光流降到 ${TRACK_LONG_EDGE} 至少快 2 倍（实测 ${metrics.flowSpeedup}×）`,
+      ok: metrics.flowSpeedup >= 2,
+    },
+    // 代价上界：误差放大不超过 2 倍。降一半分辨率的理论下界就是 2，超了说明
+    // INTER_AREA 那步或者点的换算写错了 —— 那类错不会报，只表现成"贴得没以前准"。
+    {
+      name: `误差放大 ≤2×（实测 ${metrics.errRatio}×：${atFull.errMed}px → ${atTrack.errMed}px）`,
+      ok: metrics.errRatio <= 2,
+    },
+    // **这一条才是"值不值"的判据**：绝对误差要远小于既有的四角抖动。
+    // 真机实测静止时原始四角的位置标准差是画幅的 1.01‰（见 quadfilter.js 顶部），
+    // 在 1280 长边上就是 1.29px。光流误差比它小一个数量级以上时，降尺度赔掉的那点
+    // 精度根本走不到屏幕上 —— 它在噪声底下。
+    {
+      name: `${TRACK_LONG_EDGE} 上的误差 ${atTrack.errMed}px 至少比既有抖动(≈1.29px)小 10 倍`,
+      ok: atTrack.errMed * 10 <= 1.29,
+    },
+    // 点一个都不能多丢：丢点会让种子加速耗尽，而那是"贴合慢慢滑走"的根源。
+    {
+      name: `降尺度后存活点不少于全尺度（${atTrack.survived}/${atFull.survived}）`,
+      ok: atTrack.survived >= atFull.survived,
+    },
   ]
 
   prevPts.delete(); small.delete(); gray0.delete(); gray1.delete(); shift.delete(); frame.delete(); ex.delete()

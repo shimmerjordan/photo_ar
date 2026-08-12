@@ -13,15 +13,17 @@ import {
   isRoot, landingTab, needsAdmin, tabAfterRoleChange, tabsFor,
 } from '../public/navpolicy.js'
 import { ICON_NAMES, icon, iconCells } from '../public/pixelicons.js'
-import { formatHash, parseHash } from '../public/shell.js'
+import { PAGE_NAMES, formatHash, parseHash } from '../public/shell.js'
 import { LANDSCAPE_PORTRAIT_PAIRS, PRINT_SIZES } from '../public/printsize.js'
 
 describe('navpolicy', () => {
-  test('访客只有扫描与设置', () => {
-    assert.deepEqual(tabsFor(false), [Tab.SCAN, Tab.SETTINGS])
-    // 「历史」不给访客不是因为界面挤 —— /v1/history 在服务端是 admin only（全库记录）。
+  test('访客有扫描、媒体、设置', () => {
+    // 「媒体」是 2026-08-10 加的：宾客能在那里看自己被授权的照片、把图和视频存到手机。
+    // 服务端 /v1/photos 本来就按授权过滤，所以他看到的行数天然是对的。
+    assert.deepEqual(tabsFor(false), [Tab.SCAN, Tab.PHOTOS, Tab.SETTINGS])
+    // 这两个仍然不给：/v1/upload 与 /v1/admin/* 在服务端是 admin only，
+    // /v1/history 更是**全库**的识别记录（给访客等于把全库照片的标题发给他）。
     assert.ok(!VIEWER_TABS.includes(Tab.ADMIN))
-    assert.ok(!VIEWER_TABS.includes(Tab.PHOTOS))
     assert.ok(!VIEWER_TABS.includes(Tab.MEDIA))
   })
 
@@ -44,12 +46,30 @@ describe('navpolicy', () => {
   })
 
   test('needsAdmin 与服务端的 admin-only 接口一一对应，不多不少', () => {
-    for (const p of [Tab.PHOTOS, Tab.MEDIA, Tab.ADMIN, Page.DETAIL, Page.PLAY, Page.HISTORY]) {
+    for (const p of [Tab.MEDIA, Tab.ADMIN, Page.DETAIL, Page.PLAY, Page.HISTORY]) {
       assert.equal(needsAdmin(p), true, `${p} 该要 admin`)
     }
-    // 这三个访客必须能用：扫描是他来这里的理由，设置里有登出，缓存是他自己的浏览器。
-    for (const p of [Tab.SCAN, Tab.SETTINGS, Page.CACHE]) {
+    // 这几个访客必须能用：扫描是他来这里的理由，媒体是他看自己那几张的地方，
+    // 设置里有登出，缓存是他自己的浏览器。
+    for (const p of [Tab.SCAN, Tab.PHOTOS, Tab.SETTINGS, Page.VIEW, Page.CACHE]) {
       assert.equal(needsAdmin(p), false, `${p} 不该要 admin`)
+    }
+  })
+
+  test('DETAIL 要 admin 而 VIEW 不要 —— 两页看同一张照片，差别在接口', () => {
+    // 详情页调 /v1/photo/<id>，那个响应里有 NAS 绝对路径与自匹配分。宾客那一版
+    // (VIEW) 根本不调它 —— 标题从 /v1/photos 拿。这条测试盯的是"别哪天顺手把
+    // VIEW 也接到详情接口上"。
+    assert.equal(needsAdmin(Page.DETAIL), true)
+    assert.equal(needsAdmin(Page.VIEW), false)
+    assert.notEqual(Page.DETAIL, Page.VIEW)
+  })
+
+  test('每个非根页面都有一条路由 —— 加了 Page 却忘了注册就是点进去一片空白', () => {
+    // shell.js 的 PAGES 表是动态 import 的映射；漏一条的表现是页面上一句
+    // 「没有这一页：view」，而那看起来像路由坏了。
+    for (const name of [...Object.values(Tab), ...Object.values(Page)]) {
+      assert.ok(PAGE_NAMES.includes(name), `${name} 没在 shell.js 的 PAGES 里注册`)
     }
   })
 

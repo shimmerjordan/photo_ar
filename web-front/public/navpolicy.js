@@ -32,15 +32,23 @@ export const Tab = {
 }
 
 /**
- * 访客的两个页签。
+ * 访客的三个页签。
  *
- * 只有两个不是「功能少」，是刻意的：宾客打开这个页面只有一件事可做。多一个入口就多
- * 一次「我该点哪个」，而他正站在照片前面举着手机。
+ * ## 为什么从两个变成三个（2026-08-10）
  *
- * 「历史」不给访客不是因为界面挤 —— `/v1/history` 在服务端是 admin only（它是**全库**的
- * 识别记录，给访客等于把全库照片的标题发给他）。
+ * 原来只有「扫一扫 + 设置」，理由是"宾客打开这个页面只有一件事可做，多一个入口就多
+ * 一次我该点哪个"。那条理由**在第二件事出现之后就不成立了** —— 宾客现在能把自己被
+ * 授权的照片和视频存到手机上，而那不是站在照片前面做的事（他多半是回家路上做的），
+ * 扫描页里塞不下也不该塞。
+ *
+ * 「媒体」这一页对两种角色是**不同的东西**：管理员看到的是全库与策展入口，宾客看到
+ * 的是他自己那几张 + 两个下载按钮。分叉在 `photos.js` 里按角色做，服务端那一侧
+ * `/v1/photos` 本来就按授权过滤，所以宾客看到的行数天然就是对的。
+ *
+ * 「历史」和「素材」仍然不给访客，而且不是因为界面挤 —— `/v1/history` 与 `/v1/upload`
+ * 在服务端是 admin only（前者是**全库**的识别记录，给访客等于把全库照片的标题发给他）。
  */
-export const VIEWER_TABS = [Tab.SCAN, Tab.SETTINGS]
+export const VIEWER_TABS = [Tab.SCAN, Tab.PHOTOS, Tab.SETTINGS]
 
 /**
  * 管理员的五个页签。
@@ -97,7 +105,8 @@ export const TAB_META = {
  * 那两个变窄。
  */
 export const Page = {
-  DETAIL: 'detail',   // 照片详情
+  DETAIL: 'detail',   // 照片详情（admin：带 NAS 路径与策展动作）
+  VIEW: 'view',       // 全屏查看 + 存到手机（宾客那一版的「详情」）
   PLAY: 'play',       // 试播：不开相机，全屏放这张照片配的视频
   HISTORY: 'history', // 识别历史（admin）
   CACHE: 'cache',     // 缓存（web 语义见那一页）
@@ -113,7 +122,14 @@ export function isRoot(name) {
  *
  * 与服务端的 admin-only 接口一一对应，**不多不少**：多挡一页等于无谓地少给功能，
  * 少挡一页等于把 403 摆在访客面前。
+ *
+ * ## `DETAIL` 要 admin 而 `VIEW` 不要，是这张表里唯一需要解释的一条
+ *
+ * 两页看的是同一张照片，差别在**接口**：详情页调 `/v1/photo/<id>`，而那个响应里有
+ * `refPath` / `videoPath`（NAS 上的绝对路径）和 `selfScore` —— 服务端会把它们发给
+ * 任何有授权的人。宾客不需要那些，也不该看到 NAS 的目录结构。所以宾客那一版
+ * （`VIEW`）**根本不调那个接口**，它要的标题从 `/v1/photos` 拿。
  */
 export function needsAdmin(name) {
-  return [Tab.PHOTOS, Tab.MEDIA, Tab.ADMIN, Page.DETAIL, Page.PLAY, Page.HISTORY].includes(name)
+  return [Tab.MEDIA, Tab.ADMIN, Page.DETAIL, Page.PLAY, Page.HISTORY].includes(name)
 }

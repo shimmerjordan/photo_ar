@@ -86,16 +86,31 @@ async function onInit(msg) {
   drain()
 }
 
+/**
+ * 丢帧要**回执**。
+ *
+ * 主线程按「在途帧数」限流（见 scan.js 的 `MAX_INFLIGHT`），而它只能靠回消息来减计数。
+ * 被丢掉的帧不会产生 `result` —— 不发这条的话那个名额就永久漏掉一个，几次之后主线程
+ * 以为一直满着，再也不送帧了，表现是**贴合彻底停住而没有任何报错**。
+ */
+function ack(id) {
+  self.postMessage({ type: 'drop', id })
+}
+
 function onFrame(msg) {
   if (!pipeline) {
     // 还没 init 完，丢掉 —— 补齐它没有意义，那一帧早过时了。
     // 但 bitmap **必须 close**：它持有 GPU 内存，丢引用不等于释放。
     msg.bitmap?.close()
+    ack(msg.id)
     return
   }
   // 被顶掉的那一帧同理。跟踪 46ms 而送帧更快时这条每秒都在发生 ——
   // 漏一个 close 就是每秒泄漏一张 1280×960 的纹理。
-  pending?.bitmap?.close()
+  if (pending) {
+    pending.bitmap?.close()
+    ack(pending.id)
+  }
   pending = msg
   drain()
 }
@@ -139,6 +154,8 @@ function drain() {
     self.postMessage({ type: 'result', id: msg.id, grabbedAt: msg.grabbedAt, ...out })
   } catch (e) {
     self.postMessage({ type: 'error', message: `识别失败：${e?.message ?? e}`, stack: `${e?.stack ?? ''}`.slice(0, 1500) })
+    // 这一帧没有 result，同样要还名额 —— 否则一次识别异常就把在途计数永久扣掉一个。
+    ack(msg.id)
   } finally {
     busy = false
     // 处理期间又来了帧就接着做。用 setTimeout 而不是直接递归：给消息循环一个机会把

@@ -21,6 +21,7 @@
 import * as api from '../api.js'
 import { thresholds } from '../recognize/consts.js'
 import { isDiagEnabled, onDebugChange, setDiagEnabled } from '../diag.js'
+import { Page } from '../navpolicy.js'
 import { button, h, row, section, toast, when } from '../ui.js'
 
 export default {
@@ -45,6 +46,19 @@ export default {
           // Worker、相机）。重载是唯一能保证不漏的做法，而它只发生一次。
           location.replace(location.pathname)
         }, { kind: 'danger' }))))
+
+    // 本机缓存。**只给非管理员**：管理员的入口在「管理」页里，那是他找它的地方。
+    //
+    // 这一条补的是一个真空缺：`needsAdmin(Page.CACHE)` 一直是 false（那一页管的是
+    // 用户自己浏览器里的东西，本来就该人人可进），但**唯一的入口在 admin 页上** ——
+    // 也就是说宾客既进得去又找不到。按空间预算预取之后这一页对他更要紧了：
+    // 「为什么我的视频没全存下来」的答案就在那儿。
+    if (!ctx.isAdmin()) {
+      el.appendChild(section('本机缓存',
+        h('p', { class: 'p', text: '登录后会在后台把你能扫的那些视频先存到手机里，扫到时直接从本机播、不走网络。' }),
+        h('div', { class: 'actions' },
+          button('看本机缓存', () => ctx.shell.push(Page.CACHE), { kind: 'ghost', iconName: 'cache' }))))
+    }
 
     // 有效期快到时提醒。Android 那边同样有这一条 —— 访客 30 天、管理员 12 小时，
     // 而"扫到一半掉线"是最难解释的失败。
