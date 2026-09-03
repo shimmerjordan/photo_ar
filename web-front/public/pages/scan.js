@@ -26,7 +26,7 @@ import { CameraError, FrameGrabber, canGrabBitmap, openCamera, stopCamera } from
 import { MEDIA_ERR, NETWORK_STATE, READY_STATE, diag, diagAlways, flushDiag, isDiagEnabled, short } from '../diag.js'
 import { Renderer } from '../render/gl.js'
 import {
-  FULL_RECT, TTL_MS, clipVertices, imageToNdc, plausible, unitSquareH,
+  FULL_RECT, TTL_MS, clipVertices, flatQuadImage, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
 import { Stage, loadPhotoVideo } from '../mediaload.js'
@@ -63,12 +63,27 @@ import { CLOSER_MIN_INLIERS, GUIDE_DEBOUNCE_MS, guideTip } from '../guide.js'
 const MAX_INFLIGHT = 2
 
 /**
+ * 平铺续播：跟丢之后视频不撤，退到屏幕中央按照片的比例继续放。
+ *
+ * 跟丢在真实现场太常见（手一抖、走过去、照片被人挡了一下），而上一版的表现是"视频
+ * 凭空消失、下一秒又凭空回来"—— 用户不知道它是坏了还是自己动错了。占屏宽 **70%** 是
+ * 有意小于满屏：它必须一眼看出来"这是退出贴合的样子"，而不是像全屏播放。
+ *
+ * 贴回去走 **4 步 200ms** 的离散插值。像素风里过渡只能是 `steps()`（见 theme.css 那条
+ * 硬约束），而这块几何在 GL 里，CSS 的 steps 管不到它 —— 所以那条约束在这儿是手写的。
+ */
+const FLAT_WIDTH = 0.7
+const BLEND_MS = 200
+const BLEND_STEPS = 4
+
+/**
  * **跟丢**之后那几句。每一句都必须能照着做，而且要区分原因（见 Android 那边的教训）。
  *
  * 扫描阶段（还没锁定）的那几句**不在这里** —— 它们要按内点数、连续帧数、多久没证据
  * 分档，而一张 `reason → 文案` 的表表达不了那些条件。见 `guide.js`。
  */
 const TIPS = {
+  flat: '跟丢了，视频继续放；对准照片会贴回去。',
   flow_lost: '跟丢了，正在重新识别…',
   homography_lost: '跟丢了，正在重新识别…',
   quad_implausible: '角度太斜了，正一点。',
@@ -191,6 +206,13 @@ export default {
       // 那对 aspect，比例没变就不必重跑 videoCrop（源矩形只由这两个数决定）。
       ndc: new Float32Array(8), hm: new Float32Array(9), clip: new Float32Array(16),
       crop: new Float32Array(4), cropKey: '',
+      // 平铺续播：在不在平铺、是不是满屏平铺（全屏按钮）、以及那个矩形本身
+      // （每帧重算，但缓冲复用；它同时是"贴回去"那段过渡的起点）。
+      flat: false, flatFull: false, flatQuad: new Float32Array(8),
+      blendFrom: new Float32Array(8), blendStart: 0, blendQuad: new Float32Array(8),
+      // 起播那一句（含标题与内点数）。从平铺贴回去时要把它放回去 —— 不放回去的话
+      // 视频已经贴在照片上了，HUD 还写着"跟丢了"。
+      hitTip: '',
     }
 
     /**
@@ -250,6 +272,7 @@ export default {
         if (st.lockedPhoto) {
           const age = st.quadAt ? Math.round(performance.now() - st.quadAt) : null
           parts.push(st.quad ? `贴合中 ${age}ms前` : age === null ? '无四角' : `四角已过期 ${age}ms`)
+          if (st.flat) parts.push(st.flatFull ? '平铺续播·满屏' : '平铺续播')
           if (st.trackPoints) parts.push(`跟踪点 ${st.trackPoints}`)
           if (st.filter?.correcting) parts.push('纠正滑行中')
           if (st.filter?.rejected) parts.push(`毛刺 ${st.filter.rejected}`)
@@ -322,6 +345,13 @@ export default {
      * 视频却像暂停了"。这里显式接管：播完就跳回 0 重新播，不管原生 loop 有没有生效。
      */
     const onVideoEnded = () => {
+      // 平铺状态下播完就**退出**，不循环：那时视频已经不贴在任何东西上了，
+      // 让它在屏幕中央无限重播等于把取景器一直占着。
+      if (st.flat) {
+        diag(() => '视频 ended（平铺续播）→ 退出锁定')
+        resetLock()
+        return
+      }
       dom.clip.currentTime = 0
       dom.clip.play().catch(() => {})
       diag(() => '视频 ended → 手动循环')
@@ -350,6 +380,7 @@ export default {
       sound.hidden = true
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
       st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
+      st.flat = false; st.flatFull = false; st.blendStart = 0; st.hitTip = ''
       setPrimary(null)
       tip(guideTip({}).text)
     }
@@ -384,7 +415,8 @@ export default {
         sound.hidden = false
         // 视频起播了：这一刻该点的是「开声音」（默认静音起播，见 onHit），不是「重新扫描」。
         setPrimary(sound)
-        tip(`认出了 <b>${title}</b>，内点 ${inliers}。`, { hit: true })
+        st.hitTip = `认出了 <b>${title}</b>，内点 ${inliers}。`
+        tip(st.hitTip, { hit: true })
         meta()
         return
       }
@@ -428,6 +460,10 @@ export default {
         // 同一张照片再次命中：已经在播了，别重来一遍（重来会从头播）。
         return
       }
+      // 换了一张照片：上一段的平铺状态跟这一段无关（新视频要从贴合开始）。
+      st.flat = false
+      st.flatFull = false
+      st.blendStart = 0
       dom.clip.dataset.photo = photo.id
       diagAlways(`命中 ${photo.id?.slice(0, 8)} 内点=${m.inliers} aspect=${photo.aspect ?? 'null'} → 取媒体信息`)
       dom.clip.muted = true
@@ -481,6 +517,14 @@ export default {
       if (m.fresh) onHit(m).catch((e) => diagAlways(`onHit 失败 ${e.message}`))
 
       if (m.quad && plausible(m.quad)) {
+        if (st.flat) {
+          // 从平铺贴回去：起点是当前平铺矩形，4 步 200ms 走到跟踪四角（像素风只用 steps）。
+          st.blendFrom.set(st.flatQuad); st.blendStart = performance.now()
+          st.flat = false; st.flatFull = false
+          setPrimary(sound)
+          // 把起播那一句放回去：视频已经贴回照片上了，HUD 不能还写着"跟丢了"。
+          if (st.hitTip) tip(st.hitTip, { hit: true })
+        }
         const at = performance.now()
         st.quad = m.quad
         st.quadAt = at
@@ -495,8 +539,16 @@ export default {
         // 就回来。停了再播会从头开始，那比继续播难看得多。
         st.quad = null
         st.filter.reset()
-        setPrimary(rescan)
-        tip(TIPS[m.reason] ?? guideTip({}).text)
+        // 视频真的在放 → 退到屏幕中央继续放（平铺续播），而不是让画面空着。
+        // 判据用 video 元素自己的状态：`st.flat` 一置上，`paceArgs().locked` 就回到
+        // 未锁定，送帧节奏自动回满速去找照片 —— 这正是我们想要的。
+        const playing = st.lockedPhoto?.mediaUrl && !dom.clip.paused && dom.clip.readyState >= 2
+        if (playing) {
+          if (!st.flat) { st.flat = true; tip(TIPS.flat); setPrimary(rescan) }
+        } else {
+          setPrimary(rescan)
+          tip(TIPS[m.reason] ?? guideTip({}).text)
+        }
       } else if (!st.lockedPhoto) {
         // 扫描阶段的引导：分档在 `guide.js`（那里能按内点/连续帧/多久没证据分，
         // 而"攒到 2/3"与"认不出来"要用户做的是**相反**的事 —— 一个别动，一个换姿势）。
@@ -614,11 +666,31 @@ export default {
       const age = now - st.quadAt
       const dtFrame = st.lastRenderAt ? now - st.lastRenderAt : 0
       let drew = 0
+      // 这一帧要画在哪四个角上（归一化图像坐标）。三个来源：跟踪四角、跟踪四角 +
+      // 「从平铺贴回去」的过渡、平铺矩形。**统一成一个变量**是关键 —— 平铺与贴合
+      // 因此走的是同一条渲染路径，两者之间才可能插值。
+      let quadToDraw = null
       if (st.quad && age <= TTL_MS) {
         // 自适应预测滤波：静止时重平滑压噪声、运动时按速度外推补掉管线那 88ms。
         // 观测在 `onWorkerMessage` 里喂进去（那才是它到达的时刻），这里只问"现在画哪"。
-        const smooth = st.filter.at(now, st.smoothOut) ?? st.quad
-        const ndc = imageToNdc(smooth, vw / vh, canvasAspect, st.ndc)
+        quadToDraw = st.filter.at(now, st.smoothOut) ?? st.quad
+        // 平铺 → 贴合的 4 步过渡
+        const t = now - st.blendStart
+        if (st.blendStart && t < BLEND_MS) {
+          const k = Math.floor(t / (BLEND_MS / BLEND_STEPS)) / BLEND_STEPS
+          for (let i = 0; i < 8; i++) st.blendQuad[i] = st.blendFrom[i] + (quadToDraw[i] - st.blendFrom[i]) * k
+          quadToDraw = st.blendQuad
+        } else st.blendStart = 0
+      } else if (st.quad && age > TTL_MS) {
+        st.quad = null
+        st.filter.reset()
+      }
+      if (!quadToDraw && st.flat && st.lockedPhoto?.mediaUrl) {
+        const photoAspect = st.lockedPhoto.aspect > 0 ? st.lockedPhoto.aspect : 1.5
+        quadToDraw = flatQuadImage(photoAspect, vw / vh, canvasAspect, st.flatFull ? 1.0 : FLAT_WIDTH, st.flatQuad)
+      }
+      if (quadToDraw) {
+        const ndc = imageToNdc(quadToDraw, vw / vh, canvasAspect, st.ndc)
         const hm = unitSquareH(ndc, st.hm)
         if (hm) {
           const photoAspect = st.lockedPhoto?.aspect > 0 ? st.lockedPhoto.aspect : 1.5
@@ -637,9 +709,6 @@ export default {
             diag('clipVertices 拒了这一帧（四边形跨越无穷远线或退化）')
           }
         }
-      } else if (st.quad && age > TTL_MS) {
-        st.quad = null
-        st.filter.reset()
       }
       // 打桩：这一帧**实际用到**的几何与时序。放在渲染之后、送帧之前 ——
       // 它记的是"画出去的那一帧"，而不是"我们希望画出去的"。

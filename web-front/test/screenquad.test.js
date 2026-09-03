@@ -14,6 +14,7 @@ import {
   MIN_AREA_FRAC,
   approach,
   clipVertices,
+  flatQuadImage,
   imageToNdc,
   plausible,
   smoothingAlpha,
@@ -330,4 +331,40 @@ test('imageToNdc：越界的角照样映出去（照片比画面大是正常的�
   const out = new Float32Array(8)
   imageToNdc([-0.2, -0.2, 1.2, -0.2, 1.2, 1.2, -0.2, 1.2], 1, 1, out)
   assert.ok(out[0] < -1 && out[2] > 1, '越界不该被夹')
+})
+
+/* ── 平铺矩形（跟丢后视频退到屏幕中央继续播） ────────────────────────────
+   它用**归一化图像坐标**表示，为的是走与跟踪四角完全相同的渲染路径。所以这几条
+   验的都是"经 imageToNdc 之后落在哪"—— 那才是真正画出去的东西。 */
+
+test('flatQuadImage：正方画布、3:2 照片、占宽 70% → 居中矩形，比例正确', () => {
+  const q = flatQuadImage(1.5, 1, 1, 0.7, new Float32Array(8))
+  // 经 imageToNdc（frame=canvas 时恒等变换）回到 NDC 应是 ±0.7、±(0.7/1.5)
+  const ndc = imageToNdc(q, 1, 1, new Float32Array(8))
+  assert.ok(Math.abs(ndc[0] + 0.7) < 1e-6 && Math.abs(ndc[1] - 0.7 / 1.5) < 1e-6)   // TL
+  assert.ok(Math.abs(ndc[4] - 0.7) < 1e-6 && Math.abs(ndc[5] + 0.7 / 1.5) < 1e-6)   // BR
+  assert.ok(plausible(q))
+})
+
+test('flatQuadImage：竖屏画布 + 横照片，宽 100% 时高不超过画布 80%', () => {
+  const q = flatQuadImage(1.5, 4 / 3, 9 / 19.5, 1.0, new Float32Array(8))
+  const ndc = imageToNdc(q, 4 / 3, 9 / 19.5, new Float32Array(8))
+  const h = ndc[1] - ndc[5]
+  assert.ok(h <= 1.6 + 1e-6)
+})
+
+test('flatQuadImage：竖照片配竖屏，高度触顶后宽度收窄', () => {
+  // 1:2 的照片铺满 9:19.5 的屏宽会高出 80% 那道线 → 该收的是宽度，不是把它压扁。
+  const q = flatQuadImage(0.5, 4 / 3, 9 / 19.5, 1.0, new Float32Array(8))
+  const ndc = imageToNdc(q, 4 / 3, 9 / 19.5, new Float32Array(8))
+  const w = ndc[2] - ndc[0], h = ndc[1] - ndc[5]
+  assert.ok(h <= 1.6 + 1e-6 && w < 2, `w=${w} h=${h}`)
+  // 收窄之后比例仍然是照片的比例（不变形）。
+  assert.ok(Math.abs((w / h) * (9 / 19.5) - 0.5) < 1e-6)
+})
+
+test('flatQuadImage：3:2 竖屏、占宽 100% 时不触顶，宽度就该顶满', () => {
+  const q = flatQuadImage(2 / 3, 4 / 3, 9 / 19.5, 1.0, new Float32Array(8))
+  const ndc = imageToNdc(q, 4 / 3, 9 / 19.5, new Float32Array(8))
+  assert.ok(Math.abs((ndc[2] - ndc[0]) - 2) < 1e-6, '没触顶就不该收窄')
 })

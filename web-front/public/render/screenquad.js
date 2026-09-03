@@ -283,6 +283,44 @@ export function approach(cur, target, alpha) {
   for (let i = 0; i < cur.length; i++) cur[i] += (target[i] - cur[i]) * a
 }
 
+/** 平铺矩形最多占画布高度的比例。留出上下给 HUD。 */
+export const FLAT_MAX_HEIGHT_FRAC = 0.8
+
+/**
+ * 跟丢后的「平铺」位置：屏幕居中、按照片长宽比、占屏宽 `widthFrac` 的矩形，
+ * 用**归一化图像坐标**表示 —— 这样它能走与跟踪四角完全相同的渲染路径
+ * （imageToNdc → unitSquareH → clipVertices），贴合 ↔ 平铺之间还能线性插值。
+ *
+ * NDC 是 -1..1 的正方形而画布不是，所以 NDC 高 = 宽 × canvasAspect / photoAspect。
+ *
+ * 高度触顶时**收的是宽度**（而不是把高压下来）：压高度就等于把视频拉变形，而这个矩形
+ * 的全部意义是"这段视频原本贴在一张什么比例的照片上"。
+ *
+ * @param photoAspect 照片的 宽/高。拿不到（服务端没记）时按 3:2 当默认，与渲染路径同一个默认值。
+ * @param frameAspect 相机图的 宽/高 —— 只用来抵消 [imageToNdc] 的那道 cover 缩放。
+ * @param canvasAspect 画布的 宽/高
+ * @param widthFrac 占屏宽的比例（0..1）
+ * @param out 长度 8 的输出缓冲，原地写。TL→TR→BR→BL。
+ */
+export function flatQuadImage(photoAspect, frameAspect, canvasAspect, widthFrac, out) {
+  const pa = Number.isFinite(photoAspect) && photoAspect > 0 ? photoAspect : 1.5
+  let w = Math.min(2, Math.max(0.1, widthFrac * 2))
+  let hh = w * canvasAspect / pa
+  const maxH = FLAT_MAX_HEIGHT_FRAC * 2
+  if (hh > maxH) { hh = maxH; w = hh * pa / canvasAspect }
+  // NDC 四角 TL,TR,BR,BL → 反 imageToNdc
+  let sx = 1, sy = 1
+  if (frameAspect > canvasAspect) sx = frameAspect / canvasAspect
+  else sy = canvasAspect / frameAspect
+  const X = [-w / 2, w / 2, w / 2, -w / 2]
+  const Y = [hh / 2, hh / 2, -hh / 2, -hh / 2]
+  for (let i = 0; i < 4; i++) {
+    out[i * 2] = (X[i] / sx + 1) / 2
+    out[i * 2 + 1] = (1 - Y[i] / sy) / 2
+  }
+  return out
+}
+
 /**
  * 归一化图像坐标 → NDC。**Android 那边由 ARCore 的 `transformCoordinates2d` 承担的那一步。**
  *
