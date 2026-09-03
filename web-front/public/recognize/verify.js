@@ -31,24 +31,30 @@ import {
  * 才谈得上"配对结果一致"。自己写的话 crossCheck 的平局处理、以及等距离时取哪一个，
  * 都会与它分叉 —— 而分叉只表现为内点数少几个。
  *
+ * @param shared 可选，`sharedQuery(query)` 的产物 —— 查询侧描述子 Mat 与 matcher。
+ *   检测阶段对 20 个候选各配一次，而这两样在那 20 次里完全相同。
  * @returns `{count, src: Float32Array(count*2), dst: Float32Array(count*2)}`
  *   src 取自 query，dst 取自 ref —— 与服务端 `verify_pair` 里
  *   `src = query.pts[queryIdx]` / `dst = ref.pts[trainIdx]` 同向。**这个方向决定了
  *   单应矩阵是 query → ref**，而 `normalizedQuad` 依赖它，反了会得到一个数值正常
  *   但几何完全错的四边形。
  */
-export function matchHamming(query, ref) {
+export function matchHamming(query, ref, shared = null) {
   const cv = opencv()
   if (query.count < MIN_MATCHES_FOR_HOMOGRAPHY || ref.count < MIN_MATCHES_FOR_HOMOGRAPHY) {
     return { count: 0, src: new Float32Array(0), dst: new Float32Array(0) }
   }
   const cols = query.descCols ?? 32
-  const qMat = new cv.Mat(query.count, cols, cv.CV_8U)
-  qMat.data.set(query.desc)
+  // 查询侧描述子与 matcher 可以由调用方复用：检测阶段对 20 个候选各配一次，
+  // 而 qMat（4000×32=128KB）与 BFMatcher 在这 20 次里完全相同。喂给 bf.match 的
+  // 字节不变，所以配对结果与逐次新建完全一致 —— golden 钉着这条。
+  const own = !shared
+  const qMat = shared?.qMat ?? new cv.Mat(query.count, cols, cv.CV_8U)
+  if (own) qMat.data.set(query.desc)
   const rMat = new cv.Mat(ref.count, cols, cv.CV_8U)
   rMat.data.set(ref.desc)
 
-  const bf = new cv.BFMatcher(cv.NORM_HAMMING, true)
+  const bf = shared?.bf ?? new cv.BFMatcher(cv.NORM_HAMMING, true)
   const dm = new cv.DMatchVector()
   bf.match(qMat, rMat, dm)
 
@@ -62,8 +68,27 @@ export function matchHamming(query, ref) {
     dst[i * 2] = ref.pts[m.trainIdx * 2]
     dst[i * 2 + 1] = ref.pts[m.trainIdx * 2 + 1]
   }
-  dm.delete(); bf.delete(); qMat.delete(); rMat.delete()
+  dm.delete(); rMat.delete()
+  if (own) { bf.delete(); qMat.delete() }
   return { count: n, src, dst }
+}
+
+/**
+ * 给 `matchHamming` 复用的查询侧对象。用完 `.delete()`。
+ *
+ * 检测阶段一帧要配 20 次，而每次都新建一个 4000×32 的 Mat（128KB，还要从 JS 拷进
+ * wasm 堆）+ 一个 BFMatcher —— 20 份完全一样的东西。提出来建一次。
+ *
+ * **它绑死在传进来的这个 `query` 上**：拿它去配另一帧的 query 会拿旧描述子去比，
+ * 而那不报错，只表现成"认错了照片"。所以它的生命周期不要超出那一帧的候选循环。
+ */
+export function sharedQuery(query) {
+  const cv = opencv()
+  const cols = query.descCols ?? 32
+  const qMat = new cv.Mat(query.count, cols, cv.CV_8U)
+  qMat.data.set(query.desc)
+  const bf = new cv.BFMatcher(cv.NORM_HAMMING, true)
+  return { qMat, bf, delete() { qMat.delete(); bf.delete() } }
 }
 
 /** 3×3 行列式，行优先。 */
@@ -73,6 +98,31 @@ function det3(h) {
     h[1] * (h[3] * h[8] - h[5] * h[6]) +
     h[2] * (h[3] * h[7] - h[4] * h[6])
   )
+}
+
+/**
+ * `ransacPair` 的三块中间 Mat，**模块级复用**。
+ *
+ * 这条路每帧都走（跟踪帧一次、检测帧 20 次），而每次三块 Mat 一建一删是给 wasm 堆
+ * 添活。行数变了才重建 —— 点数在跟踪期间是单调递减的，所以实际重建次数很少。
+ *
+ * ## 为什么模块级缓存在这里是安全的
+ *
+ * 因为**只有 worker 一条线程在用它，而它不重入**：`findHomography` 是同步调用，
+ * JS 单线程里不可能有第二次 `ransacPair` 在它中间插进来。将来若把这个模块搬到
+ * 主线程与 worker 同时用（各自有独立的模块实例，仍然安全），或者改成异步/多线程，
+ * 这三个变量就必须跟着改成实例字段。
+ */
+let _sm = null, _dm = null, _mask = null
+function pointMats(n) {
+  const cv = opencv()
+  if (!_sm || _sm.rows !== n) {
+    _sm?.delete(); _dm?.delete()
+    _sm = new cv.Mat(n, 1, cv.CV_32FC2)
+    _dm = new cv.Mat(n, 1, cv.CV_32FC2)
+  }
+  _mask ??= new cv.Mat()
+  return [_sm, _dm, _mask]
 }
 
 /**
@@ -89,11 +139,9 @@ export function ransacPair(src, dst, minInliers = thresholds.minInliers) {
   const fail = { inliers: 0, det: 0, ok: false, h: null }
   if (n < MIN_MATCHES_FOR_HOMOGRAPHY) return fail
 
-  const sm = new cv.Mat(n, 1, cv.CV_32FC2)
+  const [sm, dm, mask] = pointMats(n)
   sm.data32F.set(src)
-  const dm = new cv.Mat(n, 1, cv.CV_32FC2)
   dm.data32F.set(dst)
-  const mask = new cv.Mat()
   let H = null
   try {
     H = cv.findHomography(sm, dm, cv.RANSAC, RANSAC_REPROJ, mask, RANSAC_MAX_ITERS, RANSAC_CONFIDENCE)
@@ -109,7 +157,8 @@ export function ransacPair(src, dst, minInliers = thresholds.minInliers) {
     const ok = inliers >= minInliers && d >= thresholds.detMin && d <= thresholds.detMax
     return { inliers, det: d, ok, h }
   } finally {
-    sm.delete(); dm.delete(); mask.delete(); H?.delete()
+    // sm/dm/mask 是模块级复用的（见 pointMats），只有 H 是这一次由 OpenCV 分配的。
+    H?.delete()
   }
 }
 
@@ -121,8 +170,8 @@ export function ransacPair(src, dst, minInliers = thresholds.minInliers) {
  * （见 `pipeline._seedTracking`），而重新跑一遍配对是 45.6ms（实测），恰好是最贵的
  * 那一步。留下来是零成本的，重算不是。
  */
-export function verifyPair(query, ref, photoId, minInliers = thresholds.minInliers) {
-  const m = matchHamming(query, ref)
+export function verifyPair(query, ref, photoId, minInliers = thresholds.minInliers, shared = null) {
+  const m = matchHamming(query, ref, shared)
   if (m.count < MIN_MATCHES_FOR_HOMOGRAPHY) {
     return { photoId, inliers: 0, det: 0, ok: false, h: null, matchCount: m.count, matches: null }
   }

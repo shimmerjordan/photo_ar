@@ -35,7 +35,7 @@
 import { OrbExtractor, opencv } from './orb.js'
 import { candidateDocs } from './library.js'
 import { thresholds } from './consts.js'
-import { decideWith, normalizedQuad, ransacPair, verifyPair } from './verify.js'
+import { decideWith, normalizedQuad, ransacPair, sharedQuery, verifyPair } from './verify.js'
 import { Streak, streakWindow } from './streak.js'
 
 export const SCANNING = 'scanning'
@@ -358,12 +358,20 @@ export class Pipeline {
     this._refSize = [this.lib.refLongEdge, 0] // 高度按命中那张照片的比例算，见下面
 
     const docs = candidateDocs(this.lib, query.desc, query.count, thresholds.topK)
+    // 查询侧的描述子 Mat 与 matcher 在这 20 次配对里完全相同，所以建一次就够 ——
+    // 逐次新建是 20 个 128KB 的 Mat 加 20 个 BFMatcher，全是同一份东西。
+    // 喂给 `bf.match` 的字节没变，配对结果逐条不变（golden 钉着）。
+    const shared = sharedQuery(query)
     const results = []
-    for (const doc of docs) {
-      const ref = this.lib.photos[doc]
-      const r = verifyPair(query, ref, ref.id)
-      r.doc = doc
-      results.push(r)
+    try {
+      for (const doc of docs) {
+        const ref = this.lib.photos[doc]
+        const r = verifyPair(query, ref, ref.id, thresholds.minInliers, shared)
+        r.doc = doc
+        results.push(r)
+      }
+    } finally {
+      shared.delete()
     }
     const decision = decideWith(results, thresholds)
     let top = decision.top
