@@ -208,6 +208,10 @@ button.ghost {
 }
 button.danger { border-image-source: url("/art/frame-red-s.png"); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+/* 一组按钮（`ui.playerControls` 的声音 + 全屏）。`display: contents` 让那两个按钮
+   直接成为 `.actions` 的弹性项 —— 否则它们挤在一个 inline 盒子里，既吃不到 gap
+   也不跟着换行。`[hidden]` 那条带 !important，所以整组照样能一起收起来。 */
+.ctl { display: contents; }
 
 /* ══ 外壳 ══════════════════════════════════════════════════════════════ */
 #app { position: fixed; inset: 0; display: flex; flex-direction: column; }

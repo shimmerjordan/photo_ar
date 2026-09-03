@@ -28,7 +28,7 @@
  */
 import * as api from '../api.js'
 import { PRINT_SIZES } from '../printsize.js'
-import { bytes, button, h, section, starRow, toast } from '../ui.js'
+import { bytes, button, h, section, setBar, starRow, toast } from '../ui.js'
 import { starHint } from '../scannability.js'
 
 /**
@@ -125,8 +125,9 @@ export default {
     const progress = h('div', { class: 'bar2' }, h('i'))
     const progressText = h('p', { class: 'p mono' })
     const setProgress = (loaded, total, label) => {
-      const pct = total ? Math.min(1, loaded / total) : 0
-      progress.firstElementChild.style.transform = `scaleX(${pct})`
+      // 总量未知时走不定长（铺满压暗），不是 `scaleX(0)` —— 一条空槽在传大文件时
+      // 看起来像"一点都没动"。
+      setBar(progress, total ? loaded / total : null)
       progressText.textContent = `${label}  ${bytes(loaded)} / ${bytes(total)}`
     }
 

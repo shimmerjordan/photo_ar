@@ -103,6 +103,59 @@ export const button = (label, onclick, { kind = '', iconName = null, disabled = 
   })
 
 /**
+ * 声音按钮的标签。**只能由 `video.muted` 派生**，见 [playerControls]。
+ */
+export const soundLabel = (muted) => (muted ? '开声音' : '静音')
+
+/**
+ * 进度条那一格的样子。抽成纯函数是为了能在 node 里钉住不定长那一档
+ * （**不编假百分比**，理由与 [loading] 同一条）。
+ */
+export function barStyle(pct) {
+  const known = typeof pct === 'number' && Number.isFinite(pct)
+  return { transform: `scaleX(${known ? Math.min(1, Math.max(0, pct)) : 1})`, opacity: known ? '1' : '.4' }
+}
+
+/**
+ * 面板里的进度条（`.bar2`）。null = 不定长：铺满并压暗，不做来回扫（面板里那样太抢）。
+ *
+ * 四处页面各写过一遍同样的三行，其中两处的不定长判据是 `typeof pct === 'number'`
+ * —— 于是 `NaN`（`loaded / 0`）会被当成"知道进度"，画出一条宽度是 `scaleX(NaN)` 的
+ * 条：整条消失。现在只有这一处。
+ */
+export function setBar(bar, pct) {
+  const s = barStyle(pct)
+  const i = bar.firstElementChild
+  i.style.transform = s.transform
+  i.style.opacity = s.opacity
+}
+
+/**
+ * 视频控件：声音 / 全屏。**状态全部从 video 元素派生**，按钮不自己记 —— 上一版的声音按钮
+ * 只在 click 里改标签，重扫后视频被静音而按钮还写着「静音」。
+ *
+ * `onFullscreen` 给扫描页：那一页没有原生控件（视频是画进 GL 的一块面片，
+ * `<video>` 元素本身是 1px 的隐藏元素，对它 `requestFullscreen` 会全屏一个看不见的
+ * 东西），所以它自己接管 —— 换成满屏平铺。其余页面走原生全屏。
+ */
+export function playerControls(video, { onFullscreen = null } = {}) {
+  const sound = button(soundLabel(video.muted), () => {
+    video.muted = !video.muted
+    if (!video.muted) video.play().catch(() => {})
+  }, { kind: 'ghost' })
+  const full = button('全屏', () => onFullscreen ? onFullscreen() : video.requestFullscreen?.().catch(() => {}), { kind: 'ghost' })
+  const sync = () => { sound.querySelector('span').textContent = soundLabel(video.muted) }
+  // `emptied` / `loadstart`：换源（重扫、换照片）时 muted 会被调用方重置，
+  // 而那时不会有 `volumechange`。
+  const evs = ['volumechange', 'emptied', 'loadstart']
+  for (const ev of evs) video.addEventListener(ev, sync)
+  const el = h('span', { class: 'ctl' }, sound, full)
+  el.sound = sound; el.full = full; el.sync = sync
+  el.dispose = () => { for (const ev of evs) video.removeEventListener(ev, sync) }
+  return el
+}
+
+/**
  * 一条一闪而过的提示。
  *
  * 只用于「做完了」这类不需要用户回应的消息。**失败不要用 toast** —— 它会自己消失，

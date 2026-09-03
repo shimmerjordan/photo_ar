@@ -30,7 +30,7 @@ import {
   videoCrop,
 } from '../render/screenquad.js'
 import { Stage, loadPhotoVideo } from '../mediaload.js'
-import { button, h } from '../ui.js'
+import { button, h, playerControls } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
@@ -84,6 +84,8 @@ const BLEND_STEPS = 4
  */
 const TIPS = {
   flat: '跟丢了，视频继续放；对准照片会贴回去。',
+  // 点「全屏」是**用户自己要的**满屏播放，不是跟丢 —— 说"跟丢了"会让他以为点坏了。
+  flat_full: '满屏播放中。对准照片会贴回去。',
   flow_lost: '跟丢了，正在重新识别…',
   homography_lost: '跟丢了，正在重新识别…',
   quad_implausible: '角度太斜了，正一点。',
@@ -130,13 +132,28 @@ export default {
       meta: h('div', { id: 'meta' }),
     }
     const rescan = button('重新扫描', () => resetLock(), { kind: 'ghost', iconName: 'refresh' })
-    const sound = button('开声音', () => {
-      dom.clip.muted = !dom.clip.muted
-      sound.querySelector('span').textContent = dom.clip.muted ? '开声音' : '静音'
-      if (!dom.clip.muted) dom.clip.play().catch(() => {})
-    }, { kind: 'ghost' })
+    /**
+     * 声音 + 全屏。**共用 `ui.playerControls`**（试播页与宾客页是原生控件，这一页没有）：
+     * 声音按钮的标签由 `dom.clip.muted` 派生，而不是在 click 里自己改 —— 上一版就是
+     * 自己改的，于是重扫之后视频被重新静音，按钮还写着「静音」，用户点它反而关了声音。
+     *
+     * 「全屏」在这一页不能是原生全屏：视频是画进 GL 的一块面片，`<video>` 元素本身是
+     * 1px 的隐藏元素（见 `.offscreen`），全屏它等于全屏一个看不见的东西。所以这里换成
+     * **满屏平铺** —— 同一段视频，占满屏宽、不再跟着照片走。
+     */
+    const ctl = playerControls(dom.clip, {
+      onFullscreen: () => {
+        if (!st.lockedPhoto?.mediaUrl) return
+        st.flat = true
+        st.flatFull = true
+        st.quad = null
+        st.filter.reset()
+        tip(TIPS.flat_full)
+        setPrimary(rescan)
+      },
+    })
     rescan.hidden = true
-    sound.hidden = true
+    ctl.hidden = true
     /**
      * 开/关相机。**这个按钮同时是权限重试的入口** —— 权限弹窗被划掉、或相机被
      * 别的 App 占着时，原来唯一的出路是刷新整页（引擎白重载一遍）。现在关掉再开
@@ -164,10 +181,10 @@ export default {
      * 其余全部落回 `ghost`。
      */
     const setPrimary = (btn) => {
-      for (const b of [rescan, sound, camBtn, browse]) b.className = b === btn ? '' : 'ghost'
+      for (const b of [rescan, ctl.sound, camBtn, browse]) b.className = b === btn ? '' : 'ghost'
     }
 
-    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, sound, camBtn, browse), dom.meta)
+    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, ctl, camBtn, browse), dom.meta)
     el.append(dom.canvas, dom.cam, dom.clip, dom.hud)
 
     /**
@@ -377,7 +394,7 @@ export default {
       delete dom.clip.dataset.photo
       dom.clip.load()
       rescan.hidden = true
-      sound.hidden = true
+      ctl.hidden = true
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
       st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
       st.flat = false; st.flatFull = false; st.blendStart = 0; st.hitTip = ''
@@ -412,9 +429,9 @@ export default {
         bar(s.pct, '播放进度')
         if (!changed) return
         st.loadNote = null
-        sound.hidden = false
+        ctl.hidden = false
         // 视频起播了：这一刻该点的是「开声音」（默认静音起播，见 onHit），不是「重新扫描」。
-        setPrimary(sound)
+        setPrimary(ctl.sound)
         st.hitTip = `认出了 <b>${title}</b>，内点 ${inliers}。`
         tip(st.hitTip, { hit: true })
         meta()
@@ -519,9 +536,11 @@ export default {
       if (m.quad && plausible(m.quad)) {
         if (st.flat) {
           // 从平铺贴回去：起点是当前平铺矩形，4 步 200ms 走到跟踪四角（像素风只用 steps）。
-          st.blendFrom.set(st.flatQuad); st.blendStart = performance.now()
+          // `plausible` 挡的是"还没画过一帧平铺"（`flatQuad` 还是零）—— 从一个退化的
+          // 四边形插过去会有 200ms 的怪形状，那种情况下直接贴上更好。
+          if (plausible(st.flatQuad)) { st.blendFrom.set(st.flatQuad); st.blendStart = performance.now() }
           st.flat = false; st.flatFull = false
-          setPrimary(sound)
+          setPrimary(ctl.sound)
           // 把起播那一句放回去：视频已经贴回照片上了，HUD 不能还写着"跟丢了"。
           if (st.hitTip) tip(st.hitTip, { hit: true })
         }
@@ -856,6 +875,8 @@ export default {
       dom.clip.removeEventListener('error', onVideoErr)
       for (const ev of videoEvents) dom.clip.removeEventListener(ev, onVideoEvent)
       dom.clip.removeEventListener('ended', onVideoEnded)
+      // 声音按钮的三个同步监听也挂在 dom.clip 上（见 ui.playerControls）。
+      ctl.dispose()
       // **相机必须停**：不停的话相机灯一直亮、电量哗哗掉，而用户以为已经离开这一页了。
       if (st.stream) stopCamera(st.stream)
       // ResizeObserver 挂在 canvas 上，canvas 随这一页卸载，但监听器不会自己断——

@@ -22,7 +22,7 @@ import * as api from '../api.js'
 import { savePhotoImage, savePhotoVideo } from '../download.js'
 import { Stage, loadPhotoVideo } from '../mediaload.js'
 import { cachedThumbUrl } from '../prefetch.js'
-import { button, failed, framed, h, loading, section } from '../ui.js'
+import { button, failed, framed, h, loading, section, setBar } from '../ui.js'
 
 export default {
   title: '照片',
@@ -88,24 +88,19 @@ export default {
         const stageLine = h('p', { class: 'p dim' })
         const vbar = h('div', { class: 'bar2' }, h('i'))
         el.append(video, stageLine, vbar)
-        const setBar = (pct) => {
-          const known = typeof pct === 'number'
-          vbar.firstElementChild.style.transform = `scaleX(${known ? Math.min(1, Math.max(0, pct)) : 1})`
-          vbar.firstElementChild.style.opacity = known ? '1' : '.4'
-        }
-        setBar(null)
+        setBar(vbar, null)
         stopLoad = loadPhotoVideo(video, id, {
           onStage: (s) => {
             if (!alive) return
             if (s.stage === Stage.PLAYING) {
               stageLine.textContent = ''
-              setBar(s.pct)
+              setBar(vbar, s.pct)
             } else if (s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR) {
               stageLine.textContent = `视频播不了：${s.text}`
               vbar.hidden = true
             } else {
               stageLine.textContent = `${STAGE_LINE[s.stage] ?? '正在加载…'}${s.text ? ` ${s.text}` : ''}`
-              setBar(s.pct)
+              setBar(vbar, s.pct)
             }
           },
         })
@@ -114,10 +109,8 @@ export default {
       // ── 存到手机 ────────────────────────────────────────────────────
       const note = h('p', { class: 'p mono' })
       const dbar = h('div', { class: 'bar2', hidden: true }, h('i'))
-      const setDl = (pct) => {
-        dbar.hidden = false
-        dbar.firstElementChild.style.transform = `scaleX(${Math.min(1, Math.max(0, pct))})`
-      }
+      // 下载那条一开始是收着的：没在下载时一条空槽看起来像"卡住了"。
+      const setDl = (pct) => { dbar.hidden = false; setBar(dbar, pct) }
 
       // 一次只让点一个：两个下载同时跑会互相抢带宽，而两条状态挤在同一行里读不出
       // 是哪一个在动。

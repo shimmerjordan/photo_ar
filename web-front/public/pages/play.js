@@ -14,7 +14,7 @@
  */
 import { MEDIA_ERR, NETWORK_STATE, READY_STATE } from '../diag.js'
 import { Stage, loadPhotoVideo } from '../mediaload.js'
-import { bytes, duration, h, row, section } from '../ui.js'
+import { bytes, duration, h, row, section, setBar } from '../ui.js'
 
 export default {
   title: '试播',
@@ -40,15 +40,9 @@ export default {
 
     el.append(video, stageLine, bar, detail, errBox, info)
 
-    const setBar = (pct) => {
-      // -1 / null = 不定长。`#bar` 那条用 class 切扫描动画，这一条在面板里，
-      // 不定长时直接铺满并压暗（见 theme.css 的 reduce-motion 分支同款处理）——
-      // 面板里一条来回扫的金条比它值得的注意力要抢眼得多。
-      const known = typeof pct === 'number'
-      bar.firstElementChild.style.transform = `scaleX(${known ? Math.min(1, Math.max(0, pct)) : 1})`
-      bar.firstElementChild.style.opacity = known ? '1' : '.4'
-    }
-    setBar(null)
+    // 不定长（null）时铺满并压暗而不是编一个假百分比，理由与三处调用方共用的
+    // `ui.setBar` 写在一起。
+    setBar(bar, null)
 
     const paintInfo = (i) => {
       if (!i || info.body.childElementCount) return
@@ -72,7 +66,7 @@ export default {
         if (s.stage === Stage.PLAYING) {
           stageLine.textContent = '正在播放'
           detail.textContent = ''
-          setBar(s.pct)
+          setBar(bar, s.pct)
           return
         }
         if (s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR) {
@@ -85,7 +79,7 @@ export default {
         }
         stageLine.textContent = STAGE_LINE[s.stage] ?? '正在加载…'
         detail.textContent = s.text
-        setBar(s.pct)
+        setBar(bar, s.pct)
       },
     })
 
