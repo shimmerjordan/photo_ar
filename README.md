@@ -13,7 +13,8 @@ own NAS. No cloud service, no third-party recognition API. Who may see which
 photos is configured in the built-in web admin panel.
 
 **Recognition and fitting run entirely in the browser; the server is not in the
-hot path.** The page downloads the recognition library once (tens of KB); after
+hot path.** The page downloads the recognition library once (about 1 KB per
+authorised photo); after
 that every frame — feature extraction, matching, homography, fitting — is local.
 The server does three things: index resources, transport (the library and the
 videos), and manage (users / grants / config).
@@ -42,6 +43,7 @@ videos), and manage (users / grants / config).
    inlier counts topped out at 39 while true positives had a 5th percentile of
    69. The two distributions barely overlap; 40 sits in the gap and takes the
    real-world false-positive rate to 0. See `bench/`.
+   (The XFeat backend has its own distribution and uses 60; see the decision record.)
 
 Two things the recogniser deliberately refuses: photos whose texture is too
 sparse to track (**about 65% of real family photos**, measured), and
@@ -78,9 +80,9 @@ admin panel and the API.
 Full walkthrough with a verification step after each command:
 **[docs/deploy.md](docs/deploy.md)**.
 
-The image intentionally contains neither `vocab.npz` (a vocabulary tree trained
-on your own photos) nor `xfeat.onnx`; both arrive at runtime — see the Dockerfile
-comments for why and how.
+The image ships `xfeat.onnx` but intentionally not `vocab.npz` (a vocabulary tree
+trained on your own photos); that one is built at runtime with
+`photoar-server build-vocab`.
 
 ## Documentation
 
@@ -107,7 +109,7 @@ web-front/            The web app (native ES modules + zero-dependency Node, no 
   public/             Pages, the recognition pipeline (opencv.js), WebGL rendering
   server/             Static files, /v1 and /admin proxy, library packing, media tickets
 docker/               Container entrypoint (two-process supervisor) and healthcheck
-tools/                batch_ingest.py (stdlib only), export_models.py, fetch_models.py
+tools/                batch_ingest.py (stdlib only), fetch_models.py, export_models.py, fragment_playable.py, cf_edge_probe.py
 bench/                Phase 0 measurement scripts
 deploy/               config.example.json, dev-machine compose overlay, ops cheat sheet
 docs/                 README.md is the index; deployment, trade-offs, decision log
@@ -142,8 +144,12 @@ done and running, with the full chain verified on a real phone. The one-containe
 one-port deployment is verified locally under the NAS resource budget
 (3 CPU / 3 GiB).
 
-There is nothing to install: the web app is the product, and it runs on Android,
-iOS and HarmonyOS alike.
+The native Android client was retired on 2026-08-05; the web app covers Android,
+iOS and HarmonyOS without an install. Its code is in git history (`android/`), the
+decision in [docs/decisions.md](docs/decisions.md).
+
+There is nothing to install: the web app is the product, and it is designed for
+Android, iOS and HarmonyOS; the full chain has been verified on an Android phone.
 
 Not yet verified on the target hardware: the XFeat backend's latency on the N5095
 (measured 800 ms p50 under a 3-CPU budget on a faster machine — likely too slow

@@ -12,7 +12,7 @@
 谁能看哪些照片在自带的网页管理台里配。
 
 **识别与贴合全部在浏览器里跑，服务端不在热路径上。** 手机打开页面时下一次识别库
-（几十 KB），之后每一帧的特征提取、匹配、单应矩阵、贴合渲染都在本地 —— 服务端只做
+（每张授权照片约 1KB），之后每一帧的特征提取、匹配、单应矩阵、贴合渲染都在本地 —— 服务端只做
 三件事：资源索引、传输（识别库与视频）、管理（用户 / 权限 / 配置）。
 
 ```
@@ -67,8 +67,8 @@ docker compose up -d
 
 每一步都带「看到什么算成」的完整流程：**[docs/deploy.md](docs/deploy.md)**。
 
-镜像里**故意不含** `vocab.npz`（用你自己的照片训出来的词汇树）与 `xfeat.onnx`，
-两个都在运行时送进容器 —— 理由与做法见 Dockerfile 里那段注释。
+镜像里带 `xfeat.onnx`，但**故意不含** `vocab.npz`（用你自己的照片训的词汇树）——
+那个在运行时用 `photoar-server build-vocab` 训。
 
 ## 文档
 
@@ -78,7 +78,9 @@ docker compose up -d
 |---|---|
 | [docs/deploy.md](docs/deploy.md) | 部署步骤：开 SSH → compose 起服务 → 确认核显硬编 → 入库 → Tailscale → Cloudflare → 手机打开网页。每步都写了看到什么算成 |
 | [docs/decisions.md](docs/decisions.md) | **决策记录**：识别特征为什么选 XFeat、为什么放弃全局描述子、阈值怎么量出来的、用户体系与权限为什么这样设计、实测延迟、以及**已知风险与下一步必须做的测量** |
-| [docs/deploy-details.md](docs/deploy-details.md) | 取舍与数字：证书为什么同时管着相机和缓存、CDN 该缓存什么、为什么用 VAAPI 而不是 QuickSync、实测基线、排障对照表 |
+| [docs/usage.md](docs/usage.md) | 日常使用：管理台、账号与授权、手机上传、批量导入 |
+| [docs/faq.md](docs/faq.md) | 症状 → 原因 → 修法对照表 |
+| [docs/deploy-details.md](docs/deploy-details.md) | 取舍与数字：证书为什么同时管着相机和缓存、CDN 该缓存什么、为什么用 VAAPI 而不是 QuickSync、实测基线 |
 | [web-front/README.md](web-front/README.md) | 网页版自己那一半：浏览器里怎么跑 ORB、跟踪与贴合、为什么没有 ARCore 的等价物 |
 | [deploy/README.md](deploy/README.md) | 命令速查、例行维护命令、`data/` 下每个文件丢了会怎样 |
 | [bench/README.md](bench/README.md) | 上面每个数字背后的测量脚本 |
@@ -93,7 +95,7 @@ web-front/            网页版（原生 ES modules + 零依赖 Node，没有构
   public/             页面、识别管线（opencv.js）、WebGL 渲染
   server/             静态资源、/v1 与 /admin 反代、识别库打包、媒体票据
 docker/               容器入口（双进程管理器）与健康检查
-tools/                batch_ingest.py（只用标准库）、export_models.py、fetch_models.py
+tools/                batch_ingest.py（只用标准库）、fetch_models.py、export_models.py、fragment_playable.py、cf_edge_probe.py
 bench/                Phase 0 的测量脚本
 deploy/               config.example.json、开发机的 compose 覆盖层、运维速查
 docs/                 README.md 是索引；部署、取舍与决策记录
@@ -109,11 +111,8 @@ cd web-front && npm test                 # 网页版（零依赖，只用 node -
 网页版还有几套要真浏览器的：`npm run test:browser`（识别管线的黄金用例）、
 `npm run test:smoke` 与 `npm run test:pages`（对着一个跑着的容器点一遍每个页面）。
 
-发一版新的服务端镜像是个明确动作，不是推代码的副作用：
-
-```bash
-git tag v0.2.0 && git push origin v0.2.0    # 触发构建并推到 GHCR
-```
+发一版新镜像是个明确动作，不是推代码的副作用：**只能手动触发** —— Actions → server → Run workflow，
+填 `publish` / `version` / `latest` / `release` 四项。推代码或打 tag 都不会发版（推 main 只跑测试）。
 
 读源码的一点提醒：注释里的 `§N` 指的是一份没有随仓库发布的内部设计文档。每处注释
 都把真正的理由写在了旁边，所以不看那份文档也不缺信息。
@@ -124,8 +123,9 @@ git tag v0.2.0 && git push origin v0.2.0    # 触发构建并推到 GHCR
 网页管理台都已经做完并在跑，真机（安卓 / Chromium）上验证过完整链路。一个容器一个
 端口的部署形态在开发机上按 NAS 的资源预算（3 核 / 3 GiB）验证过。
 
-**安卓原生客户端 2026-08-05 下线**，精力集中在网页版：不用装、iOS 与鸿蒙同样能用，
-而它的识别与贴合质量已经够。那一套代码在 git 历史里（`android/`），决策记录在
+**安卓原生客户端 2026-08-05 下线**，精力集中在网页版：不用装；完整链路在安卓真机上
+验证过，iOS / 鸿蒙按同样的 Web API 工作，而它的识别与贴合质量已经够。那一套代码在
+git 历史里（`android/`），决策记录在
 [docs/decisions.md](docs/decisions.md)。
 
 还没在目标硬件上验证的：XFeat 后端在 N5095 上的延迟（在更快的机器上按 3 核预算实测
