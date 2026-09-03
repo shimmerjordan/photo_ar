@@ -128,6 +128,20 @@ export function toast(message) {
  */
 export const confirmDanger = (message) => globalThis.confirm(message)
 
+/**
+ * N 颗星。**用图不用字符**：点阵字体里没有 ★，写进文案会回退到系统 emoji 字体。
+ * 暗星用同一张图压 opacity —— 不另切一张灰星。
+ */
+export function starRow(n, { total = 5 } = {}) {
+  const row = h('span', { class: 'stars', 'aria-label': `${n} 星（满 ${total} 星）`, role: 'img' })
+  for (let i = 0; i < total; i++) {
+    const s = sprite('star', { alt: '' })
+    if (i >= n) s.classList.add('off')
+    row.appendChild(s)
+  }
+  return row
+}
+
 /** 字节数。与 Android `Fmt.bytes` 同一个口径（1024 进制，一位小数）。 */
 export function bytes(n) {
   if (!Number.isFinite(n) || n < 0) return '—'

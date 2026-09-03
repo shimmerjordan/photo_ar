@@ -15,7 +15,8 @@
  */
 import * as api from '../api.js'
 import { Page } from '../navpolicy.js'
-import { bytes, button, confirmDanger, duration, failed, framed, h, loading, row, section, toast, when } from '../ui.js'
+import { bytes, button, confirmDanger, duration, failed, framed, h, loading, row, section, starRow, toast, when } from '../ui.js'
+import { starHint } from '../scannability.js'
 
 export default {
   title: '照片详情',
@@ -52,6 +53,10 @@ export default {
       } else if (d.videoMissing) {
         warns.push('关联的视频文件不见了。')
       }
+      if ((d.stars ?? 1) <= 2) {
+        const hint = starHint(d.stars)
+        if (hint) warns.push(hint)
+      }
       for (const w of warns) el.appendChild(h('p', { class: 'warnbox', text: w }))
 
       el.appendChild(framed(h('img', {
@@ -64,6 +69,7 @@ export default {
         // 0 表示"未知"，服务端与 Android 都以 0 为未知（见 §13）。显示成"未填"
         // 而不是 0mm —— 后者看起来像一个真的测量值。
         row('打印宽度', d.printWidthM > 0 ? `${Math.round(d.printWidthM * 1000)} mm` : '未填（扫的时候要轻轻晃一下手机）'),
+        h('div', { class: 'row2' }, h('span', { class: 'k', text: '可扫性' }), h('span', { class: 'v' }, starRow(d.stars ?? 1))),
         row('自匹配', String(d.selfScore ?? '—'), { mono: true }),
         row('入库时间', when(d.createdAt))))
 

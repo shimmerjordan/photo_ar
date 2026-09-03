@@ -28,7 +28,8 @@
  */
 import * as api from '../api.js'
 import { PRINT_SIZES } from '../printsize.js'
-import { bytes, button, h, section, toast } from '../ui.js'
+import { bytes, button, h, section, starRow, toast } from '../ui.js'
+import { starHint } from '../scannability.js'
 
 /**
  * 本地算 sha256。服务端的判重与 `uploadCheck` 都按这个值。
@@ -62,6 +63,11 @@ export default {
     const say = (text, kind = '') => {
       if (!alive) return
       log.appendChild(h('p', { class: `step ${kind}`, text }))
+      log.scrollTop = log.scrollHeight
+    }
+    const sayNode = (node, kind = '') => {
+      if (!alive) return
+      log.appendChild(h('p', { class: `step ${kind}` }, node))
       log.scrollTop = log.scrollHeight
     }
 
@@ -217,6 +223,11 @@ export default {
             return
           }
           throw e
+        }
+
+        if (Number.isFinite(created?.stars)) {
+          const hint = starHint(created.stars)
+          sayNode(h('span', {}, '可扫性 ', starRow(created.stars), hint ? ` ${hint}` : ''), created.stars <= 2 ? 'warn' : 'ok')
         }
 
         const pid = created?.photoId ?? created?.id

@@ -1478,6 +1478,7 @@ function renderByPhoto(box) {
         el('span', { cls: 'sub mono', text: p.refPath || p.photoId }),
         p.refMissing ? el('span', { cls: 'tag bad', text: '参考图读不到' }) : null,
         p.refStale ? el('span', { cls: 'tag bad', text: '参考图已变' }) : null,
+        p.stars <= 2 ? el('span', { cls: 'tag warn', text: `可扫性 ${p.stars}/5` }) : null,
       ], 'wide'),
       td('视频', p.videoPath
         ? [

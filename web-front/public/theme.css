@@ -360,6 +360,9 @@ button.danger { border-image-source: url("/art/frame-red-s.png"); }
 .badge { padding: 0 4px; background: rgb(94 26 47 / 20%); color: var(--fg-dim); }
 .badge.warn { background: rgb(255 196 43 / 55%); color: var(--ink); }
 
+.stars { display: inline-flex; gap: 2px; vertical-align: middle; }
+.stars img.off { opacity: .25; }
+
 /* 详情页那张大参考图也进相框 —— 它是这一页的主体，裸着挂在深色底上像张贴纸。 */
 .framed { display: block; margin: 0 0 12px; filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%)); }
 .ref { display: block; width: 100%; max-height: 42vh; object-fit: contain; background: #000; }

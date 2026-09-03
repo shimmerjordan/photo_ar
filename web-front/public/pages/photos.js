@@ -53,6 +53,8 @@ export default {
         // 「参考图变了」只给管理员：宾客对它无能为力（要重新入库），
         // 摆在他面前只会让他以为自己的照片坏了。
         if (isAdmin && p.refStale) flags.push(h('span', { class: 'badge warn', text: '参考图变了' }))
+        // 「较难扫」两种角色都给：宾客也该知道"这张可能扫不出"。
+        if (p.stars <= 2) flags.push(h('span', { class: 'badge warn', text: '较难扫' }))
         grid.appendChild(h('button', {
           class: 'card', onclick: () => ctx.shell.push(isAdmin ? Page.DETAIL : Page.VIEW, { id }),
         },
