@@ -191,10 +191,6 @@ services:
       WEBFRONT_TLS_CERT: ${WEBFRONT_TLS_CERT:-}
       WEBFRONT_TLS_KEY: ${WEBFRONT_TLS_KEY:-}
 
-      # 监听地址。0.0.0.0 = 容器内全部接口（对外仍然只有上面 ports 那一条）。
-      # ⚠️ 起了网页版时这个值**会被 entrypoint 覆盖成 127.0.0.1** —— 后端必须待在
-      # 回环上，否则同一个 docker 网络里的别人能绕过前面那层直接打 /v1。
-      PHOTOAR_BIND: 0.0.0.0
       # 词汇树用 UTF-8 路径，容器里 locale 默认是 POSIX，显式设一下省事
       LANG: C.UTF-8
     volumes:
@@ -202,8 +198,8 @@ services:
       # 丢了要全库重新入库（每张约 5s，一万张十几小时）。
       - ./data:/data
       # 可选：放了 deploy/config.json 就会用它代替环境变量（见文件头的说明）。
-      # 目录不存在时 compose 会自动建一个空目录，里面没有 config.json，
-      # entrypoint 于是走环境变量 —— 所以这条挂载留着是无害的。
+      # ⚠️ 只要 deploy/config.json 存在，上面 environment 里除 TOKEN / ADMIN_* / COOKIE_SECURE / PORT
+      # 以外的变量全部**静默失效**（以文件为准）。不打算用 config.json 就别把 config.example.json 复制过去。
       - ./deploy:/config:ro
       # 照片与视频。只读挂载：这个服务永远不改用户的原始文件
       # （唯一的写入是 /v1/upload，落在下面单独一条可写挂载里）。

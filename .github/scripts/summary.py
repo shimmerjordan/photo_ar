@@ -280,7 +280,7 @@ curl -s http://<host>:{PORT}/api/config    # 顺手确认版本号是 {VERSION}
 的话 http 直连没问题** —— 那两条不碰相机。
 
 而且真证书不是"体验优化"：**Chromium 对有证书错误的源整站禁用磁盘缓存**，自签之下
-每次进页面都要重下 2.4MB 的识别引擎（实测 71.5s vs 1.6s）。手机自测用
+每次进页面都要重下 4.87MB 的识别引擎（实测 16 秒 vs 1.6 秒）。手机自测用
 `WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`（两个必须同时给，只给一个进程直接退出），
 优先用 `tailscale cert` 的真证书。
 """

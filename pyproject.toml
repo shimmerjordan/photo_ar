@@ -30,6 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# tools/export_models.py 用：把 XFeat 权重导成 ONNX。只在开发机上装。
+export = ["torch>=2.1", "onnx>=1.15"]
 
 [project.scripts]
 photoar = "photoar.cli:main"
