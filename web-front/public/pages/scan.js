@@ -35,6 +35,7 @@ import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
 import { sendInterval } from '../pacing.js'
+import { CLOSER_MIN_INLIERS, GUIDE_DEBOUNCE_MS, guideTip } from '../guide.js'
 
 /** 送帧间隔由 pacing.sendInterval 决定，见那个文件。 */
 /**
@@ -61,13 +62,13 @@ import { sendInterval } from '../pacing.js'
  */
 const MAX_INFLIGHT = 2
 
-/** 每一句都必须**能照着做**，而且要区分原因。见 Android 那边的教训。 */
+/**
+ * **跟丢**之后那几句。每一句都必须能照着做，而且要区分原因（见 Android 那边的教训）。
+ *
+ * 扫描阶段（还没锁定）的那几句**不在这里** —— 它们要按内点数、连续帧数、多久没证据
+ * 分档，而一张 `reason → 文案` 的表表达不了那些条件。见 `guide.js`。
+ */
 const TIPS = {
-  scanning: '把整张照片放进画面，靠近一点、拿稳。',
-  no_features: '画面里几乎没有纹理。对准照片，避开纯色的墙面。',
-  weak: '认不出来。让照片占满画面多一些，手指别压住边缘，避开反光。',
-  ambiguous: '<span class="bad">库里有两张几乎一样的照片</span>，它们会互相干扰。请让管理员删掉其中一张。',
-  empty: '这个账号下还没有可扫的照片。',
   flow_lost: '跟丢了，正在重新识别…',
   homography_lost: '跟丢了，正在重新识别…',
   quad_implausible: '角度太斜了，正一点。',
@@ -129,8 +130,29 @@ export default {
      */
     const camBtn = button('关相机', () => { st.stream ? closeCam() : openCam() }, { kind: 'ghost' })
     camBtn.hidden = true
+    /**
+     * 「我能扫的照片」。**这是空库与"一直扫不出来"两条死路唯一的出口。**
+     *
+     * 过去这两种处境下 HUD 只说一句"没有可扫的照片"/"认不出来"，然后什么都不做 ——
+     * 用户站在取景器前，屏幕上没有任何可点的东西。空库那一支甚至连相机都没开。
+     *
+     * 去哪一页由 `browseTab` 定（空库那一支会改它）。**不能改 `browse.onclick`** ——
+     * `h()` 是用 `addEventListener` 挂的，赋 `onclick` 只会再挂一个，两个都会跑。
+     */
+    let browseTab = 'photos'
+    const browse = button('我能扫的照片', () => ctx.shell.tab(browseTab), { kind: 'ghost' })
+    browse.hidden = true
 
-    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, sound, camBtn), dom.meta)
+    /**
+     * 同一屏只能有**一个**金框按钮 —— 金框的含义是"这一刻该点的就是它"，两个金框等于
+     * 没有金框。所以主次不是各按钮自己的属性，而是这一屏的状态：由这个函数一次定完，
+     * 其余全部落回 `ghost`。
+     */
+    const setPrimary = (btn) => {
+      for (const b of [rescan, sound, camBtn, browse]) b.className = b === btn ? '' : 'ghost'
+    }
+
+    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, sound, camBtn, browse), dom.meta)
     el.append(dom.canvas, dom.cam, dom.clip, dom.hud)
 
     /**
@@ -152,6 +174,9 @@ export default {
       frameSeq: 0, inflight: 0, lastSentAt: 0, paused: false,
       // 距上一份证据多久 / 上一条结果说了什么 —— pacing.sendInterval 的两个输入。
       lastEvidenceAt: performance.now(), lastReason: '',
+      // 引导文案那一档的三个量：连续几帧落在"看见了但不够"、当前显示的是哪一档、
+      // 那一档是什么时候换上去的（防抖，见 GUIDE_DEBOUNCE_MS）。
+      weakRun: 0, guideKey: '', guideAt: 0,
       // 切后台时真停相机与视频解码要记住的两件事：视频当时在不在播、相机当时开不开。
       pausedClip: false, wasCamOn: false,
       fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0, lastGrabMs: 0,
@@ -324,7 +349,9 @@ export default {
       rescan.hidden = true
       sound.hidden = true
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
-      tip(TIPS.scanning)
+      st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
+      setPrimary(null)
+      tip(guideTip({}).text)
     }
 
     /**
@@ -355,6 +382,8 @@ export default {
         if (!changed) return
         st.loadNote = null
         sound.hidden = false
+        // 视频起播了：这一刻该点的是「开声音」（默认静音起播，见 onHit），不是「重新扫描」。
+        setPrimary(sound)
         tip(`认出了 <b>${title}</b>，内点 ${inliers}。`, { hit: true })
         meta()
         return
@@ -466,18 +495,21 @@ export default {
         // 就回来。停了再播会从头开始，那比继续播难看得多。
         st.quad = null
         st.filter.reset()
-        tip(TIPS[m.reason] ?? TIPS.scanning)
+        setPrimary(rescan)
+        tip(TIPS[m.reason] ?? guideTip({}).text)
       } else if (!st.lockedPhoto) {
-        // 正在攒证据时说"就快了"，而不是那句"认不出来"。
-        //
-        // 这两件事在用户那边是**完全不同的下一步**：「认不出来」意味着要换姿势
-        // （靠近、正过来、避反光），而「攒到 2/3」意味着**保持现在这个姿势别动**。
-        // 上一版两种都显示"认不出来"，于是用户在最接近成功的那一刻改变了姿势。
-        if (m.streak && m.streak.n > 0) {
-          tip(`看到了，拿稳别动… ${m.streak.n}/${m.streak.need}`)
-        } else {
-          tip(TIPS[m.reason] ?? TIPS.scanning)
-        }
+        // 扫描阶段的引导：分档在 `guide.js`（那里能按内点/连续帧/多久没证据分，
+        // 而"攒到 2/3"与"认不出来"要用户做的是**相反**的事 —— 一个别动，一个换姿势）。
+        st.weakRun = (m.reason === 'weak' && (m.inliers ?? 0) >= CLOSER_MIN_INLIERS) ? st.weakRun + 1 : 0
+        const g = guideTip({ reason: m.reason, inliers: m.inliers, weakRun: st.weakRun, idleMs: performance.now() - st.lastEvidenceAt, streak: m.streak })
+        // 2 秒内不换句子（攒证据那句除外：进度数字要实时）。换得太快用户一句都读不完。
+        const now = performance.now()
+        if (g.key !== st.guideKey && (g.key === 'streak' || st.guideKey === 'streak' || now - st.guideAt >= GUIDE_DEBOUNCE_MS)) {
+          st.guideKey = g.key; st.guideAt = now
+          tip(g.text)
+        } else if (g.key === 'streak') tip(g.text)
+        // 一直扫不出来时给出唯一的出口。其余时候收起来 —— 扫描期间那个按钮是干扰。
+        browse.hidden = g.key !== 'not_in_library'
       }
       meta()
     }
@@ -526,7 +558,7 @@ export default {
       st.renderer ??= new Renderer(dom.canvas)
       st.grabber ??= new FrameGrabber(dom.cam)
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
-      if (!st.lockedPhoto) tip(TIPS.scanning)
+      if (!st.lockedPhoto) tip(guideTip({}).text)
       cancelAnimationFrame(st.raf)
       st.raf = requestAnimationFrame(loop)
     }
@@ -542,9 +574,23 @@ export default {
       tip('相机已关。点「开相机」继续扫。')
     }
 
+    /**
+     * 空库：**不开相机，但也不能是死路。**
+     *
+     * 上一版只说一句"这个账号下还没有可扫的照片"就结束了 —— 没有相机画面、没有一个
+     * 可点的东西，而两种人在这一刻要做的事完全不同：管理员该去传一张（素材页），
+     * 宾客该去看看自己有哪些照片（照片页，也许只是这台设备的库还没同步下来）。
+     * 相机按钮也留着：库是 mount 那一刻的快照，用户可能刚在别的页面传完。
+     */
     const lib = ctx.libInfo?.()
     if (lib && lib.nPhotos === 0) {
-      tip(TIPS.empty)
+      tip(guideTip({ reason: 'empty' }).text)
+      browse.hidden = false
+      browse.querySelector('span').textContent = ctx.isAdmin() ? '去素材页传一张' : '看看我的照片'
+      browseTab = ctx.isAdmin() ? 'media' : 'photos'
+      setPrimary(browse)
+      camBtn.hidden = false
+      camBtn.querySelector('span').textContent = '开相机'
       meta(true)
     } else {
       await openCam()
