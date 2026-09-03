@@ -78,13 +78,8 @@ docker compose logs -f photo-ar-server
 
 **算成**：日志里 `[photoar] 监听 0.0.0.0:8964｜照片 0 张｜后端 orb`，约 20 秒后 `docker compose ps` 的 health 变 `healthy`。
 
-日志里有一行**只出现一次**，现在就抄走：
-
-```
-[photoar] 已创建引导管理员 'admin'，随机口令：xxxxxxxxxxxx
-```
-
-登录 `http://<NAS>:8964/admin`，**进去第一件事就是改掉**。（想要自己记得住的口令，先在 `.env` 里填 `PHOTOAR_ADMIN_PASSWORD`。）
+登录 `http://<NAS>:8964/admin`，账号 `admin`、初始口令 `admin`，**第一次登录会强制改口令**。
+（想跳过强制改密，先在 `.env` 里填 `PHOTOAR_ADMIN_PASSWORD`。）
 
 日志里那条 `⚠️ 没有词表` 是**正常**的，第 5 步末尾会训。
 
@@ -279,7 +274,7 @@ WEBFRONT_TLS_KEY=/certs/<机器名>.<tailnet>.ts.net.key
 | 2 | 建 `_arphoto_inbox` | 目录在 | 2 |
 | 3 | 拉 compose 与 `.env`，填 `PHOTOAR_ROOTS` | 文件都在，冒号两边一样 | 2 |
 | 4 | `docker compose pull && up -d` | 日志 `监听 0.0.0.0:8964`，20s 后 `healthy` | 3 |
-| 5 | **抄走日志里那行随机管理员口令** | 登进 `/admin` 并立刻改掉 | 3 |
+| 5 | 用 admin / admin 登 `/admin` | 被要求改口令，改完进入管理台 | 3 |
 | 6 | 不带凭证 ping | `401` | 3 |
 | 7 | 问服务它选了哪个编码器 | `h264_vaapi` | 4 |
 | 8 | 手工入一张（纹理丰富的） | `201` + `photoId` | 5 |

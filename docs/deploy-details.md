@@ -491,7 +491,7 @@ docker compose up -d --build
 两个容易踩的点：
 
 - **管理员口令写在 `.env` 里，不在 compose 里。** 这个仓库是公开的，固定口令写进
-  compose 就等于发布出去了（见 decisions.md §16）。留空就是每次去日志里翻随机口令。
+  compose 就等于发布出去了（见 decisions.md §16）。留空就是 admin / admin + 首登强制改。
 - **cpus / mem 刻意不放宽。** 验收条件之一是「在 NAS 的资源预算内跑得动」（N5095 四核）。
   开发机放开了怎么测都快，到 NAS 上才发现撞超时 —— 那就白测了。
 

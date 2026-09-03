@@ -68,7 +68,7 @@ docker compose up -d
 
 No hand-written config file, no pre-trained vocabulary, no pre-staged model —
 whatever is missing is explained in the startup log and the service still comes
-up. The bootstrap admin password is printed to the log once.
+up. The bootstrap admin logs in as admin / admin and must change the password on first login.
 
 ⚠️ **Guests need https in front of it**: the camera (`getUserMedia`) only exists
 in a secure context, and `http://<LAN IP>` is not one. One extra ingress rule on

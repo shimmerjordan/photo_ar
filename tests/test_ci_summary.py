@@ -97,7 +97,7 @@ def _ci_env_names() -> set[str]:
 def test_摘要里那条最小命令与_CI_跑通的那条是同一组必填项(tmp_path):
     md = run(tmp_path, PUBLISHED="true", TAGS=TAGS)
     # 两个 PHOTOAR_ADMIN_* 只是为了让 CI 能自动登录测一遍，不是部署必填的
-    # （不设 = 生成随机口令打印一次，那才是推荐的形态）。
+    # （不设 = admin / admin + 首登强制改）。
     required = _ci_env_names() - {"PHOTOAR_ADMIN_NAME", "PHOTOAR_ADMIN_PASSWORD"}
     assert required, "从 workflow 里没抠出任何环境变量 —— 正则和那一步漂了"
     for name in required:

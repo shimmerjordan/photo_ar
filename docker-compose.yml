@@ -2,7 +2,7 @@
 #
 #   cp .env.example .env && ${EDITOR} .env      # 只有 PHOTOAR_ROOTS 必须看一眼
 #   docker compose up -d
-#   docker compose logs -f photo-ar-server      # 抄走里面那行随机管理员口令
+#   docker compose logs -f photo-ar-server      # 初始管理员 admin / admin，首次登录强制改口令
 #
 # 起来之后同一个端口按 URI 分：
 #
