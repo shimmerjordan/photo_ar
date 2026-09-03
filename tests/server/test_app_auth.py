@@ -293,7 +293,7 @@ def test_访客能做的只有登录_识别_看自己被授权的那些(env, two
 
     白名单里为什么是这些：
       - `ping` / `auth/*`：不登录就没有别的可谈。
-      - `recognize` / `recognize/features` / `model/xfeat`：扫这件事本身。
+      - `recognize`：扫这件事本身。
       - `photos` / `photo/<id>` 及其派生（thumb / ref / media）与 `asset/*/stream`：
         「扫出结果」之后要能看到那张照片和播那段视频。这些全都过 `photo_filter` 或
         `_photo_or_404`，只给他被授权的那些。

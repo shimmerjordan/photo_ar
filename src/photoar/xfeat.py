@@ -94,8 +94,8 @@ def canvas_size(h: int, w: int) -> tuple[int, int]:
     """原始尺寸 (h, w) → 缩放后的**有效区**尺寸 (nh, nw)。
 
     单独一个函数而不是留在 `prepare` 里，因为这个公式现在有**三份实现**：这里、
-    Android 侧的 `XFeatPreprocess`、以及 `POST /v1/recognize/features` 收下端上
-    关键点时用来验"坐标有没有落在有效区里"的那道检查。三份不一致不会报错，只会让
+    Android 侧的 `XFeatPreprocess`、以及服务端收下相机帧后的预处理里用来验"坐标
+    有没有落在有效区里"的那道检查。三份不一致不会报错，只会让
     关键点被判在补边区（或者反过来放过一个补边全错的客户端），所以服务端这两处
     至少要共用同一个名字。
 

@@ -409,7 +409,7 @@ class PhotoLibrary:
     def verify_features(
         self, query: Features, top_k: int = TOP_K
     ) -> list[PairResult]:
-        """特征**已经提好**的那一半（端上提特征的 `POST /v1/recognize/features` 走这条）。
+        """特征**已经提好**的那一半。`recognize` 提完特征后走这条。
 
         拆出来而不是让新接口自己抄一遍循环：粗排候选、`extra_slots` 兜底、精排用哪个
         `verify` 全在这几行里，抄一份的后果是两条识别路径的候选集不一样 —— 而两边都

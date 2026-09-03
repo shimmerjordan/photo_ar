@@ -132,7 +132,7 @@ def test_channel_order_is_rgb():
 def test_canvas_size_matches_prepare(h, w, nh, nw):
     """`canvas_size` 必须与 `prepare` 真的算出来的有效区一致。
 
-    两者分开之后，`featurebody._check_bounds` 拿 `canvas_size` 去判「关键点有没有落在
+    两者分开之后，服务端收下相机帧后的预处理拿 `canvas_size` 去判「关键点有没有落在
     补边区」—— 它算错的话，那道检查会去挡合法请求，或者放过一个补边全错的客户端。
     """
     assert xfeat.canvas_size(h, w) == (nh, nw)

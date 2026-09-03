@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import backend as backend_mod
-from .. import transcode, xfeat
+from .. import transcode
 from .mediaresolve import DEFAULT_STRATEGIES
 
 DEFAULT_PORT = 8964  # spec §9.1 的 LAN endpoint 用的端口
@@ -58,17 +58,6 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 # 宁可我们先拒、把话说清楚，也不要让 Cloudflare 在传到一半时掐断 —— 它掐断时返回的
 # 是一张没有上下文的错误页，用户只会看到"上传失败"。
 TUNNEL_MAX_UPLOAD_BYTES = 95 * 1024 * 1024
-
-# `POST /v1/recognize/features`（端上提特征）的请求体上限，**单独一条**。
-#
-# 不能沿用 MAX_JSON_BYTES（64KB）：一个完全合法的请求就有约 180KB，那条上限会把这个
-# 接口的每一次调用都拒掉 —— 而且拒的是 413，看起来像"客户端发了个巨大的东西"。
-# 也不该沿用 MAX_RECOGNIZE_BYTES（2MB）：那个数是给"用户误发了原图"留的 40 倍余量，
-# 而这里的体积由 `xfeat.TOP_K` **完全确定**，收紧到刚够用是免费的。
-#
-# 明细：关键点 512×2×4 = 4KB，描述子 512×64×4 = 128KB，共 132KB；base64 膨胀 4/3
-# 后约 176KB，再加 JSON 键名与转义。取 2 倍余量，跟着 TOP_K 自动变。
-MAX_FEATURES_BYTES = 2 * (xfeat.TOP_K * (2 + xfeat.DESC_DIM) * 4 * 4 // 3 + 4096)
 
 # 算自匹配分用的扰动样本数。`dedup.self_score` 取中位数，样本太少中位数不稳；
 # 20 与 §14.1 的回归测试同一个数，也是 0d 全部实测数字的来源。每张约 1s。

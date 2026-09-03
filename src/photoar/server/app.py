@@ -40,7 +40,6 @@ from ..nullvocab import NullVocab
 from ..sheet import SheetError
 from . import (
     batch,
-    featurebody,
     framedump,
     fsbrowser,
     integrity,
@@ -64,7 +63,6 @@ from .auth import (
     verify_password,
 )
 from .config import (
-    MAX_FEATURES_BYTES,
     MAX_JSON_BYTES,
     MAX_RECOGNIZE_BYTES,
     MAX_UPLOAD_BYTES,
@@ -811,8 +809,6 @@ class Server:
             ("POST", ("auth", "logout"), self._auth_logout),
             ("GET", ("auth", "me"), self._auth_me),
             ("POST", ("recognize",), self._recognize),
-            ("POST", ("recognize", "features"), self._recognize_features),
-            ("GET", ("model", "xfeat"), self._model_xfeat),
             ("GET", ("photos",), self._list_photos),
             ("POST", ("photo",), self._create_photo),
             ("GET", ("photo", "*"), self._photo_detail),
@@ -1141,47 +1137,6 @@ class Server:
             raw_frame=part.data,
         )
 
-    def _recognize_features(self, req: Request, prin: Principal) -> Response:
-        """端上提特征那条路。响应形状与 `/v1/recognize` **完全一致**。
-
-        "完全一致"是硬要求而不是巧合：客户端解析命中响应的代码是共用的一份
-        （Android 侧 `ApiParse.recognize`）。多一个字段、少一个字段、或者把 latencyMs
-        的含义改成"只算配对"，都会在换路径时表现成"另一条路上偶发解析失败"。
-        所以两条路共用 `_decide_and_respond`，差别只在候选是怎么算出来的。
-
-        `latencyMs` 在这里如实只包含**服务端**耗时（不含端上推理与上传）。这条路的
-        意义就是把推理挪走，把端上那 20-30ms 算进来会让两条路的数字不可比。
-        """
-        t0 = time.perf_counter()
-        active = self.library.backend.name
-        if active != backend_mod.XFEAT:
-            # 描述子格式不兼容：ORB 是 32 字节二值、XFeat 是 64 维 float32。硬收下
-            # 只会让 `descstore` 那边按 ORB 的 stride 去读一段 float 缓冲区 —— 读出
-            # 来的是垃圾，而且**不报错**（长度恰好能对上时）。所以在这里就拒。
-            #
-            # 判据用**实际在跑的**后端而不是配置里要的那个：XFeat 模型不在时服务会
-            # 回退 ORB（见 `_open_backend`），此时配置说 xfeat、库里是 ORB 描述子。
-            # 按配置判就会收下一批永远匹配不上的描述子，而 `/v1/ping` 上那个
-            # backendDegraded 才是真相。
-            raise HttpError(
-                400,
-                "unsupported_backend",
-                f"端上提特征只能配 {backend_mod.XFEAT} 后端使用，"
-                f"当前实际在跑的是 {active}（描述子格式不兼容：ORB 是 32 字节二值，"
-                f"XFeat 是 64 维 float32；硬收下只会读出垃圾）。"
-                f"改用 POST /v1/recognize 传 JPEG，或把后端换成 {backend_mod.XFEAT}。",
-                activeBackend=active,
-                requestedBackend=self.backend_requested,
-            )
-        try:
-            query = featurebody.parse(req.json_body(MAX_FEATURES_BYTES))
-        except featurebody.FeaturesRejected as exc:
-            raise HttpError(400, exc.code, exc.message) from exc
-
-        return self._decide_and_respond(
-            req, prin, t0, lambda top_k: self.library.verify_features(query, top_k)
-        )
-
     @staticmethod
     def _streak_key(prin: Principal) -> str:
         """跨帧累积按谁分链。
@@ -1371,43 +1326,6 @@ class Server:
             # spec §13：参考图内容变过，仍尝试命中但要提示特征可能已过期
             payload["refStale"] = True
         return json_response(200, payload, **{"Cache-Control": "no-store"})
-
-    def _model_xfeat(self, req: Request, prin: Principal) -> Response:
-        """下发端上提特征要用的那份 ONNX 模型（4.31MB）。
-
-        **为什么由服务端下发，而不是打进 APK**：模型与库里的描述子是绑死的 —— 换一份
-        模型（换 top_k、换检测阈值、重新导出）就等于全库描述子作废。打进 APK 的话，
-        "哪份模型有效"会有两个答案（用户装的那个版本 vs 服务端此刻跑的那个），而两者
-        不一致的表现是识别率静默下降，不是报错。放在这里下发，答案只有一个。
-        另外 4.31MB × 4 个 ABI 的 native 库已经让 APK 涨了不少，模型不该再加进去。
-
-        要鉴权，但**不要求 admin**：需要它的人正是拿着手机扫照片的 viewer。
-
-        `Cache-Control: no-cache` + ETag 而不是 immutable：这个文件是可以被换掉的
-        （运维换一份模型重启服务），而 immutable 会让客户端上那份缓存永远不再回源 ——
-        换了模型之后手机上还是旧的，且没有任何地方看得出来。no-cache 只是要求
-        "每次问一句 ETag 变了没"，命中时是 304 空体，代价可以忽略。
-        """
-        path = self.cfg.xfeat_model_path
-        if not path.is_file():
-            # 404 而不是 500：这是一个**正常**的部署状态（后端是 orb 时根本不需要
-            # 模型）。客户端拿到 404 应该静默退回传 JPEG 那条路，而不是报错给用户。
-            raise HttpError(
-                404,
-                "model_missing",
-                f"服务端没有 {path.name}（找的是 {path}）。"
-                f"取法见 tools/fetch_models.py 或 tools/export_models.py。"
-                f"端上提特征需要它，传 JPEG 的那条路不需要。",
-            )
-        return self._static_file(
-            req,
-            path,
-            "application/octet-stream",
-            immutable=False,
-            cache="no-cache",
-        )
-
-    # ---- 端上离线识别用的整库目标 ----
 
     def _ref_aspect(self, photo: dict[str, Any]) -> float | None:
         asset = self.catalog.get_asset(str(photo["ref_asset_id"]))
