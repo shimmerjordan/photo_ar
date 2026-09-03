@@ -52,7 +52,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from photoar import backend, features, refprep, synth, verify  # noqa: E402
+from photoar import backend, features, synth, verify  # noqa: E402
 
 #: 客户端发帧的规格，与 `Frames.kt` 的 `LONG_EDGE`/`JPEG_QUALITY` 保持一致。
 #: 640 是 spec §7 的原始规定，已在真机上被证伪（那一档一档都不全过门槛），
@@ -305,11 +305,6 @@ def main(argv: list[str]) -> int:
                     help=f"客户端发的帧长边（默认 {FRAME_LONG_EDGE}，与 Frames.LONG_EDGE 一致）。"
                          "抬它是唯一能真正**增加信息量**的旋钮：照片在帧里的实际像素数"
                          "跟着涨，而不是把已经丢掉的细节插值回来")
-    ap.add_argument("--ref-pre", default="none",
-                    help=f"参考图预处理档位（{','.join(refprep.VARIANTS)}）。"
-                         "**只作用在参考图上**，合成出来的帧仍然来自原图 —— 这是"
-                         "刻意的保守设定：真机上相机看到的是打印件经过 ISP 的样子，"
-                         "高频比原图更强，所以这里测出来的是下界")
     ap.add_argument("--query-long-edge", default=None,
                     help="服务端提查询特征时缩到的长边，逗号分隔即多尺度阶梯，"
                          f"取各尺度中最好的一档（默认单档 {backend.QUERY_LONG_EDGE}，"
@@ -322,9 +317,8 @@ def main(argv: list[str]) -> int:
     if ref is None:
         print(f"读不出参考图：{a.ref}", file=sys.stderr)
         return 1
-    # 帧合成用**原图** `ref`，参考特征用预处理后的 `ref_pre` —— 两者刻意分开，
-    # 见 `--ref-pre` 的帮助文字。
-    ref_pre = refprep.apply(ref, a.ref_pre)
+    # 参考图不做任何预处理（§51：CLAHE / unsharp 已被否定），特征直接从原图提。
+    ref_pre = ref
     ref_f = features.extract(ref_pre, long_edge=a.ref_long_edge, n_features=a.ref_features)
 
     if a.out:
@@ -333,8 +327,7 @@ def main(argv: list[str]) -> int:
     ladder = ([int(x) for x in a.query_long_edge.split(",")]
               if a.query_long_edge else [backend.QUERY_LONG_EDGE])
 
-    print(f"参考图 {a.ref}  {ref.shape[1]}x{ref.shape[0]}  特征 {len(ref_f)} 个  "
-          f"预处理 {a.ref_pre}")
+    print(f"参考图 {a.ref}  {ref.shape[1]}x{ref.shape[0]}  特征 {len(ref_f)} 个")
     print(f"判定门槛 MIN_INLIERS={verify.MIN_INLIERS}  查询侧特征 {a.query_features}  "
           f"中心裁剪 {a.crop:.2f}  发帧长边 {a.frame_long_edge}  "
           f"查询尺度 {','.join(str(x) for x in ladder)}\n")
