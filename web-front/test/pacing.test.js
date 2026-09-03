@@ -2,6 +2,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { PACE, MOTION_STILL, IDLE_SLOW_MS, IDLE_MS, sendInterval } from '../public/pacing.js'
 
+test('常量数值钉住，改动必须显式改这条测试', () => {
+  assert.deepEqual(PACE, { FAST: 16, STILL: 100, SLOW: 300, IDLE: 700 })
+  assert.equal(MOTION_STILL, 0.08)
+  assert.equal(IDLE_SLOW_MS, 10_000)
+  assert.equal(IDLE_MS, 30_000)
+})
+
 test('锁定且静止 → STILL；锁定且在动 → FAST', () => {
   assert.equal(sendInterval({ locked: true, motion: 0, idleMs: 0, reason: 'ok' }), PACE.STILL)
   assert.equal(sendInterval({ locked: true, motion: MOTION_STILL - 0.01, idleMs: 0, reason: 'ok' }), PACE.STILL)

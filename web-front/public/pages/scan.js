@@ -489,6 +489,12 @@ export default {
         st.stream = null
         return
       }
+      if (document.hidden) {
+        // 等相机的这几百毫秒里页面又被切到后台了：立刻停掉，标记等回前台再开。
+        stopCamera(st.stream); st.stream = null; st.wasCamOn = true
+        camBtn.disabled = false
+        return
+      }
       camBtn.disabled = false
       camBtn.hidden = false
       camBtn.querySelector('span').textContent = '关相机'

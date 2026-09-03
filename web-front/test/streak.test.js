@@ -165,6 +165,7 @@ describe('参数', () => {
 })
 
 test('streakWindow：检测间隔小时用默认 2000，大时放到 4 倍间隔', () => {
+  assert.equal(STREAK_DEFAULTS.windowMs, 2000)
   assert.equal(streakWindow(0), STREAK_DEFAULTS.windowMs)
   assert.equal(streakWindow(300), STREAK_DEFAULTS.windowMs)   // 1200 < 2000
   assert.equal(streakWindow(700), 2800)                       // IDLE 档：3 帧 2100ms 必须容得下
