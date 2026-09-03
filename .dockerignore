@@ -11,6 +11,7 @@ docs
 *.egg-info
 build
 dist
+tools/arcoreimg
 
 # 网页版：只有 server/ 与 public/ 进镜像（Dockerfile 里逐条 COPY），这里把它旁边那些
 # 一定不该进去的挡在构建上下文之外 —— 尤其 test/golden 里有个 3.7MB 的查询帧，

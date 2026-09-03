@@ -980,7 +980,7 @@ function renderGrantPanel() {
   if (!state.photos.length) {
     panel.appendChild(el('div', { cls: 'empty' }, [
       el('p', { text: '库里还没有照片，没有东西可以授权。' }),
-      el('p', { cls: 'hint', text: '照片由手机 App 或批量入库脚本写入。' }),
+      el('p', { cls: 'hint', text: '照片由网页版「素材」页上传，或用管理台的「批量」页 / batch_ingest.py 导入。' }),
     ]));
     return;
   }
@@ -1452,7 +1452,7 @@ function renderPhotos() {
   else renderByPhoto(box);
 }
 
-const EMPTY_HINT = '照片由手机 App（「素材」页传一组）或管理台的「批量」页导入。';
+const EMPTY_HINT = '还没有照片。用网页版的「素材」页传一组，或在「批量」页导入 NAS 上已有的文件。';
 
 function renderByPhoto(box) {
   const photos = state.mapping.photos;
@@ -2469,7 +2469,7 @@ async function deleteMount(m) {
 /**
  * 「添加照片」：挑一张图 → 挑一段视频（可跳过）→ 入库并建立映射。
  *
- * 和 App 的「素材」页是同一件事的两条路，区别只在**素材从哪来**：那边是手机相册，
+ * 和网页版的「素材」页是同一件事的两条路，区别只在**素材从哪来**：那边是手机相册，
  * 这边是服务端能看到的位置（挂载点 / PHOTOAR_ROOTS）。两边都落到同一个
  * `POST /v1/photo {refPath, videoPath}`。
  */

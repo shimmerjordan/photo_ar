@@ -77,9 +77,7 @@ COPY src/ ./src/
 # opencv-python 再装一遍普通版会白占 200MB 并覆盖掉 headless。
 RUN pip install --no-cache-dir --no-deps .
 
-# tools/ 整个目录拷进来（batch_ingest.py / fetch_models.py 在里面）。开发机上这个
-# 目录里可能还躺着一个 gitignore 的 arcoreimg 二进制（已删的安卓客户端时代遗产，
-# decisions §46）—— 被顺带拷进来也没关系，没有代码再引用它。
+# tools/ 只需要 batch_ingest.py 与 fetch_models.py；本地若残留 gitignore 的二进制不会进镜像（见 .dockerignore）。
 COPY tools/ ./tools/
 COPY docker/ ./docker/
 # XFeat 模型（4.3MB，sha256 由 tools/fetch_models.py 钉住）。**打进镜像是刻意的**：

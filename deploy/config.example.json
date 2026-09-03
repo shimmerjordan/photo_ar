@@ -13,7 +13,7 @@
     "网盘": "/share/CloudDrive"
   },
 
-  "_data_dir": "索引、SQLite、.imgdb、缩略图、转码产物。必须是持久卷。",
+  "_data_dir": "索引、SQLite、缩略图、转码产物。必须是持久卷。",
   "data_dir": "/data",
 
   "_models_dir": "模型与词表（xfeat.onnx / vocab.npz / vocab_xfeat.npz）。省略则用 <data_dir>/models。单独一个键是为了它能挂成几个部署共享的卷。",
@@ -21,9 +21,6 @@
 
   "_vocab_path": "⚠️【可选，而且一般应该省略】。省略时按后端取 <models_dir>/vocab.npz（orb）或 vocab_xfeat.npz（xfeat）；那个文件不存在时服务用空词表启动（识别结果正确，但每次全量扫描），入库之后用 `photoar-server build-vocab` 训一份就落到那个默认路径上。显式写这个键只有一种用途：指向一份历史遗留的 ORB 词表 —— 它【只对 orb 后端生效】，因为已有部署里它指向的一定是二进制词表，交给 XFeat 去 load 会读出一棵毫无意义的树（或 KeyError）。",
   "vocab_path": null,
-
-  "_arcoreimg": "ARCore SDK 里的二进制，镜像里在 /opt/photoar/tools/arcoreimg（已在 PATH 里）。",
-  "arcoreimg": "arcoreimg",
 
   "_video_encoder": "转码编码器。\"auto\"（默认）探测到核显就用 h264_vaapi，探测不到静默回退 libx264。想确认硬编真的生效，就显式写 \"h264_vaapi\"：探测失败会直接报错而不是悄悄软编（那种情况唯一的发现方式是掐表）。需要 docker-compose.yml 里的 devices: /dev/dri。",
   "video_encoder": "auto",

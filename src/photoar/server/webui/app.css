@@ -99,7 +99,6 @@ body {
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 .muted { color: var(--ink-3); }
-.nowrap { white-space: nowrap; }
 
 /* ---------- 登录 ---------- */
 
