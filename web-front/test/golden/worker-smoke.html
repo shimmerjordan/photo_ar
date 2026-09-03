@@ -240,6 +240,57 @@ runPage(async () => {
     push(`补种子被触发过（${reseeds} 次）`, reseeds > 0, metrics.longTrack)
   }
 
+  // ── bitmap 那条路：跟踪帧只解 640 ──────────────────────────────────
+  //
+  // 上面全部走 `buf`（退化路径，每帧都是全图）。**线上走的是另一条**：
+  // `scan.js` 送 `ImageBitmap`，而 worker 每帧只画一张 640 的小图，只在检测帧与
+  // 重锚帧才把 1280 的全图也画一遍（`pipeline.wantsFull()`）。
+  //
+  // 这一条不测的话，两件事只能到真机上才暴露：
+  //   1. 跟踪灰度图换了来源（drawImage 缩 vs cvtColor+INTER_AREA），光流跟不跟得住；
+  //   2. 重锚那一帧要全图，而它是**下一帧**才到的（`_wantFull` 把重锚推后一帧）——
+  //      这个往返错了就表现为"锁上之后再也不重锚"，而那没有任何报错。
+  {
+    worker.postMessage({ type: 'reset' })
+    const sendBitmap = async (id, dx = 0, dy = 0, noise = 0, seed = 1) => {
+      const bmp = await createImageBitmap(new ImageData(makeRgba(dx, dy, noise, seed), W, H))
+      worker.postMessage({ type: 'frame', id, width: W, height: H, bitmap: bmp }, [bmp])
+      return waitFor(worker, 'result', 30_000, `bitmap 帧 ${id}`)
+    }
+
+    const first = await sendBitmap(500)
+    push('bitmap 路：第一帧命中（检测帧拿到了全图）',
+      first.reason === 'ok' && first.photoId === 'goldenphoto' && first.state === 'locked', { first })
+    push(`bitmap 路：内点数与 buf 路相当（${first.inliers} vs ${res.inliers}）`,
+      Math.abs((first.inliers ?? 0) - (res.inliers ?? 0)) / (res.inliers || 1) <= 0.2,
+      { bitmap: first.inliers, buf: res.inliers })
+
+    // 与上面那段长跟踪同样的运动与噪声，只是走 bitmap。
+    const N = 60
+    const STEP = 3
+    const trail = []
+    let gaveUp = false
+    let reseeds = 0
+    for (let i = 0; i < N; i++) {
+      const r = await sendBitmap(600 + i, (i + 1) * STEP, Math.round((i + 1) * STEP * 0.4),
+        Math.round((i / N) * 130), 1000 + i)
+      trail.push(r.inliers ?? 0)
+      if (r.reseeded) reseeds++
+      if (r.gaveUp) { gaveUp = true; break }
+    }
+    metrics.bitmapTrack = {
+      frames: trail.length, reseeds, gaveUp,
+      first: trail[0], last: trail.at(-1), min: Math.min(...trail),
+    }
+    await log(`bitmap 长跟踪 ${trail.length} 帧 内点 ${trail[0]}→${trail.at(-1)} 最低 ${Math.min(...trail)} 补种子 ${reseeds} 次`)
+    push(`bitmap 路：连续 ${N} 帧不放手（实测跑了 ${trail.length} 帧）`, !gaveUp, metrics.bitmapTrack)
+    push(`bitmap 路：内点数没跌破跟踪下限（最低 ${Math.min(...trail)}）`,
+      Math.min(...trail) >= 12, metrics.bitmapTrack)
+    // 补种子必须真的发生过 —— 它要全图，而全图只在这条往返成立时才会到。
+    push(`bitmap 路：重锚成功过（${reseeds} 次，证明 wantsFull 的往返通了）`,
+      reseeds > 0, metrics.bitmapTrack)
+  }
+
   push('Worker 全程没有 onerror', fatal === null, { fatal })
   worker.terminate()
 

@@ -25,6 +25,16 @@
  * 检测慢于相机帧率，消息会堆积。这里**不排队**：正在忙时直接丢掉新帧，只记住最后一帧。
  * 排队的后果是延迟单调增长 —— 用户已经把手机移开了，Worker 还在算三秒前那一帧，
  * 而算出来的四角会贴到一个已经不在那里的照片上。
+ *
+ * ## 跟踪帧只解 640
+ *
+ * 一帧 1280×960 的 RGBA 是 4.9MB，而 `getImageData` 要把它从 GPU 读回来 —— 那笔钱
+ * 每帧都付。可跟踪帧根本不需要它：它只跑光流，而光流跑在 640 上（见
+ * `pipeline.TRACK_LONG_EDGE`）。所以这里问一句 `pipeline.wantsFull()`：**只有检测帧
+ * 与重锚帧**才把全图也画一张、读一遍，其余帧只读 1.2MB 的小图。
+ *
+ * 全图那条路一个字节都没动（`drawImage(bmp, 0, 0, msg.width, msg.height)` 原样），
+ * 因为提特征的像素决定描述子的每一位。
  */
 import { init, opencv } from './orb.js'
 import { unpack } from './library.js'
@@ -116,26 +126,27 @@ function onFrame(msg) {
 }
 
 /**
- * `ImageBitmap` → `ImageData`，**在 worker 线程上**。
+ * `ImageBitmap` → `ImageData`，**在 worker 线程上**，两个尺度各一张画布。
  *
  * 这一段就是从主线程搬过来的那 65ms（真机实测 1280×960；搬到这边之后主线程只付
  * `createImageBitmap` 的 19.4ms）。`drawImage(bmp, 0, 0, w, h)` 与主线程那条
  * `grab()` 是**逐字节同一条路** —— 缩放算法不能换，理由写在 `camera.js` 的
- * `grabBitmap()` 上面。
+ * `grabBitmap()` 上面。**那条禁令只管全图**（它去提特征）；小图只喂光流，
+ * 与描述子无关，所以它可以让 `drawImage` 缩。
  *
- * OffscreenCanvas 复用一张：每帧新建会让 GPU 侧不停分配纹理。
+ * OffscreenCanvas 各复用一张：每帧新建会让 GPU 侧不停分配纹理。
  */
-let offscreen = null
-let offctx = null
-function imageDataFromBitmap(bmp, w, h) {
-  if (!offscreen || offscreen.width !== w || offscreen.height !== h) {
-    offscreen = new OffscreenCanvas(w, h)
-    offctx = offscreen.getContext('2d', { willReadFrequently: true, alpha: false })
+let offscreen = null, offctx = null
+let smallCanvas = null, smallCtx = null
+function canvasFor(kind, w, h) {
+  const isSmall = kind === 'small'
+  let c = isSmall ? smallCanvas : offscreen
+  if (!c || c.width !== w || c.height !== h) {
+    c = new OffscreenCanvas(w, h)
+    const ctx = c.getContext('2d', { willReadFrequently: true, alpha: false })
+    if (isSmall) { smallCanvas = c; smallCtx = ctx } else { offscreen = c; offctx = ctx }
   }
-  offctx.drawImage(bmp, 0, 0, w, h)
-  // **必须 close()**：ImageBitmap 持有 GPU 内存，不关就是真的泄漏。
-  bmp.close()
-  return offctx.getImageData(0, 0, w, h)
+  return isSmall ? smallCtx : offctx
 }
 
 function drain() {
@@ -144,10 +155,34 @@ function drain() {
   pending = null
   busy = true
   try {
-    const imageData = msg.bitmap
-      ? imageDataFromBitmap(msg.bitmap, msg.width, msg.height)
-      : { width: msg.width, height: msg.height, data: new Uint8ClampedArray(msg.buf) }
-    const out = pipeline.push(imageData)
+    let frame
+    if (msg.bitmap) {
+      const wantFull = pipeline.wantsFull()
+      const [sw, sh] = pipeline.smallDims(msg.width, msg.height)
+      // 小图**每帧都画**（1.2MB，便宜），全图只在检测/重锚帧画（4.9MB + 后面的
+      // cvtColor/resize）。两张都从同一个 bitmap 画，缩放路径固定，
+      // 见 pipeline._toTrackGray 里那段「必须来自同一条路」。
+      const small = canvasFor('small', sw, sh)
+      small.drawImage(msg.bitmap, 0, 0, sw, sh)
+      const smallData = small.getImageData(0, 0, sw, sh)
+      let full = null
+      if (wantFull) {
+        const fc = canvasFor('full', msg.width, msg.height)
+        fc.drawImage(msg.bitmap, 0, 0, msg.width, msg.height)   // 与 camera.grab() 逐字节同一条路
+        full = fc.getImageData(0, 0, msg.width, msg.height)
+      }
+      // **必须 close()**：ImageBitmap 持有 GPU 内存，不关就是真的泄漏。
+      msg.bitmap.close()
+      frame = { full, small: smallData, width: msg.width, height: msg.height }
+    } else {
+      // 退化路径（没有 OffscreenCanvas）：只有全图，跟踪灰度图由 pipeline 自己缩（老路）。
+      frame = {
+        full: { width: msg.width, height: msg.height, data: new Uint8ClampedArray(msg.buf) },
+        width: msg.width,
+        height: msg.height,
+      }
+    }
+    const out = pipeline.pushFrame(frame)
     // `grabbedAt` 原样带回。主线程的延迟补偿要知道"这个结果测的是多久之前的画面"，
     // 而那**不等于** `now - ms`：帧可能在 `pending` 里排过队（跟踪 44ms > 送帧
     // 间隔 33ms 时必然发生），排队那一段不在 ms 里。

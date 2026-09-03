@@ -100,6 +100,13 @@ const FLOW_LEVELS = 3
  */
 export const TRACK_LONG_EDGE = 640
 
+/** 查询空间尺寸 → 跟踪空间尺寸。worker 与 `_toTrackGray` 都用它，**必须是同一个公式**。 */
+export function trackDims(qw, qh) {
+  const longest = Math.max(qw, qh)
+  const s = Math.min(1, TRACK_LONG_EDGE / longest)
+  return [Math.max(1, Math.round(qw * s)), Math.max(1, Math.round(qh * s))]
+}
+
 /** 重解单应至少要剩多少个点。低于它这一帧就算跟丢 —— 4 点是数学下限，太接近下限的解不可信。 */
 const MIN_TRACK_POINTS = 12
 
@@ -232,7 +239,25 @@ export class Pipeline {
     this._prevGray = new this.cv.Mat()
     this._curGray = new this.cv.Mat()
     this._grayFull = new this.cv.Mat()
-    this._small = new this.cv.Mat()
+    /**
+     * 下一帧要不要全分辨率（`wantsFull` 的一次性加签）。
+     *
+     * 只有一种情况会置起来：跟踪帧判定该重锚了，可这一帧 worker 只送了小图 ——
+     * 于是把重锚推后一帧，并要求下一帧带全图。
+     */
+    this._wantFull = false
+    /**
+     * 相机帧（查询尺度）与跟踪尺度的两块 RGBA 落地 Mat，**按帧复用**。
+     *
+     * 每帧新建一个 1280×960×4 的 Mat 是在 wasm 堆上申请 4.9MB，而 emscripten 的堆
+     * 不会还给系统 —— 表现是内存单调上涨，手机上最终被浏览器杀掉。尺寸变了才重建。
+     */
+    this._src = null
+    this._small = null
+    /** 光流的三个出参。固定形状、每帧写满，所以提成字段而不是每帧新建。 */
+    this._nextPts = new this.cv.Mat()
+    this._status = new this.cv.Mat()
+    this._err = new this.cv.Mat()
     /** 种子换算到跟踪空间的那一份（复用，避免每帧新建 Mat）。 */
     this._flowPts = null
     /** 查询空间 → 跟踪空间的比例，`_toTrackGray` 每帧维护。 */
@@ -252,18 +277,48 @@ export class Pipeline {
   }
 
   /**
+   * 下一帧要不要全分辨率。**只有检测帧与重锚帧要**；其余跟踪帧 640 灰度就够。
+   * 提前 60ms 预告重锚（一帧的量），免得重锚那一帧到了却只有小图、白等一轮。
+   */
+  wantsFull() {
+    if (this.state !== LOCKED) return true
+    if (this._wantFull) return true
+    return performance.now() - this._lastReseedAt > REANCHOR_MS - 60
+  }
+
+  /** 相机帧尺寸 → worker 该把小图画成多大。 */
+  smallDims(w, h) {
+    const [qw, qh] = this._queryDims(w, h)
+    return trackDims(qw, qh)
+  }
+
+  /**
    * 喂一帧。
    *
-   * @param imageData 相机帧的 `ImageData`（RGBA）
+   * @param frame `{full?: ImageData, small?: ImageData, width, height}`。`full` 是查询
+   *   长边的 RGBA（提特征用）；`small` 是跟踪长边的 RGBA（光流用）。跟踪帧可以只给 small。
    * @returns `{state, quad, photoId, inliers, reason, ms}`。`quad` 为 null 表示这一帧
    *   没有可用的贴合几何（调用方应当继续用上一份，直到 TTL 过期）。
    */
-  push(imageData) {
+  pushFrame(frame) {
     const t0 = performance.now()
-    const out = this.state === LOCKED ? this._track(imageData) : this._detect(imageData)
+    let out
+    if (this.state === LOCKED) out = this._track(frame)
+    else if (frame.full) out = this._detect(frame.full, frame.small)
+    else out = { quad: null, reason: 'need_full' }   // 主线程/worker 竞态：要检测却只给了小图
     out.ms = Math.round(performance.now() - t0)
     out.state = this.state
     return out
+  }
+
+  /**
+   * 喂一帧全分辨率的 `ImageData`。跟踪灰度图由管线自己缩（`_toTrackGray` 的老路）。
+   *
+   * 留着它是因为它就是"每帧都有全图"那条路 —— 没有 OffscreenCanvas 的浏览器、以及
+   * `test/golden/` 里的几个测试页都走它。
+   */
+  push(imageData) {
+    return this.pushFrame({ full: imageData, width: imageData.width, height: imageData.height })
   }
 
   /** 强制回到检测。用户点"重新扫描"、或者上层判断该放手时调。 */
@@ -277,81 +332,84 @@ export class Pipeline {
     this._refPts = null
     this._corrNext = false
     this._reseedFails = 0
+    // 回到检测之后 `wantsFull()` 反正恒真，这里清掉是为了**下一次锁定**：不清的话
+    // 那次锁定期间它一直是 true，worker 每帧都画全图，整条降尺度的路白搭。
+    this._wantFull = false
   }
 
-  _detect(imageData) {
-    const cv = this.cv
+  /**
+   * @param imageData 全分辨率（查询长边）的 RGBA，提特征用。
+   * @param small 同一帧的跟踪尺度 RGBA。命中时拿它当跟踪灰度图的来源 ——
+   *   与后续跟踪帧走同一条路，见 `_toTrackGray`。
+   */
+  _detect(imageData, small) {
     this.stats.detects++
     const nowDetect = performance.now()
     const detectGap = this._lastDetectAt ? nowDetect - this._lastDetectAt : 0
     this._lastDetectAt = nowDetect
     const src = this._matFrom(imageData)
-    try {
-      const query = this.extractor.extract(src)
-      if (query.count === 0) return { quad: null, reason: 'no_features' }
+    const query = this.extractor.extract(src)
+    if (query.count === 0) return { quad: null, reason: 'no_features' }
 
-      // 查询侧特征空间的尺寸。**不是**相机帧的尺寸 —— 四角要按真正提特征的那张图换算，
-      // 而 OrbExtractor 内部把长边缩到了 queryLongEdge。弄混就差一倍（§35.3 点名的
-      // 三处之一）。
-      this._querySize = this._queryDims(imageData.width, imageData.height)
-      this._refSize = [this.lib.refLongEdge, 0] // 高度按命中那张照片的比例算，见下面
+    // 查询侧特征空间的尺寸。**不是**相机帧的尺寸 —— 四角要按真正提特征的那张图换算，
+    // 而 OrbExtractor 内部把长边缩到了 queryLongEdge。弄混就差一倍（§35.3 点名的
+    // 三处之一）。
+    this._querySize = this._queryDims(imageData.width, imageData.height)
+    this._refSize = [this.lib.refLongEdge, 0] // 高度按命中那张照片的比例算，见下面
 
-      const docs = candidateDocs(this.lib, query.desc, query.count, thresholds.topK)
-      const results = []
-      for (const doc of docs) {
-        const ref = this.lib.photos[doc]
-        const r = verifyPair(query, ref, ref.id)
-        r.doc = doc
-        results.push(r)
-      }
-      const decision = decideWith(results, thresholds)
-      let top = decision.top
-      let reason = 'ok'
-      if (!decision.matched) {
-        // 单帧没过。**交给跨帧累积再看一眼** —— 真机实测内点分布中位 30、最大 38，
-        // 而门槛是 40，单帧判定在这种视角下永远过不了（那组数字在 `streak.js` 里）。
-        this.streak.configure({
-          softMin: thresholds.streakSoftMin,
-          need: thresholds.streakNeed,
-          windowMs: streakWindow(detectGap),
-        })
-        const got = this.streak.offer(results, performance.now(), [thresholds.detMin, thresholds.detMax])
-        if (!got) {
-          const p = this.streak.progress
-          return {
-            quad: null,
-            reason: decision.reason,
-            inliers: decision.inliers,
-            // 攒到第几帧了。诊断日志靠它区分「完全没看到」和「正在攒」——
-            // 后者是「再举稳一会儿就好了」，而那句话值得说给用户听。
-            streak: p.n > 0 ? p : undefined,
-          }
-        }
-        top = got.top
-        reason = 'streak'
-      } else {
-        // 单帧命中了：链要清掉。不清的话下一次未命中会接着一条属于上一次的链。
-        this.streak.reset()
-      }
-      const photo = this.lib.photos[top.doc]
-      // 参考侧高度：从照片的宽高比反推。库里存的 pts 在 640 长边的空间里，而那张图
-      // 的短边是多少只有 aspect 知道。aspect 缺失时退回 3:2（最常见的相纸比例）——
-      // 它只影响四角的形状，不影响是否命中。
-      const aspect = Number.isFinite(photo.aspect) && photo.aspect > 0 ? photo.aspect : 1.5
-      this._refSize = aspect >= 1
-        ? [this.lib.refLongEdge, Math.round(this.lib.refLongEdge / aspect)]
-        : [Math.round(this.lib.refLongEdge * aspect), this.lib.refLongEdge]
-
-      const quad = normalizedQuad(top.h, this._refSize, this._querySize)
-      this._seedTracking(src, query, top)
-      this.state = LOCKED
-      this.misses = 0
-      const meta = photoMeta(photo)
-      this.locked = { photoId: photo.id, doc: top.doc, inliers: top.inliers, photo: meta, quad }
-      return { quad, photoId: photo.id, inliers: top.inliers, reason, photo: meta, fresh: true }
-    } finally {
-      src.delete()
+    const docs = candidateDocs(this.lib, query.desc, query.count, thresholds.topK)
+    const results = []
+    for (const doc of docs) {
+      const ref = this.lib.photos[doc]
+      const r = verifyPair(query, ref, ref.id)
+      r.doc = doc
+      results.push(r)
     }
+    const decision = decideWith(results, thresholds)
+    let top = decision.top
+    let reason = 'ok'
+    if (!decision.matched) {
+      // 单帧没过。**交给跨帧累积再看一眼** —— 真机实测内点分布中位 30、最大 38，
+      // 而门槛是 40，单帧判定在这种视角下永远过不了（那组数字在 `streak.js` 里）。
+      this.streak.configure({
+        softMin: thresholds.streakSoftMin,
+        need: thresholds.streakNeed,
+        windowMs: streakWindow(detectGap),
+      })
+      const got = this.streak.offer(results, performance.now(), [thresholds.detMin, thresholds.detMax])
+      if (!got) {
+        const p = this.streak.progress
+        return {
+          quad: null,
+          reason: decision.reason,
+          inliers: decision.inliers,
+          // 攒到第几帧了。诊断日志靠它区分「完全没看到」和「正在攒」——
+          // 后者是「再举稳一会儿就好了」，而那句话值得说给用户听。
+          streak: p.n > 0 ? p : undefined,
+        }
+      }
+      top = got.top
+      reason = 'streak'
+    } else {
+      // 单帧命中了：链要清掉。不清的话下一次未命中会接着一条属于上一次的链。
+      this.streak.reset()
+    }
+    const photo = this.lib.photos[top.doc]
+    // 参考侧高度：从照片的宽高比反推。库里存的 pts 在 640 长边的空间里，而那张图
+    // 的短边是多少只有 aspect 知道。aspect 缺失时退回 3:2（最常见的相纸比例）——
+    // 它只影响四角的形状，不影响是否命中。
+    const aspect = Number.isFinite(photo.aspect) && photo.aspect > 0 ? photo.aspect : 1.5
+    this._refSize = aspect >= 1
+      ? [this.lib.refLongEdge, Math.round(this.lib.refLongEdge / aspect)]
+      : [Math.round(this.lib.refLongEdge * aspect), this.lib.refLongEdge]
+
+    const quad = normalizedQuad(top.h, this._refSize, this._querySize)
+    this._seedTracking(src, query, top, small)
+    this.state = LOCKED
+    this.misses = 0
+    const meta = photoMeta(photo)
+    this.locked = { photoId: photo.id, doc: top.doc, inliers: top.inliers, photo: meta, quad }
+    return { quad, photoId: photo.id, inliers: top.inliers, reason, photo: meta, fresh: true }
   }
 
   /**
@@ -361,9 +419,9 @@ export class Pipeline {
    * 喂噪声。而 RANSAC 在外点占比高时会拟合出"数值正常但几何错"的矩阵 —— 表现是视频突然
    * 跳到画面另一处，比不贴更难解释。
    */
-  _seedTracking(src, query, top) {
+  _seedTracking(src, query, top, small) {
     const cv = this.cv
-    this._toTrackGray(src)
+    this._toTrackGray(src, small)
     this._curGray.copyTo(this._prevGray)
 
     // 重跑一次配对拿 mask 太贵，所以这里用 top.h 自己筛：把 query 点投到 ref 空间，
@@ -412,96 +470,103 @@ export class Pipeline {
     this._lastReseedAt = performance.now()
   }
 
-  _track(imageData) {
+  _track(frame) {
     const cv = this.cv
     this.stats.tracks++
     if (!this._prevPts || !this._refPts) {
       this.state = SCANNING
       return { quad: null, reason: 'no_seed' }
     }
-    const src = this._matFrom(imageData)
-    const nextPts = new cv.Mat()
-    const status = new cv.Mat()
-    const err = new cv.Mat()
-    try {
-      this._toTrackGray(src)
-      const { sx, sy } = this._trackScale
-      const n = this._prevPts.rows
-      // 种子存在**查询空间**，光流跑在**跟踪空间** —— 进去之前换算一次。
-      // 复用同一块 Mat：每帧新建一个 80 行的 Mat 是给 wasm 堆添活，而这条路每秒几十次。
-      if (!this._flowPts || this._flowPts.rows !== n) {
-        this._flowPts?.delete()
-        this._flowPts = new cv.Mat(n, 1, cv.CV_32FC2)
-      }
-      const fp = this._flowPts.data32F
-      const sp = this._prevPts.data32F
-      for (let i = 0; i < n; i++) {
-        fp[i * 2] = sp[i * 2] * sx
-        fp[i * 2 + 1] = sp[i * 2 + 1] * sy
-      }
-      cv.calcOpticalFlowPyrLK(this._prevGray, this._curGray, this._flowPts, nextPts, status, err,
-        new cv.Size(FLOW_WIN, FLOW_WIN), FLOW_LEVELS)
+    // 跟踪帧通常**只有小图**（worker 只在检测/重锚帧画全图，见 `wantsFull`）。
+    // 全图在这里只有一个用处：重锚要拿它提特征，所以没有全图时重锚推后一帧。
+    const src = frame.full ? this._matFrom(frame.full) : null
+    // 光流的三个出参是字段（固定形状、每帧写满），所以这里不新建也不 delete。
+    const nextPts = this._nextPts, status = this._status, err = this._err
+    this._toTrackGray(src, frame.small)
+    const { sx, sy } = this._trackScale
+    const n = this._prevPts.rows
+    // 种子存在**查询空间**，光流跑在**跟踪空间** —— 进去之前换算一次。
+    // 复用同一块 Mat：每帧新建一个 80 行的 Mat 是给 wasm 堆添活，而这条路每秒几十次。
+    if (!this._flowPts || this._flowPts.rows !== n) {
+      this._flowPts?.delete()
+      this._flowPts = new cv.Mat(n, 1, cv.CV_32FC2)
+    }
+    const fp = this._flowPts.data32F
+    const sp = this._prevPts.data32F
+    for (let i = 0; i < n; i++) {
+      fp[i * 2] = sp[i * 2] * sx
+      fp[i * 2 + 1] = sp[i * 2 + 1] * sy
+    }
+    cv.calcOpticalFlowPyrLK(this._prevGray, this._curGray, this._flowPts, nextPts, status, err,
+      new cv.Size(FLOW_WIN, FLOW_WIN), FLOW_LEVELS)
 
-      // 跟丢的点必须剔掉。留着它们等于给 RANSAC 喂随机坐标。
-      // 存活点顺手换回查询空间 —— 后面的 RANSAC、重投影、四角换算全在那个坐标系。
-      const keptSrc = []
-      const keptRef = []
-      for (let i = 0; i < n; i++) {
-        if (!status.data[i]) continue
-        keptSrc.push(nextPts.data32F[i * 2] / sx, nextPts.data32F[i * 2 + 1] / sy)
-        keptRef.push(this._refPts[i * 2], this._refPts[i * 2 + 1])
-      }
-      const kept = keptSrc.length / 2
-      if (kept < MIN_TRACK_POINTS) return this._miss('flow_lost', kept)
+    // 跟丢的点必须剔掉。留着它们等于给 RANSAC 喂随机坐标。
+    // 存活点顺手换回查询空间 —— 后面的 RANSAC、重投影、四角换算全在那个坐标系。
+    const keptSrc = []
+    const keptRef = []
+    for (let i = 0; i < n; i++) {
+      if (!status.data[i]) continue
+      keptSrc.push(nextPts.data32F[i * 2] / sx, nextPts.data32F[i * 2 + 1] / sy)
+      keptRef.push(this._refPts[i * 2], this._refPts[i * 2 + 1])
+    }
+    const kept = keptSrc.length / 2
+    if (kept < MIN_TRACK_POINTS) return this._miss('flow_lost', kept)
 
-      // 重解单应。门槛用 4（数学下限）而不是 minInliers：这一步不是"认出是哪张"，
-      // 那件事已经在检测阶段做过了。这里只问"这些点还在不在同一个平面上"。
-      const r = ransacPair(new Float32Array(keptSrc), new Float32Array(keptRef), 4)
-      if (!r.h || r.inliers < MIN_TRACK_POINTS) return this._miss('homography_lost', r.inliers)
+    // 重解单应。门槛用 4（数学下限）而不是 minInliers：这一步不是"认出是哪张"，
+    // 那件事已经在检测阶段做过了。这里只问"这些点还在不在同一个平面上"。
+    const r = ransacPair(new Float32Array(keptSrc), new Float32Array(keptRef), 4)
+    if (!r.h || r.inliers < MIN_TRACK_POINTS) return this._miss('homography_lost', r.inliers)
 
-      const quad = normalizedQuad(r.h, this._refSize, this._querySize)
-      if (!quad) return this._miss('quad_implausible', r.inliers)
+    const quad = normalizedQuad(r.h, this._refSize, this._querySize)
+    if (!quad) return this._miss('quad_implausible', r.inliers)
 
-      // 跟踪成功：把这一帧变成下一帧的"上一帧"，并且**用光流的结果替换种子**。
-      // 不替换的话种子永远是命中那一帧的坐标，几帧之后光流的搜索窗口就跟不上了。
-      this._curGray.copyTo(this._prevGray)
-      this._prevPts.delete()
-      const pm = new cv.Mat(kept, 1, cv.CV_32FC2)
-      pm.data32F.set(keptSrc)
-      this._prevPts = pm
-      this._refPts = new Float32Array(keptRef)
+    // 跟踪成功：把这一帧变成下一帧的"上一帧"，并且**用光流的结果替换种子**。
+    // 不替换的话种子永远是命中那一帧的坐标，几帧之后光流的搜索窗口就跟不上了。
+    this._curGray.copyTo(this._prevGray)
+    this._prevPts.delete()
+    const pm = new cv.Mat(kept, 1, cv.CV_32FC2)
+    pm.data32F.set(keptSrc)
+    this._prevPts = pm
+    this._refPts = new Float32Array(keptRef)
 
-      this.misses = 0
-      this.locked.quad = quad
-      this.locked.inliers = r.inliers
+    this.misses = 0
+    this.locked.quad = quad
+    this.locked.inliers = r.inliers
 
-      // 点数掉到阈值以下就补种子。**在跟踪成功的这一帧做**，而不是等它失败 ——
-      // 失败之后再补，中间那几帧的四角已经飘过了（真机日志里的 `quad_implausible`
-      // 就是点太少导致的几何退化）。
-      // 判据用 **RANSAC 内点数**而不是光流存活数。
-      //
-      // 第一版用 `kept`，结果补种子一次都没触发过 —— 而测试正好抓到了：噪声序列上
-      // 内点从 81 掉到 32（触发线 49）而 `kept` 还有七十几个。原因是光流的 `status`
-      // 只说"这个点跟到了"，不说"它跟对了"：噪声下它会把点跟到一个几何上对不上的位置，
-      // 于是 RANSAC 把它剔成外点。**真机日志里衰减的那个数字（27→13）就是内点数**，
-      // 所以判据必须是它。
-      const quality = Math.min(kept, r.inliers)
-      const floor = Math.max(RESEED_FLOOR, Math.round(this._seedCount * RESEED_RATIO))
-      const now = performance.now()
-      const decayed = quality < floor && now - this._lastReseedAt > RESEED_COOLDOWN_MS
-      // 定期重锚：点数不掉也要回到外观。漂移的两种主要来源（随机游走、反光锁点）
-      // 都不掉点，按点数触发的那条永远抓不住它们 —— 理由与数字见 REANCHOR_MS。
-      const overdue = now - this._lastReseedAt > REANCHOR_MS
-      // 这一帧的四角是否建立在**刚换过的种子**上 —— 也就是重锚纠正落地的那一帧。
-      // 换种子发生在上一帧（下面那个块），而新种子第一次参与解单应是在这一帧；
-      // 中间隔着丢帧的话，标一直留到第一个成功的四角。滤波器对它区别对待：
-      // 它不是运动，是纠正（quadfilter.observe 的 correction，真机抓出来的跳变来源）。
-      const corrected = this._corrNext === true
-      this._corrNext = false
-      let reseeded = 0
-      let reanchorFails = 0
-      if (decayed || overdue) {
-        reseeded = this._reseed(src)
+    // 点数掉到阈值以下就补种子。**在跟踪成功的这一帧做**，而不是等它失败 ——
+    // 失败之后再补，中间那几帧的四角已经飘过了（真机日志里的 `quad_implausible`
+    // 就是点太少导致的几何退化）。
+    // 判据用 **RANSAC 内点数**而不是光流存活数。
+    //
+    // 第一版用 `kept`，结果补种子一次都没触发过 —— 而测试正好抓到了：噪声序列上
+    // 内点从 81 掉到 32（触发线 49）而 `kept` 还有七十几个。原因是光流的 `status`
+    // 只说"这个点跟到了"，不说"它跟对了"：噪声下它会把点跟到一个几何上对不上的位置，
+    // 于是 RANSAC 把它剔成外点。**真机日志里衰减的那个数字（27→13）就是内点数**，
+    // 所以判据必须是它。
+    const quality = Math.min(kept, r.inliers)
+    const floor = Math.max(RESEED_FLOOR, Math.round(this._seedCount * RESEED_RATIO))
+    const now = performance.now()
+    const decayed = quality < floor && now - this._lastReseedAt > RESEED_COOLDOWN_MS
+    // 定期重锚：点数不掉也要回到外观。漂移的两种主要来源（随机游走、反光锁点）
+    // 都不掉点，按点数触发的那条永远抓不住它们 —— 理由与数字见 REANCHOR_MS。
+    const overdue = now - this._lastReseedAt > REANCHOR_MS
+    // 这一帧的四角是否建立在**刚换过的种子**上 —— 也就是重锚纠正落地的那一帧。
+    // 换种子发生在上一帧（下面那个块），而新种子第一次参与解单应是在这一帧；
+    // 中间隔着丢帧的话，标一直留到第一个成功的四角。滤波器对它区别对待：
+    // 它不是运动，是纠正（quadfilter.observe 的 correction，真机抓出来的跳变来源）。
+    const corrected = this._corrNext === true
+    this._corrNext = false
+    let reseeded = 0
+    let reanchorFails = 0
+    if (decayed || overdue) {
+      if (!src) {
+        // 这一帧只有小图：重锚要提特征，而提特征只认全分辨率那张（特征空间一个像素都
+        // 不能换）。所以要求下一帧带全图，把重锚推后一帧 —— **不把 fails 计上**，
+        // 没试过不算失败。`decayed` 是即时判据、预告不了，这条就是它的补丁。
+        this._wantFull = true
+      } else {
+        this._wantFull = false
+        reseeded = this._reseed(src, frame.small)
         if (reseeded) {
           this._corrNext = true
           this._reseedFails = 0
@@ -517,15 +582,13 @@ export class Pipeline {
           }
         }
       }
-      return {
-        quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
-        photo: this.locked.photo, tracked: kept,
-        ...(corrected ? { corrected: true } : {}),
-        ...(reanchorFails ? { reanchorFails } : {}),
-        ...(reseeded ? { reseeded, reanchored: overdue && !decayed } : {}),
-      }
-    } finally {
-      src.delete(); nextPts.delete(); status.delete(); err.delete()
+    }
+    return {
+      quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
+      photo: this.locked.photo, tracked: kept,
+      ...(corrected ? { corrected: true } : {}),
+      ...(reanchorFails ? { reanchorFails } : {}),
+      ...(reseeded ? { reseeded, reanchored: overdue && !decayed } : {}),
     }
   }
 
@@ -537,7 +600,7 @@ export class Pipeline {
    *
    * @returns 补到多少个种子；0 表示这次没补上（不算失败，跟踪照旧继续用旧种子）。
    */
-  _reseed(src) {
+  _reseed(src, small) {
     this._lastReseedAt = performance.now()
     const photo = this.lib.photos[this.locked.doc]
     if (!photo) return 0
@@ -546,7 +609,8 @@ export class Pipeline {
     const r = verifyPair(query, photo, photo.id, RESEED_MIN_INLIERS)
     if (!r.h || r.inliers < RESEED_MIN_INLIERS || !r.matches) return 0
     // 复用命中那一帧的同一段筛选逻辑：只留重投影误差在 RANSAC 阈值内的点。
-    this._seedTracking(src, query, r)
+    // `small` 一路传下去：重锚这一帧的跟踪灰度图必须和普通跟踪帧同一条路。
+    this._seedTracking(src, query, r, small)
     return this._seedCount
   }
 
@@ -562,11 +626,33 @@ export class Pipeline {
     return { quad: null, reason, inliers, photoId: this.locked?.photoId }
   }
 
+  /**
+   * `ImageData` → 复用的 `cv.Mat`（CV_8UC4）。**返回的 Mat 归管线所有，调用方别 delete。**
+   *
+   * 尺寸没变就只覆盖字节。1280×960×4 是 4.9MB，每帧新建一块再 delete 会让 wasm 堆
+   * 反复涨缩，而 emscripten 的堆不还给系统 —— 手机上表现为内存单调上涨然后被杀。
+   */
   _matFrom(imageData) {
     const cv = this.cv
-    const m = new cv.Mat(imageData.height, imageData.width, cv.CV_8UC4)
-    m.data.set(imageData.data)
-    return m
+    const m = this._src
+    if (!m || m.rows !== imageData.height || m.cols !== imageData.width) {
+      m?.delete()
+      this._src = new cv.Mat(imageData.height, imageData.width, cv.CV_8UC4)
+    }
+    this._src.data.set(imageData.data)
+    return this._src
+  }
+
+  /** 同 `_matFrom`，但落在跟踪尺度那块（两张要同时活着，所以不能共用一块）。 */
+  _matFrom2(small) {
+    const cv = this.cv
+    const m = this._small
+    if (!m || m.rows !== small.height || m.cols !== small.width) {
+      m?.delete()
+      this._small = new cv.Mat(small.height, small.width, cv.CV_8UC4)
+    }
+    this._small.data.set(small.data)
+    return this._small
   }
 
   /**
@@ -580,9 +666,23 @@ export class Pipeline {
    *
    * 比例按**实际得到的尺寸**算（`tw/qw`），不用名义上的那个 s：两次取整之后它们能差
    * 千分之几，而这个比例要拿去把点换回查询空间，差一点就是四角整体偏一点。
+   *
+   * @param src 全分辨率 RGBA，可以为 null（那时必须给 `small`）
+   * @param small 已经在跟踪尺度上的 RGBA（worker 用 `drawImage` 缩出来的）
    */
-  _toTrackGray(src) {
+  _toTrackGray(src, small) {
     const cv = this.cv
+    if (small) {
+      // 小图直接转灰。**它与 _prevGray 必须来自同一条路**：worker 对每一帧都产小图
+      // （含检测帧与重锚帧），所以锁定期间的跟踪灰度图永远是 drawImage 那条路，
+      // 不会一帧 INTER_AREA、下一帧 drawImage 地混着来（那会给光流添一次系统性抖动）。
+      const [qw, qh] = this._querySize ?? this._queryDims(src?.cols ?? small.width, src?.rows ?? small.height)
+      const sm = this._matFrom2(small)
+      cv.cvtColor(sm, this._curGray, cv.COLOR_RGBA2GRAY)
+      // 比例按**实到的小图尺寸**算，与 worker 的 `smallDims` 是同一个 `trackDims`。
+      this._trackScale = { sx: small.width / qw, sy: small.height / qh }
+      return
+    }
     const [qw, qh] = this._querySize ?? this._queryDims(src.cols, src.rows)
     cv.cvtColor(src, this._grayFull, cv.COLOR_RGBA2GRAY)
 
@@ -593,9 +693,7 @@ export class Pipeline {
       this._grayFull.copyTo(this._curGray)
       return
     }
-    const s = Math.min(1, TRACK_LONG_EDGE / longest)
-    const tw = Math.max(1, Math.round(qw * s))
-    const th = Math.max(1, Math.round(qh * s))
+    const [tw, th] = trackDims(qw, qh)
     // 相机帧本身可能比查询尺度大（相机给了 1920 而 longEdge 是 1280），所以比例要
     // 相对**查询空间**算 —— 种子点就在那个空间里。
     this._trackScale = { sx: tw / qw, sy: th / qh }
@@ -620,7 +718,11 @@ export class Pipeline {
     this._prevGray?.delete()
     this._curGray?.delete()
     this._grayFull?.delete()
+    this._src?.delete()
     this._small?.delete()
+    this._nextPts?.delete()
+    this._status?.delete()
+    this._err?.delete()
     this._prevPts?.delete()
     this._flowPts?.delete()
   }
