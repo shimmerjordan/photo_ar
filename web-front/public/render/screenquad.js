@@ -98,8 +98,11 @@ export function plausible(q) {
  * 用闭式解（Heckbert）而不是解 8×8 线性方程组：单位正方形这个特例有教科书公式，而每帧
  * 都要算；通用求解要么引入一个矩阵库、要么自己写高斯消元 —— 后者在这个规模上只会更容易
  * 写错，且没有任何精度收益。
+ *
+ * @param out 长度 9 的输出缓冲，原地写。不给就新建一个 —— 独立调用（比如测试）不必
+ *   自己先分配一块；渲染循环里**应当**传自己那份复用的缓冲，每帧都调否则就是每帧分配。
  */
-export function unitSquareH(q) {
+export function unitSquareH(q, out = new Float32Array(9)) {
   if (!q || q.length !== 8) return null
   const x0 = q[0], y0 = q[1]
   const x1 = q[2], y1 = q[3]
@@ -126,11 +129,9 @@ export function unitSquareH(q) {
     h = (dx1 * sy - dy1 * sx) / den
   }
 
-  const out = new Float32Array([
-    x1 - x0 + g * x1, x3 - x0 + h * x3, x0,
-    y1 - y0 + g * y1, y3 - y0 + h * y3, y0,
-    g, h, 1,
-  ])
+  out[0] = x1 - x0 + g * x1; out[1] = x3 - x0 + h * x3; out[2] = x0
+  out[3] = y1 - y0 + g * y1; out[4] = y3 - y0 + h * y3; out[5] = y0
+  out[6] = g; out[7] = h; out[8] = 1
   for (const v of out) if (!Number.isFinite(v)) return null
   return out
 }
@@ -164,20 +165,22 @@ export const FULL_RECT = new Float32Array([0, 0, 1, 1])
  *
  * @param photoAspect 照片的宽/高
  * @param videoAspect 视频的宽/高。≤0 或非有限（播放器还没报 videoWidth）时不裁。
- * @returns 源图上的 `[u0, v0, u1, v1]`，**v 向下**（图像坐标系，与照片一致）
+ * @param out 长度 4 的输出缓冲，原地写。不给就新建一个。
+ * @returns `out`：源图上的 `[u0, v0, u1, v1]`，**v 向下**（图像坐标系，与照片一致）
  */
-export function videoCrop(photoAspect, videoAspect) {
-  const full = new Float32Array([0, 0, 1, 1])
-  if (!Number.isFinite(videoAspect) || videoAspect <= 0) return full
-  if (!Number.isFinite(photoAspect) || photoAspect <= 0) return full
+export function videoCrop(photoAspect, videoAspect, out = new Float32Array(4)) {
+  if (!Number.isFinite(videoAspect) || videoAspect <= 0) { out.set([0, 0, 1, 1]); return out }
+  if (!Number.isFinite(photoAspect) || photoAspect <= 0) { out.set([0, 0, 1, 1]); return out }
   if (videoAspect >= photoAspect) {
     // 视频比照片「宽」→ 高度顶满，左右各裁掉溢出的部分
     const span = photoAspect / videoAspect
-    return new Float32Array([(1 - span) / 2, 0, (1 + span) / 2, 1])
+    out.set([(1 - span) / 2, 0, (1 + span) / 2, 1])
+    return out
   }
   // 视频比照片「高」→ 宽度顶满，上下各裁掉溢出的部分
   const span = videoAspect / photoAspect
-  return new Float32Array([0, (1 - span) / 2, 1, (1 + span) / 2])
+  out.set([0, (1 - span) / 2, 1, (1 + span) / 2])
+  return out
 }
 
 /**

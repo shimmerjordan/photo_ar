@@ -161,6 +161,11 @@ export default {
       // 视频装载到哪一步了、以及那一步的细节数字。前者用来判"阶段变了没有"（播放进度
       // 每秒来好几次，不判的话每次都会重写一遍 tip 并重放那颗星的动画）。
       loadStage: null, loadNote: null,
+      // 渲染循环每帧要用的缓冲，跨帧复用而不是每帧 `new Float32Array` —— rAF 频率下
+      // 那是持续的小分配，攒起来就是 GC 停顿。`cropKey` 记着上一次算 `crop` 用的
+      // 那对 aspect，比例没变就不必重跑 videoCrop（源矩形只由这两个数决定）。
+      ndc: new Float32Array(8), hm: new Float32Array(9), clip: new Float32Array(16),
+      crop: new Float32Array(4), cropKey: '',
     }
 
     /**
@@ -303,6 +308,8 @@ export default {
       st.quad = null
       st.filter.reset()
       st.lockedPhoto = null
+      // 下一张锁定的照片可能是另一个 aspect —— 不清的话第一帧会误用上一张的缓存 crop。
+      st.cropKey = ''
       // 先掐流再动元素：不掐的话上一段的 fetch 还在往一个已经换了 src 的
       // SourceBuffer 里喂，报的是一个跟「重新扫描」毫无关系的 append 错误。
       st.stopLoad?.()
@@ -565,16 +572,19 @@ export default {
         // 自适应预测滤波：静止时重平滑压噪声、运动时按速度外推补掉管线那 88ms。
         // 观测在 `onWorkerMessage` 里喂进去（那才是它到达的时刻），这里只问"现在画哪"。
         const smooth = st.filter.at(now, st.smoothOut) ?? st.quad
-        const ndc = imageToNdc(smooth, vw / vh, canvasAspect, new Float32Array(8))
-        const hm = unitSquareH(ndc)
+        const ndc = imageToNdc(smooth, vw / vh, canvasAspect, st.ndc)
+        const hm = unitSquareH(ndc, st.hm)
         if (hm) {
           const photoAspect = st.lockedPhoto?.aspect > 0 ? st.lockedPhoto.aspect : 1.5
           const videoAspect = dom.clip.videoWidth > 0 ? dom.clip.videoWidth / dom.clip.videoHeight : 0
-          const clip = new Float32Array(16)
+          // 源矩形只由这两个 aspect 决定 —— 比例没变（绝大多数帧都没变）就不必重跑
+          // videoCrop 的除法与分支，直接复用上一次写好的 st.crop。
+          const key = `${photoAspect}|${videoAspect}`
+          if (key !== st.cropKey) { videoCrop(photoAspect, videoAspect, st.crop); st.cropKey = key }
           // 面片**恒等于整张照片**（FULL_RECT），比例对不上时裁的是源（videoCrop）——
           // 也就是 object-fit: cover。上一版反过来：缩面片、留出照片边缘。
-          if (clipVertices(hm, FULL_RECT, clip)) {
-            const ok = r.drawVideoQuad(clip, dom.clip, videoCrop(photoAspect, videoAspect))
+          if (clipVertices(hm, FULL_RECT, st.clip)) {
+            const ok = r.drawVideoQuad(st.clip, dom.clip, st.crop)
             drew = ok ? 1 : 0
             if (!ok) diag(() => `几何 OK 但没画：视频 ready=${READY_STATE[dom.clip.readyState]}`)
           } else {

@@ -107,6 +107,17 @@ test('unitSquareH：退化（四点共线 / 两点重合）返回 null', () => {
   assert.equal(unitSquareH([0, 0, 1, 0, 1, 1]), null, '长度不对')
 })
 
+test('unitSquareH / videoCrop 接受 out 缓冲并原地写', () => {
+  const out9 = new Float32Array(9)
+  assert.equal(unitSquareH(FRONTAL, out9), out9)
+  const out4 = new Float32Array(4)
+  assert.equal(videoCrop(1.5, 16 / 9, out4), out4)
+  assert.ok(Math.abs(out4[0] - (1 - 1.5 / (16 / 9)) / 2) < 1e-6)
+  // 不裁的两种早退也写进 out
+  assert.equal(videoCrop(1.5, 0, out4), out4)
+  assert.deepEqual([...out4], [0, 0, 1, 1])
+})
+
 test('videoCrop：遍历比例，恰好一个维度不裁、另一个裁到刚好盖满、比例永远是视频的', () => {
   const aspects = [16 / 9, 4 / 3, 3 / 2, 1, 2 / 3, 3 / 4, 9 / 16, 1.85, 0.5625]
   for (const pa of aspects) {
