@@ -16,6 +16,7 @@ import { readFile, access } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { Library, ORB_LAYOUT, REF_LONG_EDGE } from '../server/library.js'
 import { parseNpy, parseNpz } from '../server/npz.js'
+import { unretrievableDocs } from '../public/recognize/library.js'
 
 const REPO = resolve(import.meta.dirname, '../..')
 const LIB_DIR = join(REPO, 'data/library')
@@ -259,5 +260,21 @@ describe('全新部署：库目录还不存在', () => {
 
     await writeFile(join(dir, 'slots.json'), JSON.stringify({ 没有: 'photo_ids' }))
     await assert.rejects(() => new Library(dir).load(), /photo_ids/)
+  })
+})
+
+describe('浏览器侧 recognize/library.js：unretrievableDocs 缓存', () => {
+  test('同一个 index 返回同一个数组（缓存）', () => {
+    const idx = { nDocs: 3, docIds: new Uint32Array([0, 2]) }
+    const a = unretrievableDocs(idx)
+    assert.deepEqual(a, [1])
+    assert.equal(unretrievableDocs(idx), a)
+  })
+
+  test('换一个 index 对象，缓存不会串', () => {
+    const idx1 = { nDocs: 2, docIds: new Uint32Array([0]) }
+    const idx2 = { nDocs: 2, docIds: new Uint32Array([1]) }
+    assert.deepEqual(unretrievableDocs(idx1), [1])
+    assert.deepEqual(unretrievableDocs(idx2), [0])
   })
 })

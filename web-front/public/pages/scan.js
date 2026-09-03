@@ -187,7 +187,15 @@ export default {
      * 训），也不影响识别结果（只影响耗时），所以对宾客它是纯噪音。同理"库 45 张"——
      * 那个数字在首页已经说过了（"你有 N 张照片可扫"），在取景器里重复一遍只占地方。
      */
-    const meta = () => {
+    // 每帧都可能调 meta()（fps 统计、worker 回执…），但它的净效果只是重写一个
+    // `textContent` —— 250ms 内的重复调用付出的是同一次字符串拼接与同一次布局脏标记。
+    // `force` 留给"这一刻的变化必须立刻可见"的几个调用点（视频出错、终局阶段…）。
+    let metaAt = 0
+    let metaLast = ''
+    const meta = (force = false) => {
+      const now = performance.now()
+      if (!force && now - metaAt < 250) return
+      metaAt = now
       const debug = isDiagEnabled()
       const parts = []
       const v = dom.clip
@@ -200,6 +208,12 @@ export default {
           if (lib.hasVocab === false) parts.push('无词表·全量扫描')
         }
         if (st.fps.value) parts.push(`${st.fps.value} fps`)
+        // 相机实际给到的帧率/分辨率——确认长边仍 ≥1280（见 camera.js 的 `ideal: longEdge`
+        // 说明），且 Task 6 Step 2 的 `frameRate: {ideal:30,max:30}` 真的生效了。
+        const camSettings = st.stream?.getVideoTracks?.()[0]?.getSettings?.()
+        if (camSettings) {
+          parts.push(`相机 ${camSettings.width}×${camSettings.height}@${Math.round(camSettings.frameRate ?? 0)}fps`)
+        }
         parts.push(`送帧 ${sendInterval(paceArgs())}ms`)
         if (st.detectMs) parts.push(`检测 ${st.detectMs}ms`)
         if (st.trackMs) parts.push(`跟踪 ${st.trackMs}ms`)
@@ -232,7 +246,8 @@ export default {
         const q = fitQuality()
         if (q) parts.push(q)
       }
-      dom.meta.textContent = parts.join(' · ')
+      const s = parts.join(' · ')
+      if (s !== metaLast) { metaLast = s; dom.meta.textContent = s }
     }
     /**
      * 贴合准确度分档。判据是**跟踪内点数**（st.trackPoints，每帧更新）：
@@ -258,7 +273,7 @@ export default {
       diagAlways(`视频 error code=${e?.code} ${MEDIA_ERR[e?.code] ?? '?'}` +
         ` msg=${e?.message || '(空)'} network=${NETWORK_STATE[dom.clip.networkState]}` +
         ` ready=${READY_STATE[dom.clip.readyState]} src=${short(dom.clip.currentSrc)}`)
-      meta()
+      meta(true)
     }
     dom.clip.addEventListener('error', onVideoErr)
     const videoEvents = ['loadstart', 'loadedmetadata', 'canplay', 'playing', 'pause', 'waiting', 'stalled']
@@ -339,7 +354,8 @@ export default {
       }
 
       st.loadNote = s.text || null
-      if (s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR) {
+      const terminal = s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR
+      if (terminal) {
         st.loadNote = null
         ctx.progress?.(null, { hide: true })
         // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
@@ -350,7 +366,8 @@ export default {
       } else {
         bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
       }
-      meta()
+      // 终局（不管是不是这一秒里最新的一条）必须立刻可见：往后不会再有下一条把它盖住。
+      meta(terminal)
     }
 
     /**
@@ -368,6 +385,7 @@ export default {
       if (!photo?.mediaUrl) {
         diagAlways(`命中 ${photo?.id?.slice(0, 8)} 但没有 mediaUrl（这张没配视频）`)
         tip(`认出了 ${title}，但它还没有配视频。`, { hit: true })
+        meta(true)
         return
       }
       if (dom.clip.dataset.photo === photo.id) {
@@ -715,6 +733,9 @@ export default {
       dom.clip.removeEventListener('ended', onVideoEnded)
       // **相机必须停**：不停的话相机灯一直亮、电量哗哗掉，而用户以为已经离开这一页了。
       if (st.stream) stopCamera(st.stream)
+      // ResizeObserver 挂在 canvas 上，canvas 随这一页卸载，但监听器不会自己断——
+      // 不 dispose 的话它会一直挂着，等下次进扫描页时 `new Renderer` 又建一个。
+      st.renderer?.dispose()
       dom.clip.pause()
       dom.clip.removeAttribute('src')
       dom.clip.load()

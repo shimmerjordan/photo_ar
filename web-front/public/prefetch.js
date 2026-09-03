@@ -52,6 +52,7 @@
  */
 import * as api from './api.js'
 import { diagAlways } from './diag.js'
+import { mediaInfo } from './mediaload.js'
 
 export const CACHE_NAME = 'photoar-media-v1'
 /**
@@ -264,7 +265,7 @@ async function run(isAdmin) {
 
   status.state = '算计划…'
   const { items, used, tooBig } = await planWithinBudget(photos, limit, async (p) => {
-    const info = await api.mediaOfPhoto(p.photoId ?? p.id)
+    const info = await mediaInfo(p.photoId ?? p.id)
     // `absolute` 的（网盘直链）不缓存：那种地址十几分钟就失效，缓存下来的是一份
     // 过期的重定向而不是视频。`missing` 的更不用说。
     if (!info?.url || info.missing || info.absolute) return null

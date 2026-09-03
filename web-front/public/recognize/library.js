@@ -166,10 +166,13 @@ export function queryIndex(index, words, topK) {
  * 行为退化成全量扫描但结果正确）就建立在这条上。
  */
 export function unretrievableDocs(index) {
+  if (index._unretrievable) return index._unretrievable
   const present = new Uint8Array(index.nDocs)
   for (const d of index.docIds) present[d] = 1
   const out = []
   for (let d = 0; d < index.nDocs; d++) if (!present[d]) out.push(d)
+  // 词表与倒排表解包后不变，这个集合也不变。挂在 index 上而不是模块级：换库时 index 对象换掉，缓存自然失效。
+  index._unretrievable = out
   return out
 }
 

@@ -17,6 +17,7 @@
  */
 import { Page, TAB_META, Tab, isRoot, landingTab, needsAdmin, tabAfterRoleChange, tabsFor } from './navpolicy.js'
 import { icon } from './pixelicons.js'
+import { forgetMedia } from './mediaload.js'
 
 const PAGES = {
   [Tab.SCAN]: () => import('./pages/scan.js'),
@@ -93,8 +94,9 @@ export class Shell {
     this._render()
   }
 
-  /** 库变了：列表与详情要重取。 */
+  /** 库变了：列表与详情要重取，媒体元信息缓存也要清（换视频之后旧的那份已经不对）。 */
   libraryChanged() {
+    forgetMedia()
     this.libraryRev++
     this._render()
   }

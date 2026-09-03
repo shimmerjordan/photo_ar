@@ -28,6 +28,7 @@
  */
 import * as api from './api.js'
 import { cachedStream } from './prefetch.js'
+import { mediaInfo } from './mediaload.js'
 
 /**
  * `Content-Type` → 文件名后缀。纯函数，好测。
@@ -122,7 +123,7 @@ export async function savePhotoImage(photoId, title) {
  * @returns 一句给用户看的结果
  */
 export async function savePhotoVideo(photoId, title, { onProgress } = {}) {
-  const info = await api.mediaOfPhoto(photoId)
+  const info = await mediaInfo(photoId)
   if (!info?.url) throw new Error('这张照片还没有配视频')
   if (info.missing) throw new Error('视频文件不在服务器上了')
   if (info.absolute) {

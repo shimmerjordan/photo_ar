@@ -77,6 +77,30 @@ export function stagePct(stage, { loaded = 0, total = 0 } = {}) {
 const mb = (n) => (n / 1048576).toFixed(1)
 
 /**
+ * 会话内的媒体元信息缓存。key = photoId。
+ *
+ * `mediaOfPhoto` 在扫描页、试播页、预取、下载四处各自被调一遍 —— 同一张照片在
+ * 一次会话里的元信息不会变（除非管理端换了视频），四次网络往返换来的是同一份 JSON。
+ * 换视频后由 `forgetMedia(photoId)` 失效（管理动作那边调，见 shell.js 的
+ * `libraryChanged`）。
+ *
+ * @param fetcher 可选，默认 `api.mediaOfPhoto`。留这个口子是为了测试注入 ——
+ *   这个模块不引入任何 mock 框架，纯靠参数换掉真实网络调用。
+ */
+const _media = new Map()
+export async function mediaInfo(photoId, fetcher = api.mediaOfPhoto) {
+  if (_media.has(photoId)) return _media.get(photoId)
+  const info = await fetcher(photoId)
+  _media.set(photoId, info)
+  return info
+}
+
+/** 清掉缓存。不给 `photoId` 就清空全部（库变了，任何一张的元信息都可能已经不对）。 */
+export function forgetMedia(photoId) {
+  photoId ? _media.delete(photoId) : _media.clear()
+}
+
+/**
  * 把一张照片的视频装进 `video`，一路报阶段。
  *
  * @param onStage `({stage, text, pct, info, fromCache, error})` —— 每次状态变化调一次。
@@ -139,7 +163,7 @@ export function loadPhotoVideo(video, photoId, { onStage, onDiag } = {}) {
     say(Stage.INFO)
     let info
     try {
-      info = await api.mediaOfPhoto(photoId)
+      info = await mediaInfo(photoId)
     } catch (e) {
       return say(Stage.ERROR, { text: `取视频信息失败（${e.message}）`, pct: null, error: e })
     }

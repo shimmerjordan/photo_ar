@@ -107,13 +107,40 @@ export class Renderer {
     this.camTex = texture(gl)
     this.videoTex = texture(gl)
     this._clip = new Float32Array(16)
+
+    // 着色器 location 只在链接之后查一次。`gl.getAttribLocation`/`getUniformLocation`
+    // 是一次驱动往返（真机上比看起来贵），而它们在整个生命周期里不会变 —— 每帧重查
+    // 是纯浪费。
+    this.loc = {
+      camPos: gl.getAttribLocation(this.camProg, 'aPos'),
+      camUv: gl.getAttribLocation(this.camProg, 'aUv'),
+      camTex: gl.getUniformLocation(this.camProg, 'uTex'),
+      quadClip: gl.getAttribLocation(this.quadProg, 'aClip'),
+      quadUv: gl.getAttribLocation(this.quadProg, 'aUv'),
+      quadTex: gl.getUniformLocation(this.quadProg, 'uTex'),
+    }
+    this._camScale = [0, 0]
+    this._camPosBuf = new Float32Array(8)
+    this._camTexSize = [0, 0]
+    this._videoTexSize = [0, 0]
+    this._size = [0, 0]
+    // 每帧读 clientWidth/Height 是一次强制布局；用 ResizeObserver 缓存。
+    if (typeof ResizeObserver === 'function') {
+      this._ro = new ResizeObserver(() => { this._size = [canvas.clientWidth, canvas.clientHeight] })
+      this._ro.observe(canvas)
+    }
+    this._size = [canvas.clientWidth, canvas.clientHeight]
   }
 
   resize() {
     const c = this.canvas
     const dpr = Math.min(self.devicePixelRatio || 1, 2) // 2 以上纯浪费，手机上还会掉帧
-    const w = Math.round(c.clientWidth * dpr)
-    const h = Math.round(c.clientHeight * dpr)
+    // `_size` 由 ResizeObserver 异步填，第一帧它可能还是 [0,0]（回调还没跑）——
+    // 退回 clientWidth/Height 一次，总比拿 0 去除出 NaN 宽高比强。
+    const cw = this._size[0] || c.clientWidth
+    const ch = this._size[1] || c.clientHeight
+    const w = Math.round(cw * dpr)
+    const h = Math.round(ch * dpr)
     if (c.width !== w || c.height !== h) {
       c.width = w
       c.height = h
@@ -122,12 +149,29 @@ export class Renderer {
     return c.width / c.height
   }
 
+  /**
+   * 纹理上传。`sizeRef` 是调用方持有的 `[w, h]`，跨帧记着上一次上传的尺寸。
+   *
+   * 尺寸没变就用 `texSubImage2D` 原地更新，不重新分配显存 —— 移动 GPU 上整幅
+   * 重分配是实测有感的一项。尺寸变了（换视频 / 换相机）才 `texImage2D` 重新分配。
+   */
+  _upload(tex, sizeRef, video) {
+    const gl = this.gl
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    const w = video.videoWidth, h = video.videoHeight
+    if (sizeRef[0] !== w || sizeRef[1] !== h) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video)
+      sizeRef[0] = w; sizeRef[1] = h
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGB, gl.UNSIGNED_BYTE, video)
+    }
+  }
+
   /** 相机画面。`video` 必须已经在播（`readyState >= 2`），否则这一帧跳过不画。 */
   drawCamera(video, frameAspect, canvasAspect) {
     const gl = this.gl
     if (video.readyState < 2) return false
-    gl.bindTexture(gl.TEXTURE_2D, this.camTex)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video)
+    this._upload(this.camTex, this._camTexSize, video)
 
     // cover：短边顶满、长边溢出被裁。与 `screenquad.imageToNdc` 是同一道换算的两侧 ——
     // 那边把四个角映进来、这边把画面铺出去，**两者必须用同一个规则**，否则视频和它下面
@@ -136,15 +180,20 @@ export class Renderer {
     let sy = 1
     if (frameAspect > canvasAspect) sx = frameAspect / canvasAspect
     else sy = canvasAspect / frameAspect
-    // 顶点在 NDC 里放大，等价于把纹理裁掉溢出的部分。
-    const pos = new Float32Array([-sx, -sy, sx, -sy, -sx, sy, sx, sy])
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.camPos)
-    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW)
+    // 顶点只在 sx/sy 变化时才重新 bufferData —— 静止画面（相机与画布比例都没变）时
+    // 这块顶点每帧都是同一份数据，重传是纯浪费。
+    if (this._camScale[0] !== sx || this._camScale[1] !== sy) {
+      this._camScale[0] = sx; this._camScale[1] = sy
+      // 顶点在 NDC 里放大，等价于把纹理裁掉溢出的部分。
+      this._camPosBuf.set([-sx, -sy, sx, -sy, -sx, sy, sx, sy])
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.camPos)
+      gl.bufferData(gl.ARRAY_BUFFER, this._camPosBuf, gl.DYNAMIC_DRAW)
+    }
 
     gl.useProgram(this.camProg)
-    bindAttr(gl, this.camProg, 'aPos', this.camPos, 2)
-    bindAttr(gl, this.camProg, 'aUv', this.camUv, 2)
-    gl.uniform1i(gl.getUniformLocation(this.camProg, 'uTex'), 0)
+    bindAttr(gl, this.loc.camPos, this.camPos, 2)
+    bindAttr(gl, this.loc.camUv, this.camUv, 2)
+    gl.uniform1i(this.loc.camTex, 0)
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.camTex)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
@@ -164,8 +213,7 @@ export class Renderer {
   drawVideoQuad(clip16, video, crop = FULL_CROP) {
     const gl = this.gl
     if (video.readyState < 2) return false
-    gl.bindTexture(gl.TEXTURE_2D, this.videoTex)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video)
+    this._upload(this.videoTex, this._videoTexSize, video)
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadClip)
     gl.bufferData(gl.ARRAY_BUFFER, clip16, gl.DYNAMIC_DRAW)
@@ -175,9 +223,9 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, this._uv, gl.DYNAMIC_DRAW)
 
     gl.useProgram(this.quadProg)
-    bindAttr(gl, this.quadProg, 'aClip', this.quadClip, 4)
-    bindAttr(gl, this.quadProg, 'aUv', this.quadUv, 2)
-    gl.uniform1i(gl.getUniformLocation(this.quadProg, 'uTex'), 0)
+    bindAttr(gl, this.loc.quadClip, this.quadClip, 4)
+    bindAttr(gl, this.loc.quadUv, this.quadUv, 2)
+    gl.uniform1i(this.loc.quadTex, 0)
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
@@ -189,6 +237,11 @@ export class Renderer {
     gl.clearColor(0, 0, 0, 1)
     gl.clear(gl.COLOR_BUFFER_BIT)
   }
+
+  /** 卸载：停掉 ResizeObserver。GL 上下文本身随 canvas 一起被丢弃，不必手动释放。 */
+  dispose() {
+    this._ro?.disconnect()
+  }
 }
 
 function buffer(gl, data) {
@@ -198,8 +251,7 @@ function buffer(gl, data) {
   return b
 }
 
-function bindAttr(gl, prog, name, buf, size) {
-  const loc = gl.getAttribLocation(prog, name)
+function bindAttr(gl, loc, buf, size) {
   gl.bindBuffer(gl.ARRAY_BUFFER, buf)
   gl.enableVertexAttribArray(loc)
   gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0)

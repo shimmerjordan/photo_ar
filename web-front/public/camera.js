@@ -31,6 +31,9 @@ export async function openCamera(video, { longEdge = 1280 } = {}) {
       facingMode: { ideal: 'environment' },
       width: { ideal: longEdge },
       height: { ideal: Math.round((longEdge * 3) / 4) },
+      // 识别只消费 10~25 帧/秒，60fps 只多付 ISP 与纹理上传。max 而非 exact：
+      // 拿不到 30 的机型退让，不 Overconstrained。
+      frameRate: { ideal: 30, max: 30 },
     },
   }
   let stream
