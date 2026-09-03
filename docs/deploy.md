@@ -165,9 +165,9 @@ docker compose restart photo-ar-server        # 词表是启动时加载的
 
 ## 6. 外网通道
 
-分工是硬性的：**视频走 Tailscale，Cloudflare 只跑 API 小包**。其中一条是账号级风险，见 [deploy-details.md 的三条硬限制](deploy-details.md#隧道的三条硬限制)。
+宾客走 **Cloudflare Tunnel，全部流量含视频**（他们不装任何东西）。Tailscale 只给自己：管理台、入库大文件、在外面看自己的照片。风险与取舍见 [deploy-details.md](deploy-details.md#隧道的三条硬限制)。
 
-### 6a. Tailscale
+### 6a. Tailscale（可选，给自己用）
 
 NAS：App Center 装 Tailscale（没有就去 [pkgs.tailscale.com](https://pkgs.tailscale.com/stable/#qnap) 下 x86-64 的 `.qpkg`），登录你的 tailnet。手机装 App 登同一个。
 
@@ -178,6 +178,8 @@ tailscale ip -4        # 100.x.y.z
 **算成**：手机**关 WiFi 走 4G**、开着 Tailscale，打开 `http://<100.x.y.z>:8964/v1/ping` 看到 **401**（不是连不上）。
 
 不用开子网路由，也**不要开 Funnel**。
+
+宾客用不到这一步。
 
 ### 6b. Cloudflare Tunnel
 
@@ -202,8 +204,6 @@ docker restart cloudflared
 **算成**：外网 `curl -sS -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping` 回 `{"ok": true...}`，且 `https://arphoto.<你的域名>/` 打开就是网页版。
 
 顺手看隧道健康：`docker exec cloudflared cloudflared tunnel info <tunnel 名>` 要有 4 条连接、落在**两个不同 region**（只落一个会 Degraded，表现是偶发 502）。
-
-> 用完把这条 ingress 摘掉 —— 理由见 details 的三条硬限制。
 
 ### 6c. 让引擎停在 Cloudflare 边缘
 
@@ -240,25 +240,14 @@ done
 
 > ⚠️ **地址必须是 `https://`。** 相机（`getUserMedia`）只在安全上下文里存在：`https://` 任意域名都算，`http://localhost` 算（只有本机），**`http://192.168.x.x` 和 `http://100.x.x.x` 都不算**。
 
-所以对外地址就是第 6b 那条隧道的地址。**宾客看视频的正路是 Tailscale**（Cloudflare 那条只跑 API）：让他们登进你的 tailnet，打开 `https://<机器>.<tailnet>.ts.net:8964/`。要拿真证书先去 Tailscale 后台 DNS 页打开 **HTTPS Certificates**（默认关），然后：
+所以发给宾客的就是第 6b 那条隧道的地址 `https://arphoto.<你的域名>/` —— Cloudflare 的证书是现成的，不用自己配。
 
-```bash
-tailscale cert <机器>.<tailnet>.ts.net
-```
-
-把 `.crt` / `.key` 放一个目录，`.env` 里指过去（左宿主目录，右两个是**容器内**路径）：
-
-```bash
-WEBFRONT_CERT_DIR=/share/Container/photoar-certs
-WEBFRONT_TLS_CERT=/certs/<机器名>.<tailnet>.ts.net.crt
-WEBFRONT_TLS_KEY=/certs/<机器名>.<tailnet>.ts.net.key
-```
-
-`up -d` 之后启动日志第一行变成 `https://0.0.0.0:8964`。
-
-> 公共 CA 不会给 `100.64.0.0/10` 的 IP 签证书，所以必须用 MagicDNS 主机名，不能用 `https://100.x.y.z`。
+> 想让自己在外面不经隧道也能开相机（Tailscale 直连），要给 MagicDNS 主机名签一张证书：
+> Tailscale 后台 DNS 页打开 **HTTPS Certificates**，`tailscale cert <机器>.<tailnet>.ts.net`，
+> 把 `.crt/.key` 放一个目录并在 `.env` 里填 `WEBFRONT_CERT_DIR` / `WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`（后两个是容器内路径），
+> `up -d` 后启动日志第一行变成 `https://0.0.0.0:8964`。公共 CA 不给 `100.x` 的 IP 签，所以必须用主机名。
 >
-> 婚礼那种"几十个人一次性"的场合，更省事的是现场 Wi-Fi + 自签证书，见 [faq.md](faq.md#局域网里自测没有隧道也没有真证书)。
+> 婚礼那种「几十个人一次性」的场合，现场 Wi-Fi + 自签证书更省事，见 [faq.md](faq.md#局域网里自测没有隧道也没有真证书)。
 
 **算成**：手机 4G 打开那个地址 → 登录蒙版 → 输名字（宾客口令留空）→ 一整页一颗「扫一扫」→ 给相机权限 → 举起**打印出来的**照片，离半米左右 → 视频贴在照片上播起来。
 
@@ -281,7 +270,7 @@ WEBFRONT_TLS_KEY=/certs/<机器名>.<tailnet>.ts.net.key
 | 9 | 批量入库（先 `--limit 5 --dry-run`） | 配对没错，再放量 | 5 |
 | 10 | 训词表并重启 | `vocabTrained` 变 `true` | 5 |
 | 11 | 带 cookie 拉一次 `/api/lib` | `200` + 几十 KB | 5 |
-| 12 | 配上 https | 启动日志第一行 `https://0.0.0.0:8964` | 7 |
+| 12 | 隧道 ingress 生效 | 外网 `https://arphoto.<域名>/v1/ping` 回 401 | 6b |
 | 13 | 手机打开那个地址 | 登录蒙版出来 | 7 |
 | 14 | 管理员登进去看「照片」 | 第 8 步那张的缩略图 | 7 |
 | 15 | 「扫一扫」举起照片 | **视频贴在照片上播起来** | 7 |
