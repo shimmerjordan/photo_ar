@@ -152,6 +152,8 @@ export default {
       frameSeq: 0, inflight: 0, lastSentAt: 0, paused: false,
       // 距上一份证据多久 / 上一条结果说了什么 —— pacing.sendInterval 的两个输入。
       lastEvidenceAt: performance.now(), lastReason: '',
+      // 切后台时真停相机与视频解码要记住的两件事：视频当时在不在播、相机当时开不开。
+      pausedClip: false, wasCamOn: false,
       fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0, lastGrabMs: 0,
       // 走不走 bitmap 那条路。一次失败就永久退回（见 sendFrame）。
       useBitmap: canGrabBitmap(),
@@ -493,7 +495,7 @@ export default {
       st.renderer ??= new Renderer(dom.canvas)
       st.grabber ??= new FrameGrabber(dom.cam)
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
-      tip(TIPS.scanning)
+      if (!st.lockedPhoto) tip(TIPS.scanning)
       cancelAnimationFrame(st.raf)
       st.raf = requestAnimationFrame(loop)
     }
@@ -660,7 +662,36 @@ export default {
       post({ width: img.width, height: img.height, buf }, [buf])
     }
 
-    const onVis = () => { st.paused = document.hidden }
+    /**
+     * 切后台 / 锁屏：**真的停**，不只是停送帧。
+     *
+     * 改造前只置 `st.paused`：rAF 停了、识别停了，但相机 track 还活着（摄像头硬件与 ISP
+     * 继续跑、指示灯亮着），`dom.clip` 也还在解码。用户把手机揣兜里，以为已经离开了。
+     *
+     * 重开走 `openCam()`（权限已给过，getUserMedia 静默通过，几百毫秒黑屏）。`visSeq`
+     * 挡「hidden→visible 快速切两次」：前一次重开还在 await 时后一次已经在停了。
+     */
+    let visSeq = 0
+    const onVis = async () => {
+      const seq = ++visSeq
+      st.paused = document.hidden
+      if (document.hidden) {
+        st.pausedClip = !dom.clip.paused
+        dom.clip.pause()
+        if (st.stream) {
+          stopCamera(st.stream)
+          st.stream = null
+          cancelAnimationFrame(st.raf)
+          st.wasCamOn = true
+        }
+        return
+      }
+      if (!st.alive || !st.wasCamOn) return
+      st.wasCamOn = false
+      await openCam()
+      if (seq !== visSeq || !st.alive) return
+      if (st.pausedClip) dom.clip.play().catch(() => {})
+    }
     document.addEventListener('visibilitychange', onVis)
 
     function teardown() {
