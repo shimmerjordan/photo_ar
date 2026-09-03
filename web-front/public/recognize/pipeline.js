@@ -487,7 +487,12 @@ export class Pipeline {
     }
     // 跟踪帧通常**只有小图**（worker 只在检测/重锚帧画全图，见 `wantsFull`）。
     // 全图在这里只有一个用处：重锚要拿它提特征，所以没有全图时重锚推后一帧。
-    const src = frame.full ? this._matFrom(frame.full) : null
+    const full = frame.full ?? null
+    // **全图先不落地。** `_matFrom` 是一次 4.9MB 的 `data.set`，而带着全图来的帧里
+    // 只有一部分真的重锚 —— `wantsFull()` 提前 60ms 预告，那个窗口里的帧白带一张。
+    // 所以推到下面真要 `_reseed` 时才落地。
+    // 例外是退化路径（只有全图、没有小图）：那时 `_toTrackGray` 自己就要用它。
+    let src = frame.small ? null : this._matFrom(full)
     // 光流的三个出参是字段（固定形状、每帧写满），所以这里不新建也不 delete。
     const nextPts = this._nextPts, status = this._status, err = this._err
     this._toTrackGray(src, frame.small)
@@ -567,13 +572,15 @@ export class Pipeline {
     let reseeded = 0
     let reanchorFails = 0
     if (decayed || overdue) {
-      if (!src) {
+      if (!full) {
         // 这一帧只有小图：重锚要提特征，而提特征只认全分辨率那张（特征空间一个像素都
         // 不能换）。所以要求下一帧带全图，把重锚推后一帧 —— **不把 fails 计上**，
         // 没试过不算失败。`decayed` 是即时判据、预告不了，这条就是它的补丁。
         this._wantFull = true
       } else {
         this._wantFull = false
+        // 全图到这一刻才真的落地（退化路径上面已经落过一次，`??=` 不重复付）。
+        src ??= this._matFrom(full)
         reseeded = this._reseed(src, frame.small)
         if (reseeded) {
           this._corrNext = true
@@ -590,6 +597,14 @@ export class Pipeline {
           }
         }
       }
+    } else {
+      // 这一帧压根不该重锚：把预告撤掉。
+      //
+      // 不撤的话有一条粘死的路：`decayed` 在只有小图的那一帧触发过（`_wantFull = true`），
+      // 而下一帧内点又涨回去了 —— 于是 `decayed || overdue` 不成立、上面那个 else 分支
+      // 走不到，`_wantFull` 就一直留到下一次 `overdue`（最坏 1500ms）。那期间 worker
+      // 每帧都白画一张 4.9MB 的全图，整条降尺度的路在那 1.5 秒里等于没有。
+      this._wantFull = false
     }
     return {
       quad, photoId: this.locked.photoId, inliers: r.inliers, reason: 'ok',
@@ -684,7 +699,12 @@ export class Pipeline {
       // 小图直接转灰。**它与 _prevGray 必须来自同一条路**：worker 对每一帧都产小图
       // （含检测帧与重锚帧），所以锁定期间的跟踪灰度图永远是 drawImage 那条路，
       // 不会一帧 INTER_AREA、下一帧 drawImage 地混着来（那会给光流添一次系统性抖动）。
-      const [qw, qh] = this._querySize ?? this._queryDims(src?.cols ?? small.width, src?.rows ?? small.height)
+      // `_querySize` 必须已经有值：种子点在查询空间里，而这里要算的正是「小图 ↔ 查询
+      // 空间」的比例。**不给回退**（比如拿小图自己的尺寸顶上）—— 那会静默给出一个差
+      // 一倍的比例，表现是四角整体偏，既不报错也不掉点。跟踪帧只在 LOCKED 出现，而
+      // `_detect` 命中时一定设过它，所以这条不可达；但不可达不等于可以静默。
+      if (!this._querySize) throw new Error('跟踪帧到达时 _querySize 未设')
+      const [qw, qh] = this._querySize
       const sm = this._matFrom2(small)
       cv.cvtColor(sm, this._curGray, cv.COLOR_RGBA2GRAY)
       // 比例按**实到的小图尺寸**算，与 worker 的 `smallDims` 是同一个 `trackDims`。

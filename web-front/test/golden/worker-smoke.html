@@ -261,6 +261,7 @@ runPage(async () => {
     const first = await sendBitmap(500)
     push('bitmap 路：第一帧命中（检测帧拿到了全图）',
       first.reason === 'ok' && first.photoId === 'goldenphoto' && first.state === 'locked', { first })
+    push('bitmap 路：检测帧解了全图（usedFull）', first.usedFull === true, { first })
     push(`bitmap 路：内点数与 buf 路相当（${first.inliers} vs ${res.inliers}）`,
       Math.abs((first.inliers ?? 0) - (res.inliers ?? 0)) / (res.inliers || 1) <= 0.2,
       { bitmap: first.inliers, buf: res.inliers })
@@ -271,24 +272,42 @@ runPage(async () => {
     const trail = []
     let gaveUp = false
     let reseeds = 0
+    let fulls = 0
     for (let i = 0; i < N; i++) {
       const r = await sendBitmap(600 + i, (i + 1) * STEP, Math.round((i + 1) * STEP * 0.4),
         Math.round((i / N) * 130), 1000 + i)
       trail.push(r.inliers ?? 0)
       if (r.reseeded) reseeds++
+      if (r.usedFull) fulls++
       if (r.gaveUp) { gaveUp = true; break }
     }
     metrics.bitmapTrack = {
-      frames: trail.length, reseeds, gaveUp,
+      frames: trail.length, reseeds, gaveUp, fulls,
+      fullShare: Math.round((fulls / trail.length) * 1000) / 1000,
       first: trail[0], last: trail.at(-1), min: Math.min(...trail),
     }
-    await log(`bitmap 长跟踪 ${trail.length} 帧 内点 ${trail[0]}→${trail.at(-1)} 最低 ${Math.min(...trail)} 补种子 ${reseeds} 次`)
+    await log(`bitmap 长跟踪 ${trail.length} 帧 内点 ${trail[0]}→${trail.at(-1)} 最低 ${Math.min(...trail)} 补种子 ${reseeds} 次 全图 ${fulls} 帧`)
     push(`bitmap 路：连续 ${N} 帧不放手（实测跑了 ${trail.length} 帧）`, !gaveUp, metrics.bitmapTrack)
     push(`bitmap 路：内点数没跌破跟踪下限（最低 ${Math.min(...trail)}）`,
       Math.min(...trail) >= 12, metrics.bitmapTrack)
     // 补种子必须真的发生过 —— 它要全图，而全图只在这条往返成立时才会到。
     push(`bitmap 路：重锚成功过（${reseeds} 次，证明 wantsFull 的往返通了）`,
       reseeds > 0, metrics.bitmapTrack)
+
+    /**
+     * **绝大多数跟踪帧不解全图。** 上面那几条断言在 `wantsFull()` 恒真时全都照样过
+     * —— 也就是 Task 4 的收益整个丢掉了它们也不响。这一条是那个收益唯一的量。
+     *
+     * 阈值 1/4 的依据：全图只该在两种帧上出现 —— 重锚帧，以及它前面那个提前 60ms
+     * 的预告窗口。重锚每 `REANCHOR_MS = 1500ms` 一次，所以按每帧 t 毫秒算，全图帧
+     * 占比 ≈ (60 + t) / 1500。这个测试的一帧比真机慢得多（每帧要在页面里现造一张
+     * 1280×960 的 RGBA + createImageBitmap，实测量级几十毫秒），即便按 100ms/帧
+     * 算也只有 11%；真机 16~33ms 时是 5%~6%。留到 25% 是给「慢机器上一帧更久」
+     * 的余量，而恒真那种情况是 100%，两者差得足够远。
+     */
+    const cap = Math.floor(trail.length / 4)
+    push(`bitmap 路：全图帧只占 ${fulls}/${trail.length}（≤ ${cap}，跟踪帧真的只解了 640）`,
+      fulls <= cap, metrics.bitmapTrack)
   }
 
   push('Worker 全程没有 onerror', fatal === null, { fatal })

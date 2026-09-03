@@ -112,6 +112,17 @@ function det3(h) {
  * JS 单线程里不可能有第二次 `ransacPair` 在它中间插进来。将来若把这个模块搬到
  * 主线程与 worker 同时用（各自有独立的模块实例，仍然安全），或者改成异步/多线程，
  * 这三个变量就必须跟着改成实例字段。
+ *
+ * ## `_mask` 的那条不变量：**先查 H，再读 mask**
+ *
+ * OpenCV 的 `findHomography` 只在**成功**时写 mask（`if(result){ if(_mask.needed())
+ * tempMask.copyTo(_mask); } else { H.release(); }`）。mask 一旦是复用的，失败那次
+ * 它里面躺着的就是**上一帧的陈值** —— 而陈值的 `rows` 是正的，所以
+ * `mask.empty()` 在第一次成功之后恒假，它**不再是一道守卫**。
+ *
+ * 也就是说：`H 为空 ⟺ result 为假 ⟺ mask 是陈值`。`ransacPair` 现在是对的，靠的是
+ * `!H || H.empty()` 在 `||` 的左边先短路 —— **对 H 的检查必须排在读 mask 之前**，
+ * 谁把那个顺序调开，就会拿上一帧的内点数当这一帧的结果，而它不报错。
  */
 let _sm = null, _dm = null, _mask = null
 function pointMats(n) {
@@ -145,6 +156,9 @@ export function ransacPair(src, dst, minInliers = thresholds.minInliers) {
   let H = null
   try {
     H = cv.findHomography(sm, dm, cv.RANSAC, RANSAC_REPROJ, mask, RANSAC_MAX_ITERS, RANSAC_CONFIDENCE)
+    // **这个顺序是必须的**：mask 是复用的，失败那次里面是上一帧的陈值，所以
+    // `mask.empty()` 挡不住任何东西 —— 挡住的是它左边那两条。见 `pointMats` 上面
+    // 那段「先查 H，再读 mask」。
     if (!H || H.empty() || mask.empty()) return fail
 
     let inliers = 0

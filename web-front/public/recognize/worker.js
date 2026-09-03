@@ -159,21 +159,26 @@ function drain() {
     if (msg.bitmap) {
       const wantFull = pipeline.wantsFull()
       const [sw, sh] = pipeline.smallDims(msg.width, msg.height)
-      // 小图**每帧都画**（1.2MB，便宜），全图只在检测/重锚帧画（4.9MB + 后面的
-      // cvtColor/resize）。两张都从同一个 bitmap 画，缩放路径固定，
-      // 见 pipeline._toTrackGray 里那段「必须来自同一条路」。
-      const small = canvasFor('small', sw, sh)
-      small.drawImage(msg.bitmap, 0, 0, sw, sh)
-      const smallData = small.getImageData(0, 0, sw, sh)
-      let full = null
-      if (wantFull) {
-        const fc = canvasFor('full', msg.width, msg.height)
-        fc.drawImage(msg.bitmap, 0, 0, msg.width, msg.height)   // 与 camera.grab() 逐字节同一条路
-        full = fc.getImageData(0, 0, msg.width, msg.height)
+      try {
+        // 小图**每帧都画**（1.2MB，便宜），全图只在检测/重锚帧画（4.9MB + 后面的
+        // cvtColor/resize）。两张都从同一个 bitmap 画，缩放路径固定，
+        // 见 pipeline._toTrackGray 里那段「必须来自同一条路」。
+        const small = canvasFor('small', sw, sh)
+        small.drawImage(msg.bitmap, 0, 0, sw, sh)
+        const smallData = small.getImageData(0, 0, sw, sh)
+        let full = null
+        if (wantFull) {
+          const fc = canvasFor('full', msg.width, msg.height)
+          fc.drawImage(msg.bitmap, 0, 0, msg.width, msg.height)   // 与 camera.grab() 逐字节同一条路
+          full = fc.getImageData(0, 0, msg.width, msg.height)
+        }
+        frame = { full, small: smallData, width: msg.width, height: msg.height }
+      } finally {
+        // **必须 close()**：ImageBitmap 持有 GPU 内存，不关就是真的泄漏。
+        // 放 finally 里：上面那几步抛了（画布尺寸非法、2d 上下文丢了）同样得关，
+        // 否则一次异常就泄一张 1280×960 的纹理，而这条路每秒走几十次。
+        msg.bitmap.close()
       }
-      // **必须 close()**：ImageBitmap 持有 GPU 内存，不关就是真的泄漏。
-      msg.bitmap.close()
-      frame = { full, small: smallData, width: msg.width, height: msg.height }
     } else {
       // 退化路径（没有 OffscreenCanvas）：只有全图，跟踪灰度图由 pipeline 自己缩（老路）。
       frame = {
@@ -186,7 +191,18 @@ function drain() {
     // `grabbedAt` 原样带回。主线程的延迟补偿要知道"这个结果测的是多久之前的画面"，
     // 而那**不等于** `now - ms`：帧可能在 `pending` 里排过队（跟踪 44ms > 送帧
     // 间隔 33ms 时必然发生），排队那一段不在 ms 里。
-    self.postMessage({ type: 'result', id: msg.id, grabbedAt: msg.grabbedAt, ...out })
+    //
+    // `usedFull` 是这一帧到底解了没解全图 —— **唯一能从外面看见「跟踪帧只解 640」
+    // 有没有真的生效的量**。不报的话，`wantsFull()` 哪天恒真了（比如 `_wantFull`
+    // 粘死）测试与日志全都照旧全绿，而每帧多付 4.9MB。`test/golden/worker-smoke.html`
+    // 拿它断言全图帧占比。
+    self.postMessage({
+      type: 'result',
+      id: msg.id,
+      grabbedAt: msg.grabbedAt,
+      usedFull: Boolean(frame.full),
+      ...out,
+    })
   } catch (e) {
     self.postMessage({ type: 'error', message: `识别失败：${e?.message ?? e}`, stack: `${e?.stack ?? ''}`.slice(0, 1500) })
     // 这一帧没有 result，同样要还名额 —— 否则一次识别异常就把在途计数永久扣掉一个。
