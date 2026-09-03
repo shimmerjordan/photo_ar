@@ -112,7 +112,7 @@ cd web-front && npm test                 # 网页版（零依赖，只用 node -
 `npm run test:smoke` 与 `npm run test:pages`（对着一个跑着的容器点一遍每个页面）。
 
 发一版新镜像是个明确动作，不是推代码的副作用：**只能手动触发** —— Actions → server → Run workflow，
-填 `publish` / `version` / `latest` / `release` 四项。推代码或打 tag 都不会发版（推 main 只跑测试）。
+填 `publish` / `version` / `latest` / `release` 四项。推代码或打 tag 都不会触发任何自动检查或发版。
 
 读源码的一点提醒：注释里的 `§N` 指的是一份没有随仓库发布的内部设计文档。每处注释
 都把真正的理由写在了旁边，所以不看那份文档也不缺信息。
@@ -123,10 +123,11 @@ cd web-front && npm test                 # 网页版（零依赖，只用 node -
 网页管理台都已经做完并在跑，真机（安卓 / Chromium）上验证过完整链路。一个容器一个
 端口的部署形态在开发机上按 NAS 的资源预算（3 核 / 3 GiB）验证过。
 
-**安卓原生客户端 2026-08-05 下线**，精力集中在网页版：不用装；完整链路在安卓真机上
-验证过，iOS / 鸿蒙按同样的 Web API 工作，而它的识别与贴合质量已经够。那一套代码在
-git 历史里（`android/`），决策记录在
+**安卓原生客户端 2026-08-05 下线**。那一套代码在 git 历史里（`android/`），决策记录在
 [docs/decisions.md](docs/decisions.md)。
+
+精力集中在网页版：不用装；完整链路在安卓真机上验证过，iOS / 鸿蒙按同样的 Web API
+工作，而它的识别与贴合质量已经够。
 
 还没在目标硬件上验证的：XFeat 后端在 N5095 上的延迟（在更快的机器上按 3 核预算实测
 p50 800ms，那台上大概太慢）。它默认关着。见 [docs/decisions.md](docs/decisions.md) §11。
