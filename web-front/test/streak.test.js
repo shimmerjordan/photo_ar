@@ -6,7 +6,7 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { STREAK_DEFAULTS, Streak } from '../public/recognize/streak.js'
+import { STREAK_DEFAULTS, Streak, streakWindow } from '../public/recognize/streak.js'
 
 const DET = [0.05, 20.0]
 /** 一个候选。`h` 必须有 —— 没有单应矩阵的候选不能当证据。 */
@@ -162,4 +162,11 @@ describe('参数', () => {
     assert.ok(STREAK_DEFAULTS.ratio > thresholds.ratio,
       `累积比值 ${STREAK_DEFAULTS.ratio} 应当严于单帧 ${thresholds.ratio}`)
   })
+})
+
+test('streakWindow：检测间隔小时用默认 2000，大时放到 4 倍间隔', () => {
+  assert.equal(streakWindow(0), STREAK_DEFAULTS.windowMs)
+  assert.equal(streakWindow(300), STREAK_DEFAULTS.windowMs)   // 1200 < 2000
+  assert.equal(streakWindow(700), 2800)                       // IDLE 档：3 帧 2100ms 必须容得下
+  assert.equal(streakWindow(NaN), STREAK_DEFAULTS.windowMs)
 })

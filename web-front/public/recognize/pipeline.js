@@ -36,7 +36,7 @@ import { OrbExtractor, opencv } from './orb.js'
 import { candidateDocs } from './library.js'
 import { thresholds } from './consts.js'
 import { decideWith, normalizedQuad, ransacPair, verifyPair } from './verify.js'
-import { Streak } from './streak.js'
+import { Streak, streakWindow } from './streak.js'
 
 export const SCANNING = 'scanning'
 export const LOCKED = 'locked'
@@ -224,6 +224,8 @@ export class Pipeline {
     /** 跨帧证据累积。修的是「内点 30~38 打不过门槛 40」，见 `streak.js`。 */
     this.streak = new Streak()
     this.stats = { detects: 0, tracks: 0, lastDetectMs: 0, lastTrackMs: 0 }
+    /** 上一次 `_detect` 的时刻，算检测间隔用（见 `streakWindow`）。 */
+    this._lastDetectAt = 0
 
     // 跟踪状态。gray 是**上一帧**的灰度图，光流要用它。
     // ⚠️ 这两张在**跟踪尺度**（TRACK_LONG_EDGE）上，不是查询尺度。
@@ -280,6 +282,9 @@ export class Pipeline {
   _detect(imageData) {
     const cv = this.cv
     this.stats.detects++
+    const nowDetect = performance.now()
+    const detectGap = this._lastDetectAt ? nowDetect - this._lastDetectAt : 0
+    this._lastDetectAt = nowDetect
     const src = this._matFrom(imageData)
     try {
       const query = this.extractor.extract(src)
@@ -308,6 +313,7 @@ export class Pipeline {
         this.streak.configure({
           softMin: thresholds.streakSoftMin,
           need: thresholds.streakNeed,
+          windowMs: streakWindow(detectGap),
         })
         const got = this.streak.offer(results, performance.now(), [thresholds.detMin, thresholds.detMax])
         if (!got) {

@@ -55,6 +55,16 @@ export const STREAK_DEFAULTS = {
 }
 
 /**
+ * 按实际检测间隔算链窗口。送帧退避到 700ms 时（pacing.PACE.IDLE），3 帧要 2100ms，
+ * 固定 2000 的窗口会让链**永远攒不满** —— 退避表与这个窗口必须一起动，这里就是那根绳。
+ * 4 倍：容得下一帧被丢（worker 只留最新一帧）。
+ */
+export function streakWindow(gapMs) {
+  const g = Number.isFinite(gapMs) && gapMs > 0 ? gapMs : 0
+  return Math.max(STREAK_DEFAULTS.windowMs, 4 * g)
+}
+
+/**
  * 一条累积链。浏览器里只有一个客户端（它自己），所以不需要服务端那套 key + LRU。
  */
 export class Streak {
