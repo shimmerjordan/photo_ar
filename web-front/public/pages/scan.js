@@ -34,16 +34,9 @@ import { button, h } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
+import { sendInterval } from '../pacing.js'
 
-/**
- * 送帧的下限间隔。**它现在只是防暴走的地板，不再是节奏的决定者** —— 节奏由
- * [MAX_INFLIGHT] 自己钟摆（worker 处理完一帧就腾出一个名额，主线程立刻补一帧）。
- *
- * 取 16ms：渲染就是 60fps，比这更密的观测画不出来，只是白付一次 `createImageBitmap`。
- * 改造前这里是 33ms，而那个数字与串行的 `inflight` 布尔量一起把观测率钉死在 15Hz。
- */
-const SEND_INTERVAL_MS = 16
-
+/** 送帧间隔由 pacing.sendInterval 决定，见那个文件。 */
 /**
  * 允许多少帧同时在途。**这一条是"贴合帧率翻倍"的全部来源。**
  *
@@ -157,6 +150,8 @@ export default {
       // `inflight` 是**计数**不是布尔量（见 MAX_INFLIGHT）。每送一帧 +1，
       // 每收到一条 result 或 drop -1 —— 两种回执都要算，漏一种就会永久漏名额。
       frameSeq: 0, inflight: 0, lastSentAt: 0, paused: false,
+      // 距上一份证据多久 / 上一条结果说了什么 —— pacing.sendInterval 的两个输入。
+      lastEvidenceAt: performance.now(), lastReason: '',
       fps: { n: 0, at: 0, value: 0 }, detectMs: 0, trackMs: 0, lastGrabMs: 0,
       // 走不走 bitmap 那条路。一次失败就永久退回（见 sendFrame）。
       useBitmap: canGrabBitmap(),
@@ -203,6 +198,7 @@ export default {
           if (lib.hasVocab === false) parts.push('无词表·全量扫描')
         }
         if (st.fps.value) parts.push(`${st.fps.value} fps`)
+        parts.push(`送帧 ${sendInterval(paceArgs())}ms`)
         if (st.detectMs) parts.push(`检测 ${st.detectMs}ms`)
         if (st.trackMs) parts.push(`跟踪 ${st.trackMs}ms`)
         if (st.lockedPhoto) {
@@ -303,6 +299,7 @@ export default {
       dom.clip.load()
       rescan.hidden = true
       sound.hidden = true
+      st.lastEvidenceAt = performance.now(); st.lastReason = ''
       tip(TIPS.scanning)
     }
 
@@ -409,6 +406,9 @@ export default {
       if (m.state === 'locked' && m.ms) st.trackMs = m.ms
       else if (m.ms) st.detectMs = m.ms
       st.trackPoints = m.inliers ?? null
+      st.lastReason = m.reason ?? ''
+      // 证据 = 命中 / 有四角 / 累积链在攒。任何一样都说明"照片就在画面里"，节奏回满速。
+      if (m.fresh || m.quad || (m.streak && m.streak.n > 0)) st.lastEvidenceAt = performance.now()
       diag(() => `${m.state === 'locked' ? '跟踪' : '检测'} ${m.reason}` +
         ` 内点=${m.inliers ?? '-'} ${m.ms}ms 四角=${m.quad ? '有' : '无'}` +
         (m.streak ? ` 累积 ${m.streak.n}/${m.streak.need}` : '') +
@@ -492,6 +492,7 @@ export default {
       camBtn.querySelector('span').textContent = '关相机'
       st.renderer ??= new Renderer(dom.canvas)
       st.grabber ??= new FrameGrabber(dom.cam)
+      st.lastEvidenceAt = performance.now(); st.lastReason = ''
       tip(TIPS.scanning)
       cancelAnimationFrame(st.raf)
       st.raf = requestAnimationFrame(loop)
@@ -598,11 +599,22 @@ export default {
      * 挂在 rAF 上是改造前的做法，它凭空加了一段等待：结果回来的时刻与下一个 rAF tick
      * 之间平均差 8ms，而整个周期才 65ms。现在回执一到就立刻补帧，不必等下一帧渲染。
      */
+    /** `sendInterval` 的四个输入。`maybeSend` 与 debug 读数（meta）共用，避免写两遍。 */
+    function paceArgs() {
+      return {
+        locked: Boolean(st.lockedPhoto && st.quad),
+        motion: st.filter.motion,
+        idleMs: performance.now() - st.lastEvidenceAt,
+        reason: st.lastReason,
+      }
+    }
+
     function maybeSend() {
       if (!st.alive || st.paused || !st.stream || !st.grabber) return
       if (st.inflight >= MAX_INFLIGHT) return
       const now = performance.now()
-      if (now - st.lastSentAt < SEND_INTERVAL_MS) return
+      const interval = sendInterval(paceArgs())
+      if (now - st.lastSentAt < interval) return
       st.lastSentAt = now
       st.inflight++
       sendFrame(now)
