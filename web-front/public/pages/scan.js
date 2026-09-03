@@ -545,7 +545,7 @@ export default {
     const lib = ctx.libInfo?.()
     if (lib && lib.nPhotos === 0) {
       tip(TIPS.empty)
-      meta()
+      meta(true)
     } else {
       await openCam()
     }

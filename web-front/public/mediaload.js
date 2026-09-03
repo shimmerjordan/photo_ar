@@ -106,10 +106,12 @@ export function forgetMedia(photoId) {
  * @param onStage `({stage, text, pct, info, fromCache, error})` —— 每次状态变化调一次。
  *   `pct` 是 0..1 或 null（不定长）。
  * @param onDiag  可选，把技术细节送进 diag（页面各自决定要不要）
+ * @param fetcher 可选，透传给 `mediaInfo`（见那个函数的说明）。默认走真实网络；
+ *   测试注入一个假函数，不必打真请求也不必 mock `api.js` 模块。
  * @returns 卸载函数。**必须调**：它要停掉还在跑的 fetch 与播放进度监听，否则切页之后
  *   那十几 MB 还在下、而用户以为已经离开了。
  */
-export function loadPhotoVideo(video, photoId, { onStage, onDiag } = {}) {
+export function loadPhotoVideo(video, photoId, { onStage, onDiag, fetcher } = {}) {
   let alive = true
   let stopStream = null
   let fromCache = false
@@ -122,8 +124,16 @@ export function loadPhotoVideo(video, photoId, { onStage, onDiag } = {}) {
    * 字却说还在缓冲。
    */
   let playing = false
-  /** 元信息一到手就挂在这里，之后每一次回调都带着它 —— 试播页要拿它显示大小与时长。 */
-  let mediaInfo = null
+  /**
+   * 元信息一到手就挂在这里，之后每一次回调都带着它 —— 试播页要拿它显示大小与时长。
+   *
+   * ⚠️ **不要叫它 `mediaInfo`**：模块级也导出了一个同名函数（会话缓存那个）。这里曾经
+   * 就叫这个名字，函数体内 `mediaInfo(photoId)` 那一句解析到的是**这个局部变量**
+   * （此时还是 `null`），而不是外层那个函数 —— 结果是每次都抛
+   * `TypeError: mediaInfo is not a function`，被下面的 try/catch 吞成一句
+   * 「取视频信息失败」，三个页面的视频全加不出来。
+   */
+  let curInfo = null
 
   const say = (stage, detail = {}) => {
     if (!alive) return
@@ -135,7 +145,7 @@ export function loadPhotoVideo(video, photoId, { onStage, onDiag } = {}) {
       ...detail,
       // 放在展开之后并显式兜底：调用方给了就用它的，没给就用手上这一份。
       // 写在展开之前的话，`detail` 里一个 `info: undefined` 就会把它抹掉。
-      info: detail.info ?? mediaInfo,
+      info: detail.info ?? curInfo,
     })
   }
 
@@ -163,12 +173,14 @@ export function loadPhotoVideo(video, photoId, { onStage, onDiag } = {}) {
     say(Stage.INFO)
     let info
     try {
-      info = await mediaInfo(photoId)
+      // `fetcher` 未给（正常调用方）时是 `undefined`，`mediaInfo` 自己的默认参数
+      // （`= api.mediaOfPhoto`）接管 —— 不需要在这里再判一次。
+      info = await mediaInfo(photoId, fetcher)
     } catch (e) {
       return say(Stage.ERROR, { text: `取视频信息失败（${e.message}）`, pct: null, error: e })
     }
     if (!alive) return
-    mediaInfo = info
+    curInfo = info
     onDiag?.(`媒体信息 via=${info.via} absolute=${info.absolute} range=${info.supportsRange}` +
       ` bytes=${info.bytes} ${info.durationMs}ms missing=${info.missing} integrity=${info.integrity}`)
 
