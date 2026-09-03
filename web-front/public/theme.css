@@ -109,6 +109,13 @@ body {
   -webkit-touch-callout: none;
   overflow: hidden;
 }
+/* 这几类需要被选中复制：等宽数字/路径（.mono、.row2 .v）、失败信息（.warnbox）、
+   上传进度那条日志（.step）、加载态的文字（.state-h）。上面那条全局 `none` 是
+   为了不让整屏手势被文字选中打断，但这些恰恰是用户会想复制发出去问人的内容。 */
+.mono, .row2 .v, .warnbox, .step, .state-h {
+  -webkit-user-select: text;
+  user-select: text;
+}
 /* 浏览器默认 h1 是 2em、h2 是 1.5em —— 落到 24px 和 18px。24 没问题，**18 是灾难**：
    点阵字体在 1.5× 下每根竖笔一会儿 1px 一会儿 2px。所以先全部收回 12px，
    要大的地方（#title / .ttl / .letter h1）自己写 24px。 */
@@ -160,16 +167,6 @@ input:not([type="file"]) {
   --rule: rgb(158 71 31 / 35%);
   color: var(--fg);
 }
-/* 夜色面板把它切回来（.panel 在上面已经被切成桃色了）。 */
-.panel.night {
-  --fg: var(--lit);
-  --fg-dim: var(--lit-dim);
-  --fg-bad: var(--lit-bad);
-  --fg-ok: var(--gold);
-  --rule: rgb(198 137 99 / 30%);
-  border-image-source: url("/art/frame-night.png");
-}
-
 .panel {
   display: block;
   border-width: 20px;
@@ -238,10 +235,9 @@ button.danger { border-image-source: url("/art/frame-red-s.png"); }
 #back { min-width: 44px; min-height: 44px; padding: 0 6px; }
 #back[hidden] { display: none; }
 
-/* 木箭头只画了朝上那一张，四个方向靠旋转。90° 的整数倍不产生插值，像素还是像素。 */
+/* 木箭头只画了朝上那一张，四个方向靠旋转。90° 的整数倍不产生插值，像素还是像素。
+   眼下只有「返回」用到朝左那一张 —— 朝右/朝下两条规则没有任何调用点，删掉。 */
 .arrow-l { transform: rotate(-90deg); }
-.arrow-r { transform: rotate(90deg); }
-.arrow-d { transform: rotate(180deg); }
 
 #view { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 12px 10px 20px; }
 #view.full { padding: 0; overflow: hidden; position: relative; }
