@@ -19,7 +19,7 @@
  * 所以这一页如实显示"能查到的那部分"，并明确说清哪些查不到。**编一个数字比不给更糟**：
  * 用户会据此判断"是不是缓存坏了"。
  */
-import { bytes, button, h, row, section, toast } from '../ui.js'
+import { bytes, button, confirmDanger, h, row, section, toast } from '../ui.js'
 import { clearWasmCache } from '../recognize/wasmcache.js'
 import { budget, clearPrefetched, prefetchStatus, prefetchedCount } from '../prefetch.js'
 
@@ -46,7 +46,8 @@ export default {
     // 与下面「浏览器给的存储配额」那一节形成对照：那一节只能报整个源的总量。
     const pre = section('预取的媒体')
     el.appendChild(pre)
-    {
+    const renderPrefetch = async () => {
+      pre.body.innerHTML = ''
       const st = prefetchStatus()
       pre.body.appendChild(row('状态', st.state))
       const n = await prefetchedCount()
@@ -66,10 +67,14 @@ export default {
       pre.body.appendChild(h('p', { class: 'p dim', text: '预算是浏览器给这个站点的配额的四分之一（钳在 64MB 到 1GB 之间）。两种角色同一套。' }))
       pre.body.appendChild(h('div', { class: 'actions' },
         button('清空预取', async () => {
+          if (!confirmDanger('清空预取的视频与缩略图？下次登录会重新预取。')) return
           await clearPrefetched()
-          toast('已清空。下次登录会重新预取。')
+          toast('已清空')
+          await renderPrefetch()
         }, { kind: 'ghost' })))
     }
+    await renderPrefetch()
+    if (!alive) return
 
     const storage = section('浏览器给的存储配额')
     el.appendChild(storage)
@@ -89,6 +94,7 @@ export default {
       storage.body.appendChild(h('p', { class: 'p dim', text: '这个浏览器不提供存储用量查询。' }))
     }
 
+    const engineErr = h('p', { class: 'warnbox', hidden: true })
     el.appendChild(section('识别引擎',
       h('p', { class: 'p', text: '引擎是一个 12MB 的 wasm。第一次进页面要下载 + 编译，之后浏览器用它自己的编译缓存直接加载。' }),
       h('p', { class: 'p dim', text: '进页面时顶部那条进度会说明走的是哪条：「正在下载」还是「从缓存读取」。' }),
@@ -96,13 +102,17 @@ export default {
         button('清掉引擎的编译缓存', async () => {
           // 这条只清我们自己那份 IndexedDB 兜底（见 wasmcache.js）。浏览器原生的
           // code cache 没有清除 API —— 如实说出来，而不是让用户以为点了就干净了。
+          engineErr.hidden = true
           try {
             await clearWasmCache()
             toast('已清掉我们那份兜底缓存')
           } catch (e) {
-            toast(`清理没成：${e.message}`)
+            // 失败留在页面上（不用 toast）—— 那会自己消失，而这是用户唯一的线索。
+            engineErr.hidden = false
+            engineErr.textContent = `清理没成：${e.message}`
           }
         }, { kind: 'ghost' })),
+      engineErr,
       h('p', { class: 'p dim', text: '浏览器原生的 wasm 编译缓存没有清除 API。真要彻底清，用浏览器设置里的「清除站点数据」。' })))
 
     el.appendChild(section('彻底清空',

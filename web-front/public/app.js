@@ -20,7 +20,7 @@ import { bindToggle, diagAlways, initDiag } from './diag.js'
 import { Shell } from './shell.js'
 import { startPrefetch } from './prefetch.js'
 import { hardRefresh, staleAgainst } from './staleguard.js'
-import { toast } from './ui.js'
+import { esc, mb } from './ui.js'
 
 const $ = (id) => document.getElementById(id)
 const els = {
@@ -72,7 +72,6 @@ function progress(pct, { hide = false, label = null } = {}) {
     els.bar.removeAttribute('aria-valuenow')
   }
 }
-const MB = (n) => (n / 1048576).toFixed(1)
 const bootSay = (text) => { bootText.textContent = text }
 
 /**
@@ -101,7 +100,7 @@ function noteEngineFetch(fromCache, total) {
     localStorage.setItem(ENGINE_FETCH_KEY, String(fromCache ? 0 : n + 1))
   } catch { return }   // 隐私模式下 localStorage 会抛，那就没这条诊断，不影响使用
   if (fromCache) return
-  diagAlways(`引擎走了网络（${MB(total)}MB），本机缓存连续未命中 ${n + 1} 次`)
+  diagAlways(`引擎走了网络（${mb(total)}MB），本机缓存连续未命中 ${n + 1} 次`)
   if (n + 1 < 2) return
   // 只在 https 上提证书：http 页面上没缓存是另一回事（而 http 下相机本来就开不了，
   // 用户会先撞到那个）。
@@ -109,7 +108,7 @@ function noteEngineFetch(fromCache, total) {
     ? '多半是这个地址的证书不被浏览器信任（自签 / 点过"继续访问"）—— 那种情况下 ' +
       'Chromium 会对整个站点关掉磁盘缓存。换成受信任证书的地址（隧道域名）就好了。'
     : '这个地址不是 https，浏览器的缓存策略更严。'
-  diagAlways(`⚠️ 每次进来都要重下 ${MB(total)}MB 引擎。${why}`)
+  diagAlways(`⚠️ 每次进来都要重下 ${mb(total)}MB 引擎。${why}`)
 }
 
 // ── 登录门 ────────────────────────────────────────────────────────────
@@ -215,12 +214,12 @@ async function boot() {
     if (!r.ok) {
       const err = await r.json().catch(() => ({}))
       progress(null, { hide: true })
-      return showGate(`<span class="err">取识别库失败：${err.message ?? r.status}</span>`)
+      return showGate(`<span class="err">取识别库失败：${esc(err.message ?? r.status)}</span>`)
     }
     libBuf = await r.arrayBuffer()
   } catch (e) {
     progress(null, { hide: true })
-    return showGate(`<span class="err">取识别库失败：${e.message}</span>`)
+    return showGate(`<span class="err">取识别库失败：${esc(e.message)}</span>`)
   }
 
   // 谁登录着。**在库之后取**：库那一步已经证明了会话有效，而 /v1/me 失败不该阻止使用
@@ -265,10 +264,10 @@ function startWorker(libBuf, thresholds) {
           noteEngineFetch(m.fromCache, m.total)
         } else if (m.total) {
           progress(m.pct)
-          bootSay(`正在下载识别引擎 ${MB(m.loaded)} / ${MB(m.total)} MB`)
+          bootSay(`正在下载识别引擎 ${mb(m.loaded)} / ${mb(m.total)} MB`)
         } else {
           progress(-1)
-          bootSay(`正在加载识别引擎 ${MB(m.loaded)} MB…`)
+          bootSay(`正在加载识别引擎 ${mb(m.loaded)} MB…`)
         }
         return
       }
@@ -318,7 +317,6 @@ function mountShell() {
       libInfo: () => state.libInfo,
       webCfg: () => state.webCfg,
       worker: state.worker,
-      toast,
       progress,
       bindDiagToggle: (el) => bindToggle(el),
     },
@@ -340,4 +338,4 @@ function isAdmin() {
   return state.me?.isAdmin === true || state.me?.role === 'admin'
 }
 
-boot().catch((e) => showGate(`<span class="err">启动失败：${e.message}</span>`))
+boot().catch((e) => showGate(`<span class="err">启动失败：${esc(e.message)}</span>`))

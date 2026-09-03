@@ -25,7 +25,7 @@ export default {
     let alive = true
     const id = ctx.params.id
     if (!id) {
-      el.appendChild(h('p', { class: 'state', text: '缺少照片 id' }))
+      el.appendChild(failed('缺少照片 id', () => ctx.shell.pop()))
       return () => { alive = false }
     }
 
@@ -61,7 +61,7 @@ export default {
 
       el.appendChild(framed(h('img', {
         class: 'ref', alt: d.title ?? '参考图',
-        src: `/v1/photo/${id}/thumb?rev=${ctx.shell.libraryRev}`,
+        src: `${api.thumbUrl(id)}?rev=${ctx.shell.libraryRev}`,
       })))
       el.appendChild(h('h1', { class: 'ttl', text: d.title || '（未命名）' }))
 
@@ -78,10 +78,27 @@ export default {
         row('视频', d.videoPath ?? '未关联', { mono: true, bad: Boolean(d.videoMissing) }),
         d.durationMs ? row('时长', duration(d.durationMs)) : null))
 
+      const errBox = h('p', { class: 'warnbox', hidden: true })
+      const showErr = (msg) => { errBox.hidden = false; errBox.textContent = msg }
+
       const actions = h('div', { class: 'actions' })
       if (d.hasVideo !== false || d.videoPath) {
         actions.appendChild(button('试播', () => ctx.shell.push(Page.PLAY, { id }), { iconName: 'play' }))
       }
+      actions.appendChild(button('换参考图', async () => {
+        // 原生 prompt 而不是自绘弹窗：理由与 `confirmDanger` 同一条（见那个函数的说明）——
+        // 这套界面在手机上全屏，自绘弹窗要处理返回键、焦点陷阱、滚动锁定。
+        const path = globalThis.prompt('新参考图在 NAS 上的路径（已在挂载根下）：', d.refPath ?? '')
+        if (!path) return
+        try {
+          await api.replaceRef(id, { refPath: path.trim() })
+          toast('参考图已换，特征已重算')
+          ctx.shell.libraryChanged()
+          await load()
+        } catch (e) {
+          showErr(`没换成：${e.message}`)
+        }
+      }, { kind: 'ghost', iconName: 'refresh' }))
       actions.appendChild(button('删除这张', async () => {
         // 服务端的删除是**墓碑**而不是真删（slot 下标就是 desc.bin 的偏移，摘一项会让
         // photo_id ↔ slot 整体平移 → 命中之后播别人的视频）。但对用户是不可撤销的，
@@ -94,10 +111,11 @@ export default {
           ctx.shell.pop()
         } catch (e) {
           // 失败留在页面上，不用 toast —— 那会自己消失，而这是用户唯一的线索。
-          el.appendChild(h('p', { class: 'warnbox', text: `删除没成：${e.message}` }))
+          showErr(`删除没成：${e.message}`)
         }
       }, { kind: 'danger', iconName: 'trash' }))
       el.appendChild(actions)
+      el.appendChild(errBox)
     }
 
     await load()

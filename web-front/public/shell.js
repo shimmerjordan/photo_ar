@@ -18,6 +18,7 @@
 import { Page, TAB_META, Tab, isRoot, landingTab, needsAdmin, tabAfterRoleChange, tabsFor } from './navpolicy.js'
 import { icon } from './pixelicons.js'
 import { forgetMedia } from './mediaload.js'
+import { empty, loading, toast } from './ui.js'
 
 const PAGES = {
   [Tab.SCAN]: () => import('./pages/scan.js'),
@@ -41,7 +42,8 @@ export const PAGE_NAMES = Object.keys(PAGES)
 export class Shell {
   /**
    * @param els `{topbar, title, back, view, tabbar}`
-   * @param ctx 传给每个页面的上下文：`{me, isAdmin, go, back, toast, libraryRev, ...}`
+   * @param ctx 传给每个页面的上下文：`{me, isAdmin, libInfo, webCfg, worker, progress, bindDiagToggle, params, shell}`
+   *   —— 后两个（`params`、`shell`）由 `_render()` 在这份 ctx 上补齐，不在构造时传入。
    */
   constructor(els, ctx) {
     this.els = els
@@ -178,9 +180,11 @@ export class Shell {
       this._teardown = null
     }
     this.els.view.innerHTML = ''
+    this.els.view.appendChild(loading())
 
     // 越权直接送回落地页，而不是渲染一个必然 403 的页面。
     if (needsAdmin(name) && !this.ctx.isAdmin()) {
+      toast('这一页需要管理员权限')
       this.stack = [{ name: landingTab(), params: {} }]
       this._syncHash()
       return this._render()
@@ -188,7 +192,7 @@ export class Shell {
 
     const loader = PAGES[name]
     if (!loader) {
-      this.els.view.textContent = `没有这一页：${name}`
+      this.els.view.replaceChildren(empty('没有这一页', '点底部页签回到首页。', 'query'))
       return
     }
 
@@ -196,6 +200,8 @@ export class Shell {
     // 加载是异步的（动态 import）。期间用户可能又切了页 —— 那时这次挂载已经过时，
     // 必须丢掉。不判的话两页的 DOM 会同时插进去，而且旧那页的清理函数丢了。
     if (seq !== this._mountSeq) return
+    // 再清一次：上面那只 Junimo 只是"正在加载"占位，页面自己的内容要从一块空白开始画。
+    this.els.view.innerHTML = ''
 
     this.els.title.textContent = mod.title ?? ''
     this.els.back.hidden = this.stack.length <= 1

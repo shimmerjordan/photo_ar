@@ -12,7 +12,7 @@
  * 每一帧都这样"。
  */
 import * as api from '../api.js'
-import { empty, failed, h, loading, when } from '../ui.js'
+import { button, empty, failed, h, loading, when } from '../ui.js'
 
 /** 未命中原因 → 该做什么。**每一条都要能照着做** —— 这是 App 那边反复踩出来的教训。 */
 const REASON = {
@@ -47,6 +47,7 @@ export default {
 
       if (!items.length) {
         el.appendChild(empty('还没有识别记录', '扫一次照片就会在这里留一条，命中和未命中都记。'))
+        el.appendChild(button('刷新', load, { kind: 'ghost', iconName: 'refresh' }))
         return
       }
 

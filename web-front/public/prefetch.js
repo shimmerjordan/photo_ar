@@ -51,8 +51,9 @@
  * - 每次会话只跑一遍（登录后触发）。
  */
 import * as api from './api.js'
-import { diagAlways } from './diag.js'
+import { diagAlways, short } from './diag.js'
 import { mediaInfo } from './mediaload.js'
+import { mb } from './ui.js'
 
 export const CACHE_NAME = 'photoar-media-v1'
 /**
@@ -359,6 +360,3 @@ async function prefetchThumbs(photos, limitBytes) {
   } catch { /* 同上 */ }
   diagAlways(`预取：缩略图 ${status.thumbs} 张（${mb(used)}MB）`)
 }
-
-const mb = (n) => (n / 1048576).toFixed(1)
-const short = (id) => String(id ?? '').slice(0, 8)

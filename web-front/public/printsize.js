@@ -33,9 +33,6 @@ export const PRINT_SIZES = [
   { key: 'a4_p', label: 'A4 竖', widthMm: 210, hint: '同一张 A4，竖着摆' },
 ]
 
-/** 已知宽度的那些（`widthMm > 0`）。 */
-export const known = (p) => p.widthMm > 0
-
 /**
  * 横放一定比竖放宽。
  *

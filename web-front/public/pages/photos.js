@@ -21,7 +21,7 @@
  * 它解释了"为什么我扫了没反应"，那是宾客真会问的问题。
  */
 import * as api from '../api.js'
-import { empty, failed, h, loading, thumb } from '../ui.js'
+import { button, empty, failed, h, loading, thumb } from '../ui.js'
 import { Page } from '../navpolicy.js'
 
 export default {
@@ -41,6 +41,7 @@ export default {
           // 宾客这一句必须给出**他能做的下一步**，而"去传一张"不是（他没有那个页签，
           // 服务端也会 403）。他能做的只有一件事：找管理员。
           : empty('还没有照片给你', '管理员还没有把照片授权给你。找他要一下，之后刷新这一页就能看到。'))
+        el.appendChild(button('刷新', load, { kind: 'ghost', iconName: 'refresh' }))
         return
       }
       const grid = h('div', { class: 'grid' })

@@ -195,6 +195,19 @@ export function starRow(n, { total = 5 } = {}) {
   return row
 }
 
+/**
+ * 转义成能安全塞进 `innerHTML` 的文本。
+ *
+ * 凡是服务端或用户能填的字符串（照片标题、错误信息…）一旦要拼进一段 HTML
+ * （比如 `tip()` 那种"半句静态 + 一段动态"的场景，纯 `textContent` 用不上），
+ * 就必须先过这一遍 —— 不然一个带 `<` 的标题会把后面的标签吃掉，界面表现是
+ * "这一条不见了"，而不是一个能定位到"没转义"的报错。
+ */
+export const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+
+/** MB，一位小数。三处（app.js / mediaload.js / prefetch.js）各写过一遍，现在只有这一处。 */
+export const mb = (n) => (n / 1048576).toFixed(1)
+
 /** 字节数。与 Android `Fmt.bytes` 同一个口径（1024 进制，一位小数）。 */
 export function bytes(n) {
   if (!Number.isFinite(n) || n < 0) return '—'

@@ -211,10 +211,6 @@ export const attachVideo = (id, payload) =>
 export const replaceRef = (id, payload) =>
   req(`/v1/photo/${id}/ref`, { method: 'POST', body: payload })
 
-/** 按 sha256 或路径反查已入库的照片。上传前判重用。 */
-export const lookup = (params) =>
-  req(`/v1/lookup?${new URLSearchParams(params)}`)
-
 // ── 配置 ──────────────────────────────────────────────────────────────
 /** web-front 转出来的识别阈值（服务端热配置）。拿不到就是空对象，不是错误。 */
 export const webConfig = () => req('/api/config')

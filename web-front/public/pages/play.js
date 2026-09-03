@@ -13,8 +13,8 @@
  * 报得对不对。链路本身为什么要绕成这样，写在 `mp4stream.js` 顶部那张表里。
  */
 import { MEDIA_ERR, NETWORK_STATE, READY_STATE } from '../diag.js'
-import { Stage, loadPhotoVideo } from '../mediaload.js'
-import { bytes, duration, h, row, section, setBar } from '../ui.js'
+import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
+import { bytes, duration, failed, h, row, section, setBar } from '../ui.js'
 
 export default {
   title: '试播',
@@ -22,6 +22,10 @@ export default {
   async mount(el, ctx) {
     let alive = true
     let stopLoad = null
+    if (!ctx.params.id) {
+      el.appendChild(failed('缺少照片 id', () => ctx.shell.pop()))
+      return () => {}
+    }
 
     // controls 交给浏览器：自绘播放条要处理拖动、缓冲区间、全屏、画中画 ——
     // 而原生控件在每个平台上都已经对了，且带无障碍。
@@ -77,7 +81,7 @@ export default {
           errBox.textContent = s.text
           return
         }
-        stageLine.textContent = STAGE_LINE[s.stage] ?? '正在加载…'
+        stageLine.textContent = stageText(s.stage, s) || '正在加载…'
         detail.textContent = s.text
         setBar(bar, s.pct)
       },
@@ -102,11 +106,4 @@ export default {
       video.load()
     }
   },
-}
-
-const STAGE_LINE = {
-  [Stage.INFO]: '正在取视频信息…',
-  [Stage.TICKET]: '正在准备播放通道…',
-  [Stage.DOWNLOAD]: '正在下载视频',
-  [Stage.BUFFER]: '正在缓冲首帧…',
 }

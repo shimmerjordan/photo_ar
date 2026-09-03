@@ -29,8 +29,8 @@ import {
   FULL_RECT, TTL_MS, clipVertices, flatQuadImage, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
-import { Stage, loadPhotoVideo } from '../mediaload.js'
-import { button, h, playerControls } from '../ui.js'
+import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
+import { button, esc, h, playerControls } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
@@ -96,20 +96,6 @@ const TIPS = {
   forbidden: '认出来了，但这张没有授权给你。',
 }
 
-/**
- * 视频装载各阶段在 HUD 大字上说的半句话（前半句是「认出了「娃娃」，」）。
- *
- * 每一句都在说**这一刻在等什么**，而不是笼统的"加载中"：等信息、等通道、等字节、
- * 等第一帧。分开说的价值在网络烂的时候才显出来 —— 卡在"下载视频"和卡在"取视频信息"
- * 是两种完全不同的故障，而它们过去长得一模一样。
- */
-const STAGE_TIP = {
-  [Stage.INFO]: '正在取视频…',
-  [Stage.TICKET]: '正在准备播放…',
-  [Stage.DOWNLOAD]: '正在下载视频…',
-  [Stage.BUFFER]: '就快好了…',
-}
-
 /** 顶部那条金条的 `aria-label`。不换的话读屏会在播视频时念「加载识别引擎 40%」。 */
 const STAGE_LABEL = {
   [Stage.INFO]: '取视频信息',
@@ -128,7 +114,7 @@ export default {
       canvas: h('canvas', { class: 'gl' }),
       cam: h('video', { class: 'offscreen', playsinline: true, muted: true }),
       clip: h('video', { class: 'offscreen', playsinline: true, loop: true }),
-      tip: h('div', { id: 'tip', text: '正在准备…' }),
+      tip: h('div', { id: 'tip', text: '正在准备…', 'aria-live': 'polite' }),
       meta: h('div', { id: 'meta' }),
     }
     const rescan = button('重新扫描', () => resetLock(), { kind: 'ghost', iconName: 'refresh' })
@@ -444,9 +430,9 @@ export default {
         st.loadNote = null
         ctx.progress?.(null, { hide: true })
         // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
-        tip(`认出了 ${title}，但${s.text}。`, { hit: true })
+        tip(`认出了 ${title}，但${esc(s.text)}。`, { hit: true })
       } else if (changed) {
-        tip(`认出了 <b>${title}</b>，${STAGE_TIP[s.stage] ?? '正在加载…'}`, { hit: true })
+        tip(`认出了 <b>${title}</b>，${stageText(s.stage, s) || '正在加载…'}`, { hit: true })
         bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
       } else {
         bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
@@ -466,7 +452,9 @@ export default {
       const photo = m.photo
       st.lockedPhoto = photo
       rescan.hidden = false
-      const title = photo?.title ? `「${photo.title}」` : '这张照片'
+      // 转义一次，之后各处拼进 tip() 的 innerHTML 就不用再操心 —— photo.title 是
+      // 管理员填的自由文本，一个 `<` 就会把后面的标签吃掉。
+      const title = photo?.title ? `「${esc(photo.title)}」` : '这张照片'
       if (!photo?.mediaUrl) {
         diagAlways(`命中 ${photo?.id?.slice(0, 8)} 但没有 mediaUrl（这张没配视频）`)
         tip(`认出了 ${title}，但它还没有配视频。`, { hit: true })
@@ -497,7 +485,7 @@ export default {
       if (!st.alive) return
       if (m.type === 'error') {
         diagAlways(`Worker 错误 ${m.message}`)
-        tip(`<span class="bad">${m.message}</span>`)
+        tip(`<span class="bad">${esc(m.message)}</span>`)
         return
       }
       // 丢帧回执：没有几何可用，只还名额然后立刻补一帧。

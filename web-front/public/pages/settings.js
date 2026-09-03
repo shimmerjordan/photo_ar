@@ -128,7 +128,11 @@ export default {
     // 7 下、每下间隔不超过 1.2 秒。数字给了反馈（后三下开始提示还差几下），否则连按的人
     // 不知道自己有没有在触发什么 —— 而没有反馈的隐藏手势等于不存在。
     const version = ctx.webCfg?.().version ?? '未知'
-    const versionRow = row('版本', version, { mono: true })
+    // 用 `<button>` 而不是 `row()` 那个纯展示的 div：这一行其实是个可交互的隐藏
+    // 手势入口，键盘与读屏用户也该能找到它、知道按了会发生什么。
+    const versionRow = h('button', {
+      class: 'ghost row2', type: 'button', 'aria-label': '版本（连按 7 下开调试）',
+    }, h('span', { class: 'k', text: '版本' }), h('span', { class: 'v mono', text: version }))
     about.body.appendChild(versionRow)
     let taps = []
     versionRow.addEventListener('click', () => {

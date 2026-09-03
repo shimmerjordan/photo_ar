@@ -34,6 +34,7 @@
 import * as api from './api.js'
 import { cachedStream } from './prefetch.js'
 import { playStream } from './mp4stream.js'
+import { mb } from './ui.js'
 
 /** 阶段名。页面用它决定画什么，不要去比对文案 —— 文案会改。 */
 export const Stage = {
@@ -73,8 +74,6 @@ export function stagePct(stage, { loaded = 0, total = 0 } = {}) {
   if (!total || !Number.isFinite(total)) return null
   return Math.min(1, Math.max(0, loaded / total))
 }
-
-const mb = (n) => (n / 1048576).toFixed(1)
 
 /**
  * 会话内的媒体元信息缓存。key = photoId。

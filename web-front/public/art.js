@@ -42,8 +42,6 @@ const SPRITES = {
   arrow: { src: '/art/arrow.png', w: 20, h: 22 },
 }
 
-export const SPRITE_NAMES = Object.keys(SPRITES)
-
 /**
  * 一张物件图。
  *

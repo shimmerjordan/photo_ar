@@ -28,7 +28,7 @@
  */
 import * as api from '../api.js'
 import { PRINT_SIZES } from '../printsize.js'
-import { bytes, button, h, section, setBar, starRow, toast } from '../ui.js'
+import { bytes, button, h, section, setBar, starRow } from '../ui.js'
 import { starHint } from '../scannability.js'
 
 /**
@@ -59,7 +59,7 @@ export default {
     let videoFile = null
     let sizeKey = 'unknown'
 
-    const log = h('div', { class: 'steps' })
+    const log = h('div', { class: 'steps', 'aria-live': 'polite' })
     const say = (text, kind = '') => {
       if (!alive) return
       log.appendChild(h('p', { class: `step ${kind}`, text }))
@@ -82,6 +82,7 @@ export default {
     photoIn.addEventListener('change', () => {
       photoFile = photoIn.files?.[0] ?? null
       photoName.textContent = photoFile ? `${photoFile.name}（${bytes(photoFile.size)}）` : '未选择'
+      runBtn.disabled = !photoFile
     })
     videoIn.addEventListener('change', () => {
       videoFile = videoIn.files?.[0] ?? null
@@ -124,6 +125,7 @@ export default {
     // ── 执行 ────────────────────────────────────────────────────────
     const progress = h('div', { class: 'bar2' }, h('i'))
     const progressText = h('p', { class: 'p mono' })
+    const elapsed = h('p', { class: 'p dim' })
     const setProgress = (loaded, total, label) => {
       // 总量未知时走不定长（铺满压暗），不是 `scaleX(0)` —— 一条空槽在传大文件时
       // 看起来像"一点都没动"。
@@ -131,20 +133,27 @@ export default {
       progressText.textContent = `${label}  ${bytes(loaded)} / ${bytes(total)}`
     }
 
+    let ctl = null
     const go = h('div', { class: 'actions' })
+    const cancelBtn = button('取消', () => ctl?.abort(), { kind: 'ghost' })
+    cancelBtn.hidden = true
     const runBtn = button('传上去并建立映射', async () => {
       if (busy) return
-      if (!photoFile) return toast('先挑一张照片')
       busy = true
       runBtn.disabled = true
+      cancelBtn.hidden = false
+      ctl = new AbortController()
       log.innerHTML = ''
       const t0 = Date.now()
+      let phase = ''
       // 处理期间每秒报一次「已经 N 秒」。Android 那边有同一条 —— 特征提取要几十秒，
-      // 而一个不动的"处理中"与卡死无从区分。
+      // 而一个不动的"处理中"与卡死无从区分。只在入库那一步（真正可能久的那一步）报，
+      // 其余阶段（上传有自己的进度条）留空。
       const tick = setInterval(() => {
         if (!alive) return
+        if (phase !== 'ingest') { elapsed.textContent = ''; return }
         const s = Math.round((Date.now() - t0) / 1000)
-        progressText.textContent = `处理中… 已经 ${s} 秒（照片大的话要久一些，别离开这一页）`
+        elapsed.textContent = `处理中… 已经 ${s} 秒（照片大的话要久一些，别离开这一页）`
       }, 1000)
 
       try {
@@ -190,6 +199,7 @@ export default {
           say(`上传${what}…`)
           const r = await api.upload(file, {
             name,
+            signal: ctl.signal,
             onProgress: ({ loaded, total }) => setProgress(loaded, total, `上传${what}`),
           })
           return { nasPath: r?.path ?? r?.nasPath, sha256: sha }
@@ -198,6 +208,7 @@ export default {
         const photoUp = await upOne(photoFile, '照片')
         const videoUp = videoFile ? await upOne(videoFile, '视频') : null
 
+        phase = 'ingest'
         say('入库并建立映射…（要跑特征提取，可能几十秒）')
         const widthMm = PRINT_SIZES.find((s) => s.key === sizeKey)?.widthMm ?? 0
         const payload = {
@@ -252,16 +263,20 @@ export default {
         say(`没成：${e.message}${e.status ? `（HTTP ${e.status}）` : ''}`, 'bad')
       } finally {
         clearInterval(tick)
+        cancelBtn.hidden = true
         if (alive) {
           busy = false
-          runBtn.disabled = false
+          runBtn.disabled = !photoFile
           progressText.textContent = ''
+          elapsed.textContent = ''
           progress.firstElementChild.style.transform = 'scaleX(0)'
         }
       }
     })
+    runBtn.disabled = !photoFile
     go.appendChild(runBtn)
-    el.appendChild(section('开始', go, progress, progressText, log))
+    go.appendChild(cancelBtn)
+    el.appendChild(section('开始', go, progress, progressText, elapsed, log))
 
     return () => { alive = false }
   },

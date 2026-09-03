@@ -175,19 +175,10 @@ export function diagAlways(msgOrFn) {
   const text = typeof msgOrFn === 'function' ? msgOrFn() : String(msgOrFn)
   log.push(text, Date.now(), 'key')
   dirty = true
-  if (enabled) return
-  // 有错误发生过就在面板标题上留个痕，好让人知道"这里有东西可看"。
-  pendingErrors++
-}
-let pendingErrors = 0
-
-export function pendingErrorCount() {
-  return pendingErrors
 }
 
 function enable() {
   enabled = true
-  pendingErrors = 0
   saveDebugFlag(true)
   if (!panel) buildPanel()
   panel.hidden = false

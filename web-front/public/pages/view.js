@@ -20,7 +20,7 @@
  */
 import * as api from '../api.js'
 import { savePhotoImage, savePhotoVideo } from '../download.js'
-import { Stage, loadPhotoVideo } from '../mediaload.js'
+import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
 import { cachedThumbUrl } from '../prefetch.js'
 import { button, failed, framed, h, loading, section, setBar } from '../ui.js'
 
@@ -35,7 +35,7 @@ export default {
 
     const id = ctx.params.id
     if (!id) {
-      el.appendChild(h('p', { class: 'state', text: '缺少照片 id' }))
+      el.appendChild(failed('缺少照片 id', () => ctx.shell.pop()))
       return () => { alive = false }
     }
 
@@ -71,7 +71,7 @@ export default {
       // 而 `<img>` 不查那里，所以命中时喂给它的是一个 blob 地址（cachedThumbUrl 的说明）。
       const img = h('img', {
         class: 'ref', alt: title,
-        src: thumbObjectUrl ?? `/v1/photo/${id}/thumb?rev=${ctx.shell.libraryRev}`,
+        src: thumbObjectUrl ?? `${api.thumbUrl(id)}?rev=${ctx.shell.libraryRev}`,
       })
       el.appendChild(framed(img))
       const full = new Image()
@@ -99,7 +99,7 @@ export default {
               stageLine.textContent = `视频播不了：${s.text}`
               vbar.hidden = true
             } else {
-              stageLine.textContent = `${STAGE_LINE[s.stage] ?? '正在加载…'}${s.text ? ` ${s.text}` : ''}`
+              stageLine.textContent = stageText(s.stage, s) || '正在加载…'
               setBar(vbar, s.pct)
             }
           },
@@ -153,11 +153,4 @@ export default {
       if (thumbObjectUrl) URL.revokeObjectURL(thumbObjectUrl)
     }
   },
-}
-
-const STAGE_LINE = {
-  [Stage.INFO]: '正在取视频…',
-  [Stage.TICKET]: '正在准备播放…',
-  [Stage.DOWNLOAD]: '正在下载视频',
-  [Stage.BUFFER]: '就快好了…',
 }
