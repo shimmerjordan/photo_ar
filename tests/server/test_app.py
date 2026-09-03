@@ -550,6 +550,17 @@ def test_photo_detail_reports_stale_and_missing(env):
         assert hit.get("refStale") is True
 
 
+def test_photos_list_and_detail_carry_stars(env):
+    """`stars` 是自匹配分翻出来的星级，对所有人可见（区别于只给 admin 的 `selfScore`），
+    列表和详情要对同一张照片给出相同的星级。"""
+    pid = env.ingest_ok(env.write_image("photos/stars.jpg", seed=64))
+    lst = env.body_json(env.get("/v1/photos"))["photos"]
+    row = next(p for p in lst if p["photoId"] == pid)
+    assert 1 <= row["stars"] <= 5
+    det = env.body_json(env.get(f"/v1/photo/{pid}"))
+    assert det["stars"] == row["stars"]
+
+
 # ---- 上传 ----
 
 
@@ -719,3 +730,5 @@ def test_详情里的运维字段只给管理员(make_env):
     # 这几样是他该看到的 —— 少了的话他不知道自己那张为什么扫不出来。
     for kept in ("photoId", "title", "refMissing", "refStale", "videoMissing"):
         assert kept in doc, f"{kept} 不该被一起裁掉"
+    # `stars` 对所有人可见（不是运维字段），即使 `selfScore` 被裁掉了也该在。
+    assert "stars" in doc and doc["stars"] == admin_doc["stars"]

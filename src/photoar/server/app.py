@@ -38,6 +38,7 @@ from .. import sheet as sheet_mod
 from .. import streak, verify, xfeat
 from ..nullvocab import NullVocab
 from ..sheet import SheetError
+from photoar.scannability import stars
 from . import (
     batch,
     framedump,
@@ -1380,6 +1381,7 @@ class Server:
                     "hasVideo": p["video_asset_id"] is not None,
                     "refStale": bool(p["ref_stale"]),
                     "createdAt": int(p["created_at"]),
+                    "stars": stars(int(p["self_score"])),
                 }
             )
         return json_response(200, {"photos": out, "total": len(out)})
@@ -1411,6 +1413,7 @@ class Server:
             "refAspect": self._ref_aspect(photo),
             "refMissing": bool(ref.get("missing")),
             "refStale": bool(photo["ref_stale"]),
+            "stars": stars(int(photo["self_score"])),
             "videoMissing": bool(video["missing"]) if video else None,
             "createdAt": int(photo["created_at"]),
             "updatedAt": int(photo["updated_at"]),
@@ -1727,6 +1730,7 @@ class Server:
             {
                 "photoId": result.photo_id,
                 "selfScore": result.self_score,
+                "stars": stars(result.self_score),
                 "printWidthM": result.print_width_m,
                 "transcoded": result.transcoded,
                 "elapsedMs": result.elapsed_ms,
@@ -1770,6 +1774,7 @@ class Server:
             {
                 "photoId": result.photo_id,
                 "selfScore": result.self_score,
+                "stars": stars(result.self_score),
                 "slot": result.slot,
                 "elapsedMs": result.elapsed_ms,
             },
@@ -3018,6 +3023,7 @@ class Server:
                     "fitMode": self._fit_mode_of(p),
                     "refStale": bool(p["ref_stale"]),
                     "createdAt": int(p["created_at"]),
+                    "stars": stars(int(p["self_score"])),
                 }
             )
         return out
