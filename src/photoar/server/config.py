@@ -166,7 +166,8 @@ class ServerConfig:
     # Cloudflare 隧道的 https，写死 Secure 会让前者登录后一刷新就掉线。
     cookie_secure: bool = False
     # 引导管理员。库里一个 admin 都没有时按这两个字段建一个（见
-    # `app.Server._bootstrap_admin`）。口令留空 = 启动时生成随机口令并打印一次。
+    # `app.Server._bootstrap_admin`）。口令留空 = 用固定的 `DEFAULT_ADMIN_PASSWORD`
+    # （admin），首次登录强制改。
     admin_name: str = DEFAULT_ADMIN_NAME
     admin_password: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
