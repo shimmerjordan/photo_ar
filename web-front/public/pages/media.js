@@ -269,7 +269,7 @@ export default {
           runBtn.disabled = !photoFile
           progressText.textContent = ''
           elapsed.textContent = ''
-          progress.firstElementChild.style.transform = 'scaleX(0)'
+          setBar(progress, 0)
         }
       }
     })

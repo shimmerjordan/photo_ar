@@ -312,12 +312,16 @@ export function flatQuadImage(photoAspect, frameAspect, canvasAspect, widthFrac,
   let sx = 1, sy = 1
   if (frameAspect > canvasAspect) sx = frameAspect / canvasAspect
   else sy = canvasAspect / frameAspect
-  const X = [-w / 2, w / 2, w / 2, -w / 2]
-  const Y = [hh / 2, hh / 2, -hh / 2, -hh / 2]
-  for (let i = 0; i < 4; i++) {
-    out[i * 2] = (X[i] / sx + 1) / 2
-    out[i * 2 + 1] = (1 - Y[i] / sy) / 2
-  }
+  // 四角直接写出来，**不建中间数组**：这个函数每帧都调（平铺期间），两个 4 元数组
+  // 就是每帧两次分配 —— 与渲染循环里那些复用缓冲同一条理由（攒起来就是 GC 停顿）。
+  const l = (-w / 2 / sx + 1) / 2
+  const r = (w / 2 / sx + 1) / 2
+  const t = (1 - hh / 2 / sy) / 2
+  const b = (1 + hh / 2 / sy) / 2
+  out[0] = l; out[1] = t   // TL
+  out[2] = r; out[3] = t   // TR
+  out[4] = r; out[5] = b   // BR
+  out[6] = l; out[7] = b   // BL
   return out
 }
 

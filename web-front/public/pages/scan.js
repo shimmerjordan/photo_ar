@@ -132,6 +132,8 @@ export default {
         if (!st.lockedPhoto?.mediaUrl) return
         st.flat = true
         st.flatFull = true
+        // 平铺期间**必须关掉原生 loop**，理由见 `onWorkerMessage` 里放手那一支。
+        dom.clip.loop = false
         st.quad = null
         st.filter.reset()
         tip(TIPS.flat_full)
@@ -160,6 +162,14 @@ export default {
     let browseTab = 'photos'
     const browse = button('我能扫的照片', () => ctx.shell.tab(browseTab), { kind: 'ghost' })
     browse.hidden = true
+    /**
+     * 库里一张可扫的照片都没有。**这一格一置上，出口按钮就再也不收起来。**
+     *
+     * 只看 worker 结果的 reason 不够：空库时对着白墙的那一条是 `no_features`，
+     * 对着任何有纹理的东西才是 `empty` —— 于是"扫一下白墙，唯一的出口就消失了"。
+     * 而库是不是空的与这一帧看到了什么无关，它是这一次 mount 的事实。
+     */
+    let libEmpty = false
 
     /**
      * 同一屏只能有**一个**金框按钮 —— 金框的含义是"这一刻该点的就是它"，两个金框等于
@@ -167,7 +177,13 @@ export default {
      * 其余全部落回 `ghost`。
      */
     const setPrimary = (btn) => {
-      for (const b of [rescan, ctl.sound, camBtn, browse]) b.className = b === btn ? '' : 'ghost'
+      // 指向一个**收起来的**按钮就等于这一屏没有金框，而调用点常常判断不了那个按钮
+      // 此刻在不在（`rescan` 在没锁定时是 hidden 的）。退化成"谁都不是主动作"总比
+      // 把金框发给一个看不见的按钮好。
+      // `closest('[hidden]')` 而不是 `btn.hidden`：声音按钮自己从不 hidden，
+      // 收起来的是包着它的那个 `ctl`（见 ui.playerControls）。
+      const target = btn && !btn.hidden && !btn.closest?.('[hidden]') ? btn : null
+      for (const b of [rescan, ctl.sound, camBtn, browse]) b.className = b === target ? '' : 'ghost'
     }
 
     dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, ctl, camBtn, browse), dom.meta)
@@ -384,6 +400,8 @@ export default {
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
       st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
       st.flat = false; st.flatFull = false; st.blendStart = 0; st.hitTip = ''
+      // 平铺时关掉的原生 loop 要还回去 —— 下一段视频是从贴合开始的。
+      dom.clip.loop = true
       setPrimary(null)
       tip(guideTip({}).text)
     }
@@ -456,6 +474,14 @@ export default {
       // 管理员填的自由文本，一个 `<` 就会把后面的标签吃掉。
       const title = photo?.title ? `「${esc(photo.title)}」` : '这张照片'
       if (!photo?.mediaUrl) {
+        // **这一支也要退出平铺。** 锁定的已经是另一张（没视频的）照片了，而平铺画的是
+        // 上一段视频 —— 不清的话它继续在屏幕中央放，`hitTip` 还会在下一次四角到达时
+        // 被放回 HUD（说的是上一张的标题）。
+        st.flat = false
+        st.flatFull = false
+        st.blendStart = 0
+        st.hitTip = ''
+        dom.clip.loop = true
         diagAlways(`命中 ${photo?.id?.slice(0, 8)} 但没有 mediaUrl（这张没配视频）`)
         tip(`认出了 ${title}，但它还没有配视频。`, { hit: true })
         meta(true)
@@ -469,6 +495,8 @@ export default {
       st.flat = false
       st.flatFull = false
       st.blendStart = 0
+      st.hitTip = ''
+      dom.clip.loop = true
       dom.clip.dataset.photo = photo.id
       diagAlways(`命中 ${photo.id?.slice(0, 8)} 内点=${m.inliers} aspect=${photo.aspect ?? 'null'} → 取媒体信息`)
       dom.clip.muted = true
@@ -528,6 +556,8 @@ export default {
           // 四边形插过去会有 200ms 的怪形状，那种情况下直接贴上更好。
           if (plausible(st.flatQuad)) { st.blendFrom.set(st.flatQuad); st.blendStart = performance.now() }
           st.flat = false; st.flatFull = false
+          // 贴回照片上了 → 循环恢复（贴合状态下播完要接着放，见 onVideoEnded）。
+          dom.clip.loop = true
           setPrimary(ctl.sound)
           // 把起播那一句放回去：视频已经贴回照片上了，HUD 不能还写着"跟丢了"。
           if (st.hitTip) tip(st.hitTip, { hit: true })
@@ -551,7 +581,17 @@ export default {
         // 未锁定，送帧节奏自动回满速去找照片 —— 这正是我们想要的。
         const playing = st.lockedPhoto?.mediaUrl && !dom.clip.paused && dom.clip.readyState >= 2
         if (playing) {
-          if (!st.flat) { st.flat = true; tip(TIPS.flat); setPrimary(rescan) }
+          if (!st.flat) {
+            st.flat = true
+            // **关掉原生 loop。** 平铺播完要退出锁定（见 onVideoEnded），而那靠 `ended`
+            // 事件；元素上带着 `loop` 属性，在 mp4stream 的两条直连回退路径
+            //（没有 MediaSource、或 addSourceBuffer 失败 → 普通 `src`）上原生 loop
+            // 是生效的，于是 `ended` 永远不来，视频就在屏幕中央无限重播占着取景器。
+            // MediaSource 那条路上原生 loop 不可靠才需要手动循环，两件事别搞混。
+            dom.clip.loop = false
+            tip(TIPS.flat)
+            setPrimary(rescan)
+          }
         } else {
           setPrimary(rescan)
           tip(TIPS[m.reason] ?? guideTip({}).text)
@@ -567,8 +607,21 @@ export default {
           st.guideKey = g.key; st.guideAt = now
           tip(g.text)
         } else if (g.key === 'streak') tip(g.text)
-        // 一直扫不出来时给出唯一的出口。其余时候收起来 —— 扫描期间那个按钮是干扰。
-        browse.hidden = g.key !== 'not_in_library'
+        /**
+         * 出口按钮跟着**正在显示的那一档**（`st.guideKey`）走，不是这一帧算出来的
+         * `g.key` —— 文案有 2 秒防抖，跟 `g.key` 的话按钮会在"屏上还写着靠近一点"时
+         * 就已经变成了另一种状态的样子。
+         *
+         * 两档要出口：`not_in_library`（一直认不出来，那句话本身就指着这个按钮）与
+         * **`empty`**（库里没有可扫的照片 —— verify 对空候选集给的就是这个 reason）。
+         * 少了 `empty` 这一档的后果是：空库时点「开相机」，第一条 worker 结果就把这个
+         * 按钮收起来，而 `setPrimary` 指着它 —— 屏幕上既没有金框也没有出口。
+         */
+        const showBrowse = libEmpty || st.guideKey === 'not_in_library' || st.guideKey === 'empty'
+        if (showBrowse === browse.hidden) {
+          browse.hidden = !showBrowse
+          setPrimary(showBrowse ? browse : null)
+        }
       }
       meta()
     }
@@ -597,6 +650,8 @@ export default {
         dom.camErr = h('div', { class: 'gate-inline' },
           h('p', { class: 'bad', text: e instanceof CameraError ? e.message : `开相机失败：${e.message}` }))
         el.appendChild(dom.camErr)
+        // 同 closeCam：这一屏唯一能做的事就是再点一次它。
+        setPrimary(camBtn)
         tip('相机没开起来。按上面说的处理好，点「重新开相机」。')
         return
       }
@@ -630,6 +685,9 @@ export default {
       st.renderer?.clear()
       resetLock()
       camBtn.querySelector('span').textContent = '开相机'
+      // 相机关了之后屏幕上能做的事只剩这一个（`resetLock` 刚把金框收了），
+      // 而那句提示正让用户去点它 —— 所以它就是这一屏的主动作。
+      setPrimary(camBtn)
       tip('相机已关。点「开相机」继续扫。')
     }
 
@@ -643,6 +701,7 @@ export default {
      */
     const lib = ctx.libInfo?.()
     if (lib && lib.nPhotos === 0) {
+      libEmpty = true
       tip(guideTip({ reason: 'empty' }).text)
       browse.hidden = false
       browse.querySelector('span').textContent = ctx.isAdmin() ? '去素材页传一张' : '看看我的照片'
