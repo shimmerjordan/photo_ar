@@ -71,7 +71,8 @@ stat -c '%g' /dev/dri/renderD128                   # Permission denied 时把这
 | 409 `already_ingested` | 同内容已入库 | photoId 是内容哈希，同内容必然同 id |
 | 409 `near_duplicate` | 与库中某张过于相似 | 会列出冲突对象。**两张都留着的后果是两张都永远认不出来** |
 | 403 `path_denied` | 路径在 `roots` 白名单外 | 响应体不回显被拒路径（免得变成探测工具），看 NAS 日志 |
-| 422 `bad_print_width` | `printWidthMm` 不合法 | 这个字段是可选的，网页版根本不看它，可以不填 |
+| 400 `bad_print_width` | `printWidthMm` 不是数字，或是负数 | 这个字段是可选的，网页版根本不看它，不知道实际尺寸就整个省略 |
+| 503 `upload_disabled` | 没设 `PHOTOAR_UPLOAD_DIR` | 上传功能整体关闭。要用就按 [deploy.md 第 2 步](deploy.md#photoar_roots-怎么填)配一个落在 `PHOTOAR_ROOTS` 之内、且挂载可写的目录 |
 
 `path_denied` 最常见的成因是 `/share/Photo` 和 `/share/CACHEDEV1_DATA/Photo` 混用（前者是符号链接）。挂载时冒号两边写成一样、白名单写 `/share/Photo`，**别用 `find` 出来的 CACHEDEV 路径提交**。批量脚本的 `--map` 就是给已经不一致的情况准备的。
 
@@ -85,7 +86,7 @@ stat -c '%g' /dev/dri/renderD128                   # Permission denied 时把这
 
 处理：在「媒体」页那一行点**删除**，留一张（参考图和视频文件都不动，NAS 上什么都不会少）。删完立刻能扫出来。
 
-> 入库闸门现在会拦住新的重复（409 并列出是哪一张），所以这件事只会发生在 2026-08-03 之前入的库上。
+> 入库闸门现在会拦住新的重复（409 并列出是哪一张），所以这件事只会发生在**老库**上（闸门上线之前入的那些）。
 
 排除重复之后，界面上那几句提示都对应真实的干扰，照做就行：
 
@@ -100,7 +101,7 @@ stat -c '%g' /dev/dri/renderD128                   # Permission denied 时把这
 
 ## 隧道 502，但容器是绿的
 
-2026-08-06 真踩到的。**所有常规检查都告诉你一切正常**：`docker ps` 是 `Up (healthy)`、日志干干净净、healthcheck 也过（它在容器**内部**探，走回环，根本不经过隧道）。
+**所有常规检查都告诉你一切正常**：`docker ps` 是 `Up (healthy)`、日志干干净净、healthcheck 也过（它在容器**内部**探，走回环，根本不经过隧道）。
 
 根因：容器配了 `WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`，于是网页版在 8964 上说的是 **TLS**；而 ingress 写的是 `service: http://localhost:8964`。cloudflared 拿明文去打 TLS 端口，握手阶段被丢掉 → 502。
 
@@ -118,7 +119,7 @@ curl -sk -o /dev/null -w 'https %{http_code}\n' https://127.0.0.1:8964/healthz  
 | **走隧道（推荐）** | 不设 `WEBFRONT_TLS_*` | `service: http://localhost:8964` |
 | 要保住局域网直连开相机 | 设 `WEBFRONT_TLS_*` | `service: https://localhost:8964` + `originRequest: {noTLSVerify: true}` |
 
-推荐第一条：走隧道时证书由 Cloudflare 提供，容器再包一层对公网访问**零收益**（浏览器看到的是 Cloudflare 的证书）。代价是局域网直连 `http://192.168.x.x:8964` 不是安全上下文、**相机用不了**，只影响「断网退回局域网给宾客扫」这个备份方案。
+推荐第一条：走隧道时证书由 Cloudflare 提供，容器再包一层对公网访问**零收益** —— 浏览器看到的是 Cloudflare 的证书。它的代价只有一条：局域网直连 `http://192.168.x.x:8964` 不是[安全上下文](#安全上下文)、相机用不了，也就是「断网退回局域网给宾客扫」这个备份方案会失效。
 
 ⚠️ 改 `WEBFRONT_TLS_*` 之后要 **`docker compose up -d`**，不能 `restart` —— 后者不重新读 `.env`。
 
@@ -147,13 +148,13 @@ cache-control: max-age=14400      ← 源站发的是 no-cache，被换掉了
 
 ## `docker images` 里一堆 `<none>`
 
-**正常，不是故障。** `pull` 拿到新的 `latest` 时 docker 把 tag 挪到新镜像上，上一份就丢掉全部 tag 变成 `<none>`（1.1GB 一个）。升级完跟一句：
+**正常，不是故障。** 每升级一次多一个 1.1GB 的 `<none>`。升级完跟一句：
 
 ```bash
 docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
 ```
 
-**别用不带 `--filter` 的版本** —— 那会连这台机器上别的服务的无 tag 镜像一起清。完整说明见 [deploy-details.md](deploy-details.md#升级备份恢复)。
+⚠️ 那个 `--filter` 不能省，不带它会连这台机器上别的服务的无 tag 镜像一起清。为什么会堆、为什么必须过滤，见 [deploy-details.md](deploy-details.md#升级后为什么要-prune以及为什么必须带过滤器)；升级的完整步骤见 [deploy.md 第 8 节](deploy.md#8-升级与回滚)。
 
 ## 局域网里自测（没有隧道也没有真证书）
 

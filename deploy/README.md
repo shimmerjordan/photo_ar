@@ -1,20 +1,12 @@
-# `deploy/` 里有什么，以及命令速查
+# `deploy/`：运维命令速查
 
-除这份 README 外只有两个文件：
+另两个文件：`config.example.json` 是可选的配置模板（**不需要它** —— 全部配置都能从 `.env`
+来；`cp` 成 `deploy/config.json` 才生效），`compose.local.yml` 是开发机上的覆盖层（用法写在
+它自己的头部）。第一次部署走 [docs/deploy.md](../docs/deploy.md)，出问题查
+[docs/faq.md](../docs/faq.md)，某个数字为什么是这个值看
+[docs/deploy-details.md](../docs/deploy-details.md)。
 
-| 文件 | 干什么 |
-|---|---|
-| `config.example.json` | 可选的配置文件模板。**不需要它** —— 全部配置都能从 `.env` 的环境变量来。想用更细的参数（media 策略、`self_score_samples`、ffprobe 路径…）就 `cp` 成 `deploy/config.json`，entrypoint 检测到它存在就用它 |
-| `compose.local.yml` | 在**开发机**上起服务的覆盖层。用法与「与 NAS 到底哪里不一样」写在那个文件的头部 |
-
-> **第一次部署不看这份。** 走 [docs/deploy.md](../docs/deploy.md) —— 那份是带
-> 「看到什么算成」的完整流程。取舍、实测数字与排障在
-> [docs/deploy-details.md](../docs/deploy-details.md)。
->
-> 这份只留**不在那两份里**的东西：例行维护的命令、`data/` 里每个文件丢了会怎样、
-> 以及几条只有运维会撞上的坑。
-
-## 例行维护
+## 常用维护
 
 ```bash
 # 素材完整性（mtime + bytes，只在不一致时才哈希）。不自动改绑，只报告。
@@ -30,13 +22,8 @@ docker compose exec photo-ar-server photoar-server reindex
 docker compose exec photo-ar-server photoar-server build-vocab
 ```
 
-> `docker compose exec` **不走 ENTRYPOINT**，所以这些命令不会顺带起一个网页版进程。
-> 换成 `docker run` 的话 entrypoint 会认出这几个子命令、同样只跑它们
-> （见 `docker/entrypoint.py` 的 `_is_server_invocation`）。
-
-## 入库会被拒的几种情况
-
-入库被拒的错误码与修法见 [docs/faq.md](../docs/faq.md)。
+`docker compose exec` **不走 ENTRYPOINT**，所以这些命令不会顺带起一个网页版进程。
+升级、回滚、备份与恢复的命令在 [docs/deploy.md 第 8 节](../docs/deploy.md#8-升级与回滚)。
 
 ## `/data` 里各文件的作用
 
@@ -58,12 +45,9 @@ docker compose exec photo-ar-server photoar-server build-vocab
 
 ## 两条只有运维会撞上的
 
-**`/data` 里的产物属主是 root**（容器以 root 跑，QTS 上的容器惯例如此）。想在宿主机上
-直接删会 Permission denied，用容器自己删：
-
-```bash
-docker compose run --rm --entrypoint sh photo-ar-server -c 'rm -rf /data/*'
-```
-
-**换了 `vocab.npz` 必须 `reindex --rebuild-words`。** 不做的话库里存的词序列还是旧树
-量化出来的，倒排索引指向错误的桶 —— 表现是**识别率突然掉到底，而日志里一切正常**。
+- **`/data` 里的产物属主是 root**（容器以 root 跑，QTS 上的容器惯例如此），想在宿主机上
+  直接删会 Permission denied。用容器自己删：
+  `docker compose run --rm --entrypoint sh photo-ar-server -c 'rm -rf /data/*'`
+- **换了 `vocab.npz` 必须 `reindex --rebuild-words`**，不做的表现是**识别率突然掉到底，
+  而日志里一切正常**（还有哪些改动要动库，见
+  [docs/deploy.md 第 8 节](../docs/deploy.md#8-升级与回滚)）

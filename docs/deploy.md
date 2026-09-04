@@ -104,7 +104,7 @@ docker compose logs -f photo-ar-server
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8964/v1/ping   # 要 401
 ```
 
-**没设 `PHOTOAR_TOKEN` 时也必须是 401** —— 空 token 是让运维凭证那条路整体禁用，不是"谁都能进"。设了的话带上它再来一次该回 `{"ok": true, ...}`，响应里几个字段值得看一眼：`backendDegraded`（true = XFeat 没取到、回退了 ORB）、`vocabTrained`、`photos`。
+**没设 `PHOTOAR_TOKEN` 时也必须是 401** —— 空 token 是让运维凭证那条路整体禁用，不是「谁都能通过」。设了的话带上它再来一次该回 `{"ok": true, ...}`，响应里几个字段值得看一眼：`backendDegraded`（true = XFeat 没取到、回退了 ORB）、`vocabTrained`、`photos`。
 
 > `pull` 报 `denied`：GHCR 上的包默认 private，见 [faq.md](faq.md#pull-报-denied--unauthorized)。
 
@@ -224,18 +224,9 @@ docker restart cloudflared
 
 网页版有 2.6MB 静态资源是所有宾客共享、内容永不变的。不配的话每个宾客都从 NAS 拉一遍，而且最大那块拉不进边缘缓存 —— Cloudflare 的默认缓存按扩展名，名单里**没有 `.wasm`**。差别在宾客第一屏 10 秒以上。
 
-Caching → Cache Rules 加一条，**表达式必须按路径限定**：
+Caching → Cache Rules 加一条，只放行 `/vendor/` 与 `/art/` 两个路径前缀 —— 表达式、四项设置、以及三件要留意的事（`?v=` 必须进缓存键等），逐字抄 [deploy-details.md 的「CDN：该缓存什么、绝对不该缓存什么」](deploy-details.md#cdn该缓存什么绝对不该缓存什么)。
 
-```
-表达式：(http.host eq "arphoto.你的域名") and
-        (starts_with(http.request.uri.path, "/vendor/") or
-         starts_with(http.request.uri.path, "/art/"))
-设置：Cache eligibility → Eligible for cache
-     Edge TTL         → Use cache-control header if present
-     Cache key → Query string → Include all
-```
-
-> ⛔ **绝对不要用 "Cache Everything" 或不限路径的规则。** `/v1/*` 与 `/api/*` 是**按人授权**的。缓存到边缘就是把一个人的视频发给另一个人 —— 而且没有任何症状，你看到的是"能播"。
+> ⛔ **绝对不要用 "Cache Everything" 或不限路径的规则。** `/v1/*` 与 `/api/*` 是**按人授权**的。缓存到边缘就是把一个人的视频发给另一个人 —— 而且没有任何症状，你看到的是能播。
 
 **算成**：连打两次，第二次 `cf-cache-status` 是 `HIT`：
 
@@ -253,7 +244,7 @@ done
 
 没有 App 要装，把地址发出去就行。一条硬性前提：
 
-> ⚠️ **地址必须是 `https://`。** 相机（`getUserMedia`）只在安全上下文里存在：`https://` 任意域名都算，`http://localhost` 算（只有本机），**`http://192.168.x.x` 和 `http://100.x.x.x` 都不算**。
+> ⚠️ **地址必须是 `https://`。** 相机只在安全上下文里存在，局域网 IP 和 Tailscale IP 的 http 都不算 —— 地址对照表见 [faq.md](faq.md#安全上下文)。
 
 所以发给宾客的就是第 6b 那条隧道的地址 `https://arphoto.<你的域名>/` —— Cloudflare 的证书是现成的，不用自己配。
 
@@ -268,50 +259,90 @@ done
 
 怎么建账号、怎么授权、宾客和管理员看到什么不一样，见 [usage.md](usage.md)。
 
+## 8. 升级与回滚
+
+**先 `cd` 到 compose 所在的那个目录。** 照第 2 步的默认路径就是 `/share/Container/photo-ar`；记不清当时选的是哪个，问正在跑的容器最准（这个 label 是 compose 自己打的）：
+
+```bash
+docker inspect photo-ar-server --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
+
+到了那个目录（能看到 `docker-compose.yml`、`.env`、`data/`），跑：
+
+```bash
+docker compose pull && docker compose up -d
+# 清掉刚被顶掉 tag 的那份旧镜像（1.1GB 一个）
+docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
+```
+
+**算成**：`curl -s http://127.0.0.1:8964/api/config` 里的 `version` 变成新的。
+
+第二行不是卫生习惯、那个 `--filter` 也不能省，理由见 [deploy-details.md](deploy-details.md#升级后为什么要-prune以及为什么必须带过滤器)。
+
+**升级不会更新 `docker-compose.yml`。** `docker compose pull` 更新的只有镜像；这台机器上那份 compose 是安装时 `curl` 下来、然后你手工改过挂载和 `PHOTOAR_ROOTS` 的本地副本，仓库里对它的修正不会自己过来。想跟一下就只看差异，别整份覆盖（会冲掉你改的挂载）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shimmerjordan/photo_ar/main/docker-compose.yml | diff -u docker-compose.yml - | head -40
+```
+
+**回滚 / 钉住版本。** 镜像**只在手动跑 workflow 且勾了 publish 时**才发新的（Actions → server → Run workflow，版本号在界面上填）—— 往 main 推代码、甚至打 git tag，都不会动镜像；而 `latest` 还要再勾一次「同时更新 latest」才会挪。所以 `pull` 拿到的 `latest` 一定是某次特意发布**并特意指定**的版本。想回到某一版就在 `.env` 里写死它，再 `docker compose up -d`：
+
+```
+PHOTOAR_IMAGE=ghcr.io/shimmerjordan/photo-ar-server:0.2.0
+```
+
+**什么时候需要动库**，其余情况都不用：
+
+| 改了什么 | 要做什么 | 不做的表现 |
+|---|---|---|
+| `vocab.npz` | `reindex --rebuild-words` | **识别率突然掉到底，而日志一切正常** |
+| 特征提取参数（ORB / 描述子） | 全库重新入库 | 同上，且 `check` 也看不出来 |
+| 只改了服务端逻辑 / 接口 | 什么都不用 | — |
+| 照片原文件被移动或改名 | `verify` 看报告，重新关联 | 详情页 `refStale`，识别仍在（用的是入库时存的特征） |
+
+**改了网页版**：前端没有构建步骤，但它在镜像里 —— 改了 `web-front/public/` 不重建镜像是不会生效的。NAS 上没有构建这回事（等 CI 发版然后 `pull`）；开发机上怎么带覆盖层构建见 [deploy-details.md](deploy-details.md#在开发机上跑)。宾客那边刷新一下页面就是新的（HTML 与 js 都是 `no-cache`，只有 `vendor/` 和字体是 immutable）。
+
+### 备份与恢复
+
+值钱的只有 `data/`（每个文件的作用、丢了会怎样见 [../deploy/README.md](../deploy/README.md)）。`thumb/`、`playable/` 丢了只能重新入库再生成，所以**别只备份 `catalog.db`**。SQLite 正在被写时拷出来的文件可能是坏的，停一下再拷最省心：
+
+```bash
+docker compose stop
+sudo tar czf /share/Backup/photo-ar-data-$(date +%F).tar.gz data/    # 属主是 root
+docker compose start
+```
+
+一万张量级下 `data/` 的大头是 `playable/`（每条最大 16.24MiB）。空间紧的话可以只备份 `catalog.db` + `library/` + `thumb/`，排除 `playable/` —— 它能从原视频重新转码出来（代价是每条几十秒）。
+
+**恢复到一台新 NAS**：`data/` 拷回去、`vocab.npz` 用**同一份**、照片和视频原文件放回**同样的路径**（`roots` 按路径存，路径变了要 `verify` 后重新关联）。
+
+**换 token**：改 `.env` → `docker compose up -d` → 手机「设置」里改成新的。旧 token 立刻失效，客户端表现是所有通道 401（原因会写在卡片下面）。
+
 ---
 
 ## 跑通清单
 
-| # | 做什么 | 看到什么算成 | 步骤 |
-|---|---|---|---|
-| 1 | SSH，找到 docker | `docker compose version` 打出 v2.x | 1 |
-| 2 | 建 `_arphoto_inbox` | 目录在 | 2 |
-| 3 | 拉 compose 与 `.env`，填 `PHOTOAR_ROOTS` | 文件都在，冒号两边一样 | 2 |
-| 4 | `docker compose pull && up -d` | 日志 `监听 0.0.0.0:8964`，20s 后 `healthy` | 3 |
-| 5 | 用 admin / admin 登 `/admin` | 被要求改口令，改完进入管理台 | 3 |
-| 6 | 不带凭证 ping | `401` | 3 |
-| 7 | 问服务它选了哪个编码器 | `h264_vaapi` | 4 |
-| 8 | 手工入一张（纹理丰富的） | `201` + `photoId` | 5 |
-| 9 | 批量入库（先 `--limit 5 --dry-run`） | 配对没错，再放量 | 5 |
-| 10 | 训词表并重启 | `vocabTrained` 变 `true` | 5 |
-| 11 | 带 cookie 拉一次 `/api/lib` | `200` + 几十 KB | 5 |
-| 12 | 隧道 ingress 生效 | 外网 `https://arphoto.<域名>/v1/ping` 回 401 | 6b |
-| 13 | 手机打开那个地址 | 登录蒙版出来 | 7 |
-| 14 | 管理员登进去看「照片」 | 第 8 步那张的缩略图 | 7 |
-| 15 | 「扫一扫」举起照片 | **视频贴在照片上播起来** | 7 |
-| 16 | 装 Tailscale（NAS + 手机） | 4G 下 ping 回 401 | 6a |
-| 17 | 加一条 cloudflared ingress | 外网 curl 到 `{"ok": true}` | 6b |
-| 18 | 建宾客账号、授权几张 | 用它登进去只看到一颗「扫一扫」 | 7 |
-| 19 | 关 WiFi 走 4G 再扫一次 | 还能认出来、还能播 | 7 |
-| 20 | 备份 `data/` | 有一份压缩包 | 下面 |
+| # | 做什么 → 看到什么算成 |
+|---|---|
+| 1 | SSH，找到 docker → `docker compose version` 打出 v2.x |
+| 2 | 建 `_arphoto_inbox` → 目录在 |
+| 3 | 拉 compose 与 `.env`，填 `PHOTOAR_ROOTS` → 文件都在，冒号两边一样 |
+| 4 | `docker compose pull && up -d` → 日志 `监听 0.0.0.0:8964`，20s 后 `healthy` |
+| 5 | 用 admin / admin 登 `/admin` → 被要求改口令，改完进入管理台 |
+| 6 | 不带凭证 ping → `401` |
+| 7 | 问服务它选了哪个编码器 → `h264_vaapi` |
+| 8 | 手工入一张（纹理丰富的） → `201` + `photoId` |
+| 9 | 批量入库（先 `--limit 5 --dry-run`） → 配对没错，再放量 |
+| 10 | 训词表并重启 → `vocabTrained` 变 `true` |
+| 11 | 带 cookie 拉一次 `/api/lib` → `200` + 几十 KB |
+| 12 | 隧道 ingress 生效 → 外网 `https://arphoto.<你的域名>/v1/ping` 回 401 |
+| 13 | 手机打开那个地址 → 登录蒙版出来 |
+| 14 | 管理员登进去看「照片」 → 第 8 步那张的缩略图 |
+| 15 | 「扫一扫」举起照片 → **视频贴在照片上播起来** |
+| 16 | 装 Tailscale（NAS + 手机） → 4G 下 ping 回 401 |
+| 17 | 加一条 cloudflared ingress → 外网 curl 到 `{"ok": true}` |
+| 18 | 建宾客账号、授权几张 → 用它登进去只看到一颗「扫一扫」 |
+| 19 | 关 WiFi 走 4G 再扫一次 → 还能认出来、还能播 |
+| 20 | 备份 `data/`（第 8 节） → 有一份压缩包 |
 
-**第 15 步是整条链路第一次真正闭合的地方** —— 在它之前的绿灯都只说明「零件没坏」。
-
-## 之后
-
-**升级**（先 `cd` 到 compose 所在目录，忘了就 `docker inspect photo-ar-server --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'`）：
-
-```bash
-docker compose pull && docker compose up -d
-docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
-```
-
-第二行不能省，那个 `--filter` 也不能省 —— 理由见 [deploy-details.md](deploy-details.md#升级备份恢复)。
-
-**备份**：值钱的只有 `data/`，停机再拷：
-
-```bash
-docker compose stop && sudo tar czf /share/Backup/photo-ar-$(date +%F).tar.gz data/ && docker compose start
-```
-
-**在开发机上跑**（给改代码的人）：见 [deploy-details.md](deploy-details.md#在开发机上跑)。
+**第 15 步是整条链路第一次真正闭合的地方** —— 在它之前的绿灯都只说明零件没坏，不说明它们连起来能用。
