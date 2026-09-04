@@ -3349,3 +3349,111 @@ Android, iOS and HarmonyOS"）和实测机型（"Edge for Android 150"）。
 里没有专门一节记这个结论，出处是 `backend.py` 的 `QUERY_N_FEATURES` /
 `QUERY_LONG_EDGE` 注释：长边 640→1280 配合特征数 300→4000，才是把"全过占比"
 从 0 抬到 0.4 的那个杠杆，改参考图（本文件这套预处理）做不到同样的事。
+
+## §52 从使用者文档下沉的过程叙事（2026-09-03）
+
+这一轮把使用者文档收成四个「家」（`deploy.md` = 照着做、`deploy-details.md` = 为什么和
+多少、`faq.md` = 症状→原因→修法、`usage.md` = 日常操作），本身不改任何事实。搬家时有一
+批段落属于**过程叙事**：它们记的是「曾经是什么样、为什么改」，对照着做的人没有用，但删
+掉就没地方查了。原文剪贴到这里，按来源文件分节。
+
+### 来自 `docs/deploy-details.md`
+
+**「2.85MB 的文件大小检查」这个误会**（原在「转码与核显硬编」一节末尾）：
+
+> **视频规格**：30 秒 / 1080p / 4Mbps，per-video 上限因此是 16.24MiB。（曾经以为有个
+> 2.85MB 的文件大小检查，其实从来没有 —— 那个数只是 `15s × (1500k + 96k) / 8` 算出来
+> 的旧规格产物大小。）
+
+**`org.opencontainers.image.source` 标签是一次性迁移**（原在「升级、备份、恢复」一节）：
+
+> **一次性**：标签是这次才加的，**在此之前发布的所有镜像都没有它**（`0.1.0` 与那一批
+> `sha-*` 全都没有），所以已经堆在机器上的那些 `<none>` 过滤不到。先看一眼再决定，
+> `prune` 只删无 tag 的、不碰任何正在用的镜像：
+>
+> ```bash
+> docker images -f dangling=true      # 先看要删什么，确认里面没有你手工留着的
+> docker image prune -f               # 清掉（这一次是不带过滤的全机清理）
+> ```
+>
+> 之后升级用上面那条带过滤的就够了。
+
+**主 compose 曾经有 `build: .`，以及怎么确认自己这台没有**（原在「升级、备份、恢复」
+一节。那段还带一个 `for id in $(docker images -f dangling=true -q)` 的 shell 循环，用来
+把「photo-ar 旧版镜像」和「构建中间层」分开 —— 一并归档在这里，文档里不留）：
+
+> **如果 `<none>` 每次升级涨的不止一个**，那就不只是 tag 被顶掉，八成是这台机器在**自己
+> 构建**（见下一段）。这条能分辨它们 —— 老镜像没有标签，但都带着 `PHOTOAR_DATA` 这个
+> 环境变量，照样认得出来：
+>
+> ```bash
+> for id in $(docker images -f dangling=true -q); do
+>   if docker image inspect "$id" --format '{{range .Config.Env}}{{.}} {{end}}' | grep -q PHOTOAR_DATA
+>   then echo "$id  photo-ar 旧版镜像"
+>   else echo "$id  别的（构建中间层 / 别的服务）"; fi
+> done
+> ```
+>
+> **升级不会更新 `docker-compose.yml`。** `docker compose pull` 更新的只有镜像。这台机器
+> 上那份 compose 是安装时 `curl` 下来、然后你**手工改过挂载和 `PHOTOAR_ROOTS`** 的本地
+> 副本 —— 仓库里对它的修正不会自己过来。有一条修正**恰好和这个症状有关**：主 compose
+> 里曾经有 `build: .`，而 `image:` 与 `build:` 并存时，本地一旦没有那个镜像，compose 会
+> **转去构建而不是 pull**（表现是突然开始拉 `node:22-trixie-slim` 和 `python:3.11-slim`
+> 两个基底、跑几分钟构建，还额外留下中间层镜像）。确认一句就够：
+>
+> ```bash
+> grep -nE '^[[:space:]]*build:' docker-compose.yml     # 应该什么都不输出
+> ```
+>
+> （`^[[:space:]]*` 不能省 —— 现在这份 compose 的注释里就写着"这里刻意没有 `build: .`"，
+> 不锚定行首的话每次都命中那行注释，然后你会去查一个不存在的问题。）
+>
+> 有输出就把那一行（和它上面的注释）删掉 —— 部署机永远只该 `pull`。顺便对一下仓库里的
+> 新版，只看差异、别整份覆盖（会冲掉你改的挂载）：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/shimmerjordan/photo_ar/main/docker-compose.yml | diff -u docker-compose.yml - | head -40
+> ```
+
+### 来自 `docker-compose.yml`
+
+`image:` 旁边那段解释「为什么这里刻意没有 `build:`」（现在只留一行注释，完整论证在
+`deploy/compose.local.yml` 头部，那才是 `build:` 真正住的地方）：
+
+> ⚠️ 这里**刻意没有** `build: .`（曾经有，挪去 deploy/compose.local.yml 了）。
+>
+> image 与 build 并存时，compose 在本地没有这个镜像的时候会**转去构建而不是
+> pull** —— 在 NAS 上这意味着突然开始拉 node:22-trixie-slim 和 python:3.11-slim
+> 两个基底镜像、然后跑一次几分钟的构建，产物还顶着 ghcr.io/... 的名字，让人以为
+> 自己跑的是发布版。部署机永远只该 pull；要本地构建的是开发机，用
+> deploy/compose.local.yml 那个 overlay（它带 build）。
+
+### 来自 `docs/faq.md`
+
+**隧道 502 那一条是 2026-08-06 真踩到的**（现在 faq 里只留症状与修法，不留日期）：
+
+> 2026-08-06 真踩到的。**所有常规检查都告诉你一切正常**：`docker ps` 是 `Up (healthy)`、
+> 日志干干净净、healthcheck 也过（它在容器**内部**探，走回环，根本不经过隧道）。
+
+**「库里有同一张照片的两份」这件事的时间边界**（faq 里改成「老库」一词）：
+
+> 入库闸门现在会拦住新的重复（409 并列出是哪一张），所以这件事只会发生在 2026-08-03
+> 之前入的库上。
+
+### 来自 `deploy/README.md`
+
+那份 README 收成「常用维护命令 / `data/` 各文件丢了会怎样 / 两条运维坑」三段，删掉的是
+一段自我定位的话（它讲的是三份文档之间的分工，而分工现在写在 `docs/README.md` 索引里）：
+
+> **第一次部署不看这份。** 走 [docs/deploy.md](../docs/deploy.md) —— 那份是带
+> 「看到什么算成」的完整流程。取舍、实测数字与排障在
+> [docs/deploy-details.md](../docs/deploy-details.md)。
+>
+> 这份只留**不在那两份里**的东西：例行维护的命令、`data/` 里每个文件丢了会怎样、
+> 以及几条只有运维会撞上的坑。
+
+### 来自 `.github/scripts/summary.py`
+
+补记一句：`:latest` 那段警告里带着一次真事故 —— 「拉了 `:main` 拿到的还是几个月前的镜像，
+而那一版连网页版都还没合进容器，表现是 `/` 回「没有这个接口」」。它现在还留在 Job
+Summary 的文案里，因为对着 CI 运行页部署的人正需要这句；这里只是记一笔它的出处。

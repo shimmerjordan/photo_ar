@@ -13,7 +13,7 @@
 - [批量入库脚本的几个设计](#批量入库脚本的几个设计)
 - [Cloudflare 加速：两篇博客的方法逐条过](#cloudflare-加速两篇博客的方法逐条过)
 - [这台机器上量到的基线](#这台机器上量到的基线)
-- [升级、备份、恢复](#升级备份恢复)
+- [升级后为什么要 prune，以及为什么必须带过滤器](#升级后为什么要-prune以及为什么必须带过滤器)
 - [在开发机上跑](#在开发机上跑)
 - [不用 SSH 的那条路](#不用-ssh-的那条路)
 - [不用 GHCR 镜像的两条老路](#不用-ghcr-镜像的两条老路)
@@ -22,8 +22,8 @@
 
 ## 两条外网通道，各跑什么
 
-网页版只有**一个源、一个端口**（`/` 网页、`/admin` 管理台、`/v1/*` API），所以"走哪条
-路"完全由用户打开哪个地址决定，没有客户端探活那一层。
+网页版只有**一个源、一个端口**（三条 URI 各是什么见 [deploy.md](deploy.md)），所以「走哪条
+路」完全由用户打开哪个地址决定，没有客户端探活那一层。
 
 | 通道 | 跑什么 | 什么时候用 |
 |---|---|---|
@@ -58,8 +58,8 @@
 
 两件事都断在这上面，第二件是 2026-08-05 实测出来的，之前一直不知道：
 
-1. **相机。** `getUserMedia` 只在安全上下文里存在。`https://` 任意域名算，
-   `http://localhost` 算，**`http://192.168.x.x` 与 `http://100.x.x.x` 都不算。**
+1. **相机。** `getUserMedia` 只在安全上下文里存在，而局域网 http 不是 —— 完整的
+   地址对照表见 [faq.md](faq.md#安全上下文)。
 2. **浏览器的磁盘缓存。** Chromium 对**有证书错误的源整体禁用磁盘缓存** —— 自签证书、
    或者点过"继续访问"的那种，全都算。`Cache-Control: immutable` 写了也不生效。
 
@@ -84,7 +84,7 @@
 
 **`/v1/*` 和 `/api/*` 一律不能缓存。** 它们是**按人授权**的：`/api/lib` 是这个用户能扫
 的那些照片、`/api/stream/<票>` 是一次性票据换来的视频流。任何一条把它们缓存到边缘的
-规则，都会把一个人的视频发给另一个人 —— 而且没有任何症状，你看到的是"能播"。
+规则，都会把一个人的视频发给另一个人 —— 而且没有任何症状，你看到的是视频正常播放。
 
 所以**不要开 "Cache Everything" 页规则**（那是老教程里最常见的一条）。要缓存就写成
 按路径限定的 Cache Rule，见下面。
@@ -99,7 +99,7 @@ Cloudflare 后台 → Caching → Cache Rules，新建一条：
 
 ```
 名字：photoar static
-表达式：(http.host eq "ar.你的域名") and (starts_with(http.request.uri.path, "/vendor/")
+表达式：(http.host eq "arphoto.<你的域名>") and (starts_with(http.request.uri.path, "/vendor/")
         or starts_with(http.request.uri.path, "/art/"))
 设置：
   Cache eligibility        → Eligible for cache
@@ -122,7 +122,7 @@ Cloudflare 后台 → Caching → Cache Rules，新建一条：
 ### 怎么确认它真的生效了
 
 ```bash
-U="https://ar.你的域名/vendor/opencv.wasm?v=<从 opencv.js 里抄那个版本号>"
+U="https://arphoto.<你的域名>/vendor/opencv.wasm?v=<从 opencv.js 里抄那个版本号>"
 curl -sI -H 'Accept-Encoding: br' "$U" | grep -iE 'cf-cache-status|content-encoding|content-length|cache-control'
 ```
 
@@ -157,9 +157,9 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 
 `resolve_encoder` 不查 `ffmpeg -encoders`（列得出来 ≠ 跑得动），它**真编一帧**。
 
-**视频规格**：30 秒 / 1080p / 4Mbps，per-video 上限因此是 16.24MiB。（曾经以为有个
-2.85MB 的文件大小检查，其实从来没有 —— 那个数只是 `15s × (1500k + 96k) / 8` 算出来
-的旧规格产物大小。）
+**视频规格**：30 秒 / 1080p / 4Mbps，per-video 上限因此是 16.24MiB。**没有**文件大小
+检查这回事（曾经以为有一个 2.85MB 的，那个误会归档在
+[decisions.md 的「从使用者文档下沉的过程叙事」](decisions.md#52-从使用者文档下沉的过程叙事2026-09-03)）。
 
 ## 入库为什么会被拒
 
@@ -208,118 +208,22 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 
 参考：[为 Cloudflare Tunnel 提速](https://blog.dalenull.work/2024/09/28/speed-up-your-cloudflare-tunnel/)、
 [利用优选域名加速 Cloudflare tunnel 在中国的访问速度](https://jqtmviyu.github.io/post/cloudflare-cn-perf/)。
+两篇讲的是**两段不同的链路**，别混为一谈：第一篇优化「Cloudflare 边缘 → cloudflared（NAS）」，
+第二篇优化「手机/亲友 → Cloudflare 边缘」。逐条过完的结论：
 
-两篇讲的是**两段不同的链路**，别混为一谈：
-
-```
-手机/亲友 ──①──→ Cloudflare 边缘 ──②──→ cloudflared（NAS）
-             第二篇优化这一段        第一篇优化这一段
-```
-
-**先看结论**：
-
-| 手段 | 值不值得 | 前提 / 判据 |
+| 手段 | 值不值得 | 依据 / 怎么做（一句） |
 |---|---|---|
-| `TUNNEL_EDGE_IP_VERSION=6` | ✅ 值得先试 | NAS 有 v6 出口（`curl -6 api64.ipify.org` 有输出） |
-| 边缘 IP 优选（脚本） | ⚠️ 先量再说 | 脚本报的「整段最快」比「DNS 最快」好几十毫秒才动手；本机实测只差 1.3ms |
-| 固定 `http2` | ⚠️ 有症状再改 | 隧道抖、偶发 502 |
-| SaaS 回源优选 | ⚠️ 最后手段 | 外网 `/v1/ping` 中位数明显超过 400ms |
-| Argo / Smart Shield | ❌ | 优化不到国内出口那一段 |
-| China Network | ❌ | 要 Enterprise + ICP 备案 |
-| **把静态资源缓存到边缘**（Cache Rule） | ✅ **收益最大** | 2.6MB × 每个宾客，见上一节 |
-| 把视频也挂到隧道上 | ⚠️ 已接受 | 违反 CDN 条款、风险是账号级的。2026-08-05 明确接受，理由见「两条外网通道」 |
+| `TUNNEL_EDGE_IP_VERSION=6` | ✅ 值得先试 | `edge-ip-version` 官方默认是 `4`（不是 `auto`），所以哪怕 NAS 有 v6 也不会用；`curl -s -6 --max-time 8 https://api64.ipify.org` 有输出就给 cloudflared 容器加上它 |
+| 边缘 IP 优选（改 `/etc/hosts`） | ⚠️ 先量再说 | 用 `tools/cf_edge_probe.py`。为什么要扫 7844、两个会让人以为「优选没用」的坑、以及「本机实测只差 1.3ms 等于没收益」，全部在那个脚本的模块 docstring 里 |
+| 固定 `TUNNEL_TRANSPORT_PROTOCOL=http2` | ⚠️ 有症状再改 | `protocol` 默认 `auto` = 先试 QUIC（UDP/7844）。国内线路对 UDP 限速或干扰时症状是**隧道能连上但抖**（偶发 502、延迟毛刺），怀疑就固定 http2 试一周；线路对 UDP 友好时 QUIC 的丢包恢复更好，只能实测 |
+| SaaS 回源优选（分线路 DNS） | ⚠️ 最后手段 | 先实测：`for i in $(seq 10); do curl -o /dev/null -s -w '%{time_total}\n' -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping; done`，中位数 < 400ms 就别折腾（客户端 2 秒超时、服务端 P95 约 180ms，余量很大）。要上：两个域名 + 支持分线路的 DNS（腾讯云 DNSPod 免费版的「境内 / 境外」够用）+ Cloudflare for SaaS（Free 可用、含 100 个 custom hostname，超出 $0.10/个）。⚠️「优选域名」是第三方，随时失效，且失效时**境内直接连不上而境外一切正常**，很难第一时间归因 |
+| **把静态资源缓存到边缘**（Cache Rule） | ✅ **收益最大** | 2.6MB × 每个宾客，见上面[「CDN：该缓存什么、绝对不该缓存什么」](#cdn该缓存什么绝对不该缓存什么) |
+| 把视频也挂到隧道上 | ⚠️ 已接受 | 违反 CDN 条款、风险是账号级的。2026-08-05 明确接受，理由见[「两条外网通道」](#两条外网通道各跑什么) |
+| Argo Smart Routing（已并入 Smart Shield） | ❌ | 付费加购、官方没有公开的价格与提速数字，而且它优化的是 Cloudflare **网络内部**的路由，对「国内出口 → 最近边缘」那一段无能为力 —— 而那一段恰好是国内慢的主要原因 |
+| Cloudflare China Network | ❌ | 唯一真正解决那一段的官方方案，但要 Enterprise 套餐 + 每个顶级域名的 ICP 备案 + 京东云境内节点，个人 NAS 不在射程内 |
 
-### 让 cloudflared 走 IPv6
-
-`edge-ip-version` **默认是 `4`**（官方文档明确的默认值，不是 `auto`），所以哪怕 NAS
-有 v6 也不会用。很多家宽的 v6 不限速、不做 NAT、丢包更少。
-
-```bash
-curl -s -6 --max-time 8 https://api64.ipify.org; echo   # 先确认真有 v6 出口
-```
-
-有输出再给 cloudflared 容器加 `TUNNEL_EDGE_IP_VERSION: "6"`（或 `auto`），重启后用
-`cloudflared tunnel info` 看连接是否落在 `2606:4700:a0::/48` / `a8::/48`。
-
-### 边缘 IP 优选
-
-`cloudflared` 主动连 `region1.v2.argotunnel.com` / `region2.v2.argotunnel.com` 的
-**7844** 端口，而这两个域名各只解析出 20 个地址；同一网段里不同地址的线路质量能差一个
-量级，DNS 给哪 20 个纯属运气。
-
-```bash
-python3 tools/cf_edge_probe.py            # 扫 v4
-python3 tools/cf_edge_probe.py --v6       # NAS 有 v6 出口时
-```
-
-脚本整段扫 7844、按握手耗时排序，打印可直接粘进 `/etc/hosts` 的两行，并且**会告诉你
-优选到底值不值** —— 它同时报「DNS 给的 20 个里最快多少」和「整段最快多少」。开发机上
-2026-07-30 实测：
-
-```
-region1  198.41.192.0/24：254 个地址全部在 7844 上应答
-    33.3 ms  198.41.192.229        ← 整段最快
-    DNS 给的 20 个里最快 34.6 ms
-region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
-```
-
-**差 1.3ms，等于没有收益。** 所以正确用法是先在 NAS 上跑一次看那两个数差多少，差几十
-毫秒或者 DNS 那批大面积超时才值得动 hosts（国内线路上这两种情况都不罕见）。
-
-两个坑，都会让人以为「优选没用」：
-
-- 两行必须来自**不同网段**（一个 `192.x`、一个 `200.x`）。cloudflared 默认建 4 条连接
-  并要求分布在两个 region，两行填同一段会让 Tunnel 变成 **Degraded**，比不优选更差
-- 测的必须是 **7844** 而不是 443。拿 443 挑出来的地址可能根本不在 7844 上服务，表现是
-  启动慢、日志刷 `retrying`
-
-脚本里写死的网段是 2026-07-30 用 `dig` 核过的（region1 → `198.41.192.0/24` +
-`2606:4700:a0::/48`，region2 → `198.41.200.0/24` + `2606:4700:a8::/48`）。Cloudflare
-换网段的话脚本会自己发现并提示 —— 它拿域名当前解析结果比对写死的网段。
-
-### 协议：quic 还是 http2
-
-`protocol` 默认 `auto` = 先试 QUIC（UDP/7844），不通再退 http2（TCP/7844）。国内很多
-线路对 UDP 限速或干扰，症状是**隧道能连上但抖**（偶发 502、延迟毛刺）。怀疑就固定
-`TUNNEL_TRANSPORT_PROTOCOL: "http2"` 试一周。反过来，线路对 UDP 友好时 QUIC 的丢包
-恢复更好 —— 只能实测，没有普适答案。
-
-顺带两个默认值：`retries` 默认 5（1/2/4/8/16 秒指数退避，别调大）；`region` 目前只能
-填 `us`（把所有连接固定到美国，对我们只会更慢，别填）。
-
-### SaaS 回源优选
-
-优化的是**①那一段**：手机 → Cloudflare 边缘。做法是分线路 DNS：境内解析到「优选域名」，
-境外解析到回退源，靠 Cloudflare for SaaS 的 Custom Hostname 让两条路的 `Host` 头都是
-你的域名，边缘据此路由到同一个 tunnel。
-
-查证过的成本与前提：
-
-- Cloudflare for SaaS **Free 套餐可用**，含 100 个 custom hostname，超出 $0.10/个
-  （Free 档不支持通配符 custom hostname、自定义证书、Non-SNI）
-- 需要**两个域名**（一个对外、一个当回退源）
-- 需要支持分线路的 DNS：腾讯云 DNSPod 免费版的基本线路里就有「境内 / 境外」，够用
-- 「优选域名」是第三方（大厂域名或网友维护的解析），随时失效，且失效时的表现是
-  **境内用户直接连不上而境外一切正常**，很难第一时间归因
-
-值不值得取决于流量形状：隧道上只有 API 小包，优化的是握手和 RTT，不是吞吐。建议顺序：
-
-1. 先在常用的外网环境（4G、公司 WiFi）实测：
-   `for i in $(seq 10); do curl -o /dev/null -s -w '%{time_total}\n' -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping; done`
-2. 中位数 < 400ms → 别折腾（识别请求客户端 2 秒超时，服务端 P95 约 180ms，余量很大）
-3. 明显更慢或大面积超时 → 再上这一套。它不改服务端，纯 DNS + 面板配置，随时可退
-
-### 明确不值得的两条
-
-- **Argo Smart Routing**（现已并入 Smart Shield）：付费加购，官方没有公开的价格与提速
-  数字，而且它优化的是 Cloudflare **网络内部**的路由，对「国内出口 → 最近边缘」这一段
-  无能为力 —— 而那一段恰好是国内慢的主要原因
-- **Cloudflare China Network**：唯一真正解决①那段的官方方案，但要 Enterprise 套餐 +
-  每个顶级域名的 ICP 备案 + 京东云境内节点，个人 NAS 不在射程内
-
-## 排障
-
-症状对照表和逐条展开都在 [faq.md](faq.md)。这份只讲「为什么是这个数」。
+另外两个默认值别动：`retries` 默认 5（1/2/4/8/16 秒指数退避，调大只会让故障期更长）；
+`region` 目前只能填 `us`（把所有连接固定到美国，对我们只会更慢）。
 
 ## 这台机器上量到的基线
 
@@ -340,36 +244,15 @@ region2  198.41.200.0/24：254 个全应答，整段最快 33.4 ms
 完整报告在 `bench/logs/sim-qnap.json`，重跑：
 `python3 bench/sim_qnap.py --photos 300 --queries 200`。
 
-## 升级、备份、恢复
+## 升级后为什么要 prune，以及为什么必须带过滤器
 
-**升级服务端**。先 `cd` 到 `docker-compose.yml` 所在的那个目录 —— 照 deploy.md 第 2
-步的默认路径就是：
+升级的命令在 [deploy.md 第 8 节](deploy.md#8-升级与回滚)。这里只讲那条 `prune` 为什么
+是必须的、以及那一长串 `--filter` 为什么不能省。
 
-```bash
-cd /share/Container/photo-ar
-```
-
-记不清当时选的是哪个目录，问正在跑的容器最准（这个 label 是 compose 自己打的，答案
-就是当初 `docker compose up -d` 时所在的目录，不管你实际选了哪条路径）：
-
-```bash
-docker inspect photo-ar-server --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
-```
-
-到了那个目录（能看到 `docker-compose.yml`、`.env`、`data/`），跑：
-
-```bash
-docker compose pull && docker compose up -d
-# 清掉刚被顶掉 tag 的那份旧镜像（1.1GB 一个）
-docker image prune -f --filter label=org.opencontainers.image.source=https://github.com/shimmerjordan/photo_ar
-```
-
-（自己改了代码就 `build` 而不是 `pull`，依赖层有缓存，通常几十秒。）
-
-**第三行是必须的，不是卫生习惯。** `pull` 拿到新的 `latest` 时，docker 把这个 tag
-挪到新镜像上，上一份就**丢掉全部 tag 变成 `<none>`** —— 它没被删，只是没名字了，
-1.1GB 一个，随升级次数线性堆积。这是 docker 移动 tag 的固有行为，compose 没有开关
-能关掉它（`pull` / `up --pull always` / 换 compose 版本都一样）。
+**它不是卫生习惯。** `pull` 拿到新的 `latest` 时，docker 把这个 tag 挪到新镜像上，上一份
+就**丢掉全部 tag 变成 `<none>`** —— 它没被删，只是没名字了，1.1GB 一个，随升级次数线性
+堆积。这是 docker 移动 tag 的固有行为，compose 没有开关能关掉它（`pull` /
+`up --pull always` / 换 compose 版本都一样）。
 
 **为什么带那一长串 `--filter`**：不带过滤的 `docker image prune -f` 会清掉**这台机器
 上所有服务**的无 tag 镜像。在这台 NAS 上那还有 CloudDrive2、Calibre、cloudflared、
@@ -377,91 +260,6 @@ explore_journal 的两个服务 —— 它们的孤儿镜像多半也是垃圾�
 升级都跑的命令，让它伸手到项目外面去，出事的那次最难追。过滤用的是镜像自带的
 `org.opencontainers.image.source` 标签（在 `Dockerfile` 里打，见那段注释），所以它
 **只可能**命中 photo-ar 自己的镜像。
-
-> **一次性**：标签是这次才加的，**在此之前发布的所有镜像都没有它**（`0.1.0` 与那一批
-> `sha-*` 全都没有），所以已经堆在机器上的那些 `<none>` 过滤不到。先看一眼再决定，
-> `prune` 只删无 tag 的、不碰任何正在用的镜像：
->
-> ```bash
-> docker images -f dangling=true      # 先看要删什么，确认里面没有你手工留着的
-> docker image prune -f               # 清掉（这一次是不带过滤的全机清理）
-> ```
->
-> 之后升级用上面那条带过滤的就够了。
-
-**如果 `<none>` 每次升级涨的不止一个**，那就不只是 tag 被顶掉，八成是这台机器在**自己
-构建**（见下一段）。这条能分辨它们 —— 老镜像没有标签，但都带着 `PHOTOAR_DATA` 这个
-环境变量，照样认得出来：
-
-```bash
-for id in $(docker images -f dangling=true -q); do
-  if docker image inspect "$id" --format '{{range .Config.Env}}{{.}} {{end}}' | grep -q PHOTOAR_DATA
-  then echo "$id  photo-ar 旧版镜像"
-  else echo "$id  别的（构建中间层 / 别的服务）"; fi
-done
-```
-
-**升级不会更新 `docker-compose.yml`。** `docker compose pull` 更新的只有镜像。这台机器
-上那份 compose 是安装时 `curl` 下来、然后你**手工改过挂载和 `PHOTOAR_ROOTS`** 的本地
-副本 —— 仓库里对它的修正不会自己过来。有一条修正**恰好和这个症状有关**：主 compose
-里曾经有 `build: .`，而 `image:` 与 `build:` 并存时，本地一旦没有那个镜像，compose 会
-**转去构建而不是 pull**（表现是突然开始拉 `node:22-trixie-slim` 和 `python:3.11-slim`
-两个基底、跑几分钟构建，还额外留下中间层镜像）。确认一句就够：
-
-```bash
-grep -nE '^[[:space:]]*build:' docker-compose.yml     # 应该什么都不输出
-```
-
-（`^[[:space:]]*` 不能省 —— 现在这份 compose 的注释里就写着"这里刻意没有 `build: .`"，
-不锚定行首的话每次都命中那行注释，然后你会去查一个不存在的问题。）
-
-有输出就把那一行（和它上面的注释）删掉 —— 部署机永远只该 `pull`。顺便对一下仓库里的
-新版，只看差异、别整份覆盖（会冲掉你改的挂载）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/shimmerjordan/photo_ar/main/docker-compose.yml | diff -u docker-compose.yml - | head -40
-```
-
-镜像**只在手动跑 workflow 且勾了 publish 时**才发新的（Actions → server →
-Run workflow，版本号在界面上填）——往 main 推代码、甚至打 git tag，都不会动镜像。
-而 `latest` 还要再勾一次「同时更新 latest」才会挪，所以 `pull` 拿到的 `latest`
-一定是某次特意发布**并特意指定**的版本。想钉死版本就在 `.env` 里写
-`PHOTOAR_IMAGE=ghcr.io/shimmerjordan/photo-ar-server:0.2.0`。
-
-什么时候需要动库，其余情况都不用：
-
-| 改了什么 | 要做什么 | 不做的表现 |
-|---|---|---|
-| `vocab.npz` | `reindex --rebuild-words` | **识别率突然掉到底，而日志一切正常** |
-| 特征提取参数（ORB / 描述子） | 全库重新入库 | 同上，且 `check` 也看不出来 |
-| 只改了服务端逻辑 / 接口 | 什么都不用 | — |
-| 照片原文件被移动或改名 | `verify` 看报告，重新关联 | 详情页 `refStale`，识别仍在（用的是入库时存的特征） |
-
-**改了网页版**：`docker compose up -d --build`（开发机 —— `build:` 只在
-`deploy/compose.local.yml` 覆盖层里，所以要按 deploy.md 那样把覆盖层写进
-`COMPOSE_FILE`；NAS 上没有构建这回事，等 CI 发版然后 pull）。前端没有构建步骤，
-但它在镜像里 —— 改了 `web-front/public/` 不重建镜像是不会生效的。宾客那边刷新一下页面就是新的
-（HTML 与 js 都是 `no-cache`，只有 `vendor/` 和字体是 immutable）。
-
-**备份**：值钱的只有 `data/`（每个文件的作用见 [deploy/README.md](../deploy/README.md)
-的表）。`thumb/`、`playable/` 丢了只能重新入库再生成，所以别只备份
-`catalog.db`。SQLite 正在被写时拷出来的文件可能是坏的，停一下再拷最省心：
-
-```bash
-docker compose stop
-sudo tar czf /share/Backup/photo-ar-data-$(date +%F).tar.gz data/    # 属主是 root
-docker compose start
-```
-
-一万张量级下 `data/` 的大头是 `playable/`（每条最大 16.24MiB）。空间紧的话可以只备份
-`catalog.db` + `library/` + `thumb/`，排除 `playable/` —— 它能从原视频重新
-转码出来（代价是每条几十秒）。
-
-**恢复到一台新 NAS**：`data/` 拷回去、`vocab.npz` 用**同一份**、照片和视频原文件放回
-**同样的路径**（`roots` 按路径存，路径变了要 `verify` 后重新关联）。
-
-**换 token**：改 `.env` → `docker compose up -d` → 手机「设置」里改成新的。旧 token
-立刻失效，客户端表现是所有通道 401（原因会写在卡片下面）。
 
 ## 在开发机上跑
 
@@ -491,7 +289,7 @@ docker compose up -d --build
 两个容易踩的点：
 
 - **管理员口令写在 `.env` 里，不在 compose 里。** 这个仓库是公开的，固定口令写进
-  compose 就等于发布出去了（见 decisions.md §16）。留空就是 admin / admin + 首登强制改。
+  compose 就等于发布出去了（见 [decisions.md 的「开发机上的固定口令为什么不写在 compose 里」](decisions.md#16-开发机上的固定口令为什么不写在-compose-里)）。留空就是 admin / admin + 首登强制改。
 - **cpus / mem 刻意不放宽。** 验收条件之一是「在 NAS 的资源预算内跑得动」（N5095 四核）。
   开发机放开了怎么测都快，到 NAS 上才发现撞超时 —— 那就白测了。
 
