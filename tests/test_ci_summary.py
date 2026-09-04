@@ -45,7 +45,10 @@ def run(tmp_path: Path, **env) -> str:
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_SHA": "1a2b3c4d5e6f7890",
         "BUILD_OUTCOME": "success",
-        "E2E_OUTCOME": "success",
+        "RUN_OUTCOME": "success",
+        "LOGIN_OUTCOME": "success",
+        "VERSION_OUTCOME": "success",
+        "PERSIST_OUTCOME": "success",
         "PUBLISHED": "false",
         "TAGS": "",
         "GITHUB_STEP_SUMMARY": str(out),
@@ -59,16 +62,22 @@ def run(tmp_path: Path, **env) -> str:
 # ---- 什么时候**不该**给部署说明 ----
 
 
+# e2e 四个 step 都跳过（outcome 是空串，不是缺失）—— 镜像没编出来时的常态。
+_E2E_SKIPPED = {"RUN_OUTCOME": "", "LOGIN_OUTCOME": "", "VERSION_OUTCOME": "", "PERSIST_OUTCOME": ""}
+# 起容器过了但打接口挂了：后面版本号/重启验持久化两步 fail-fast 跳过。
+_E2E_LOGIN_FAILED = {"RUN_OUTCOME": "success", "LOGIN_OUTCOME": "failure", "VERSION_OUTCOME": "", "PERSIST_OUTCOME": ""}
+
+
 @pytest.mark.parametrize(
     "build,e2e",
     [
-        ("failure", ""),        # 镜像没编出来，冒烟压根没跑到（outcome 是空串不是缺失）
-        ("success", "failure"),  # 编出来了但起不来
-        ("success", ""),         # 冒烟被跳过 —— 没验过就等于没验过
+        ("failure", _E2E_SKIPPED),      # 镜像没编出来，四步冒烟压根没跑到
+        ("success", _E2E_LOGIN_FAILED),  # 编出来了但打接口那步挂了
+        ("success", _E2E_SKIPPED),       # 冒烟被跳过 —— 没验过就等于没验过
     ],
 )
 def test_没验过的版本不给部署说明(tmp_path, build, e2e):
-    md = run(tmp_path, BUILD_OUTCOME=build, E2E_OUTCOME=e2e)
+    md = run(tmp_path, BUILD_OUTCOME=build, **e2e)
     assert "不可部署" in md
     # 这三个是"照着抄就能起来"的入口。一个都不许出现 —— 出现一个就有人会抄。
     for lure in ("docker pull", "docker run", "docker compose up"):
@@ -153,7 +162,11 @@ def test_没有_GITHUB_STEP_SUMMARY_时打到标准输出():
     # 本地眼看输出用的那条路。坏了不影响 CI，但坏了就没人会在改文案后先看一眼。
     r = subprocess.run(
         [sys.executable, str(SCRIPT)],
-        env={"IMAGE": IMAGE, "VERSION": "x", "BUILD_OUTCOME": "success", "E2E_OUTCOME": "success"},
+        env={
+            "IMAGE": IMAGE, "VERSION": "x", "BUILD_OUTCOME": "success",
+            "RUN_OUTCOME": "success", "LOGIN_OUTCOME": "success",
+            "VERSION_OUTCOME": "success", "PERSIST_OUTCOME": "success",
+        },
         capture_output=True, text=True,
     )
     assert r.returncode == 0, r.stderr

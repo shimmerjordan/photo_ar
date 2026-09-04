@@ -18,7 +18,7 @@
 
 ## 摘要里的说法为什么不会变成谎话
 
-它声称的每一条访问路径（`/`、`/admin`、`/v1/*`、`/healthz`）都是同一个 job 上面那一步
+它声称的每一条访问路径（`/`、`/admin`、`/v1/*`）都是同一个 job 上面那一步
 用 curl 真打过的；它给的那条 `docker run` 与 CI 里跑通的那条是同一组必填项。所以要是
 哪天多出一个必填的环境变量，CI 的容器会先变 unhealthy、job 先红 —— 而红的时候这份
 摘要走的是另一条分支（不给部署说明）。**它讲不出没被验证过的话。**
@@ -28,8 +28,9 @@
 CI 里由 workflow 传环境变量调用。也可以直接跑来眼看输出（没有 `GITHUB_STEP_SUMMARY`
 时打到 stdout）：
 
-    IMAGE=ghcr.io/me/photo-ar-server VERSION=sha-1a2b3c4 \
-      BUILD_OUTCOME=success E2E_OUTCOME=success PUBLISHED=true \
+    IMAGE=ghcr.io/me/photo-ar-server VERSION=sha-1a2b3c4 PUBLISHED=true \
+      BUILD_OUTCOME=success RUN_OUTCOME=success LOGIN_OUTCOME=success \
+      VERSION_OUTCOME=success PERSIST_OUTCOME=success \
       TAGS=$'ghcr.io/me/photo-ar-server:0.2.0\\nghcr.io/me/photo-ar-server:latest' \
       python3 .github/scripts/summary.py
 """
@@ -56,7 +57,9 @@ VERSION = env("VERSION", "unknown")
 TAGS = [t.strip() for t in env("TAGS").splitlines() if t.strip()]
 PUBLISHED = env("PUBLISHED") == "true"
 BUILD_OK = env("BUILD_OUTCOME") == "success"
-E2E_OK = env("E2E_OUTCOME") == "success"
+# e2e 是四个 step，workflow 分别传各自的 outcome —— 不再只看最后一个。
+E2E_STAGES = [("起容器", "RUN_OUTCOME"), ("打接口", "LOGIN_OUTCOME"), ("版本号", "VERSION_OUTCOME"), ("重启验持久化", "PERSIST_OUTCOME")]
+E2E_OK = all(env(var) == "success" for _, var in E2E_STAGES)
 
 
 def doc(path: str, label: str | None = None) -> str:
@@ -83,19 +86,23 @@ def describe_tag(tag: str) -> str:
     return "分支名（手动 Run workflow 得到的）"
 
 
+def _stage_status(outcome: str) -> str:
+    return "✅ 通过" if outcome == "success" else ("❌ 失败" if outcome else "⏭ 没跑到")
+
+
 def blocked() -> str:
     """构建或冒烟没过时的分支。**刻意不给部署说明。**
 
     绿一半的运行页上放一份"怎么部署"，读的人会以为有东西可部署。而这条流水线的设计
     正好相反：推镜像那两步排在冒烟之后，就是为了让不可用的镜像根本出不去。
     """
-    e2e = "✅ 通过" if E2E_OK else ("❌ 失败" if env("E2E_OUTCOME") else "⏭ 没跑到")
+    e2e_rows = "\n".join(f"| {name} | {_stage_status(env(var))} |" for name, var in E2E_STAGES)
     return f"""## ⛔ 这一版不可部署
 
 | 阶段 | 结果 |
 |---|---|
-| 编镜像 | {"✅ 通过" if BUILD_OK else "❌ 失败"} |
-| 起容器并打接口 | {e2e} |
+| 编镜像 | {_stage_status(env("BUILD_OUTCOME"))} |
+{e2e_rows}
 
 **镜像没有被推到 registry。** 推送那两步排在冒烟之后，所以出不去的正是出了问题的
 那一版 —— registry 上还是上一次发布的镜像，线上服务不受这次失败影响。
@@ -143,28 +150,23 @@ docker pull {first}
 | `latest` | 要不要把 `:latest` 指到这一版 |
 | `release` | 要不要建 GitHub Release（顺带打 git tag） |
 
-**打 git tag 不会触发任何东西** —— 这条流水线只手动触发。
+**推 main / 开 PR 会自动跑检查（test/web/lint），但不发版**；发版只能走上面这个
+手动入口。打 git tag 本身也不会触发任何东西。
 
-想跑含这次改动的镜像但完全不经过 GHCR：在**开发机**上带覆盖层构建
-（`COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml`，`build:` 只在覆盖层里；
-版本号会显示成 `x.y.z-dev`，那正是"不是 CI 出的镜像"的标记）。
+想跑含这次改动的镜像但完全不经过 GHCR：在**开发机**上带覆盖层构建（`COMPOSE_FILE=docker-compose.yml:deploy/compose.local.yml`，`build:` 只在覆盖层里；版本号会显示成 `x.y.z-dev`）。
 
-⚠️ **别指望 `:latest` 是新的。** 它**只在发布时勾了 latest 才动**，所以停在
-「上一次特意发布并勾了它」那一刻 —— 中间往 main 推过多少次都不会动它。真踩过：拉了 `:main`
-拿到的还是几个月前的镜像，而那一版连网页版都还没合进容器，表现是 `/` 回
-「没有这个接口」。**确认办法**：起来之后 `curl -s <host>/api/config` 看 `version` 字段，
-或者 `docker exec <容器> printenv PHOTOAR_VERSION` —— 空的就是没经过版本注入的老镜像。
+⚠️ **`:latest` 只在发布时勾了 latest 才动** —— 按版本 tag（或 `:sha-xxxxxxx`）拉更可靠。
 """
 
 
 def deploy() -> str:
     tag = TAGS[0] if (PUBLISHED and TAGS) else f"{IMAGE}:latest"
     return f"""### 2 · 起容器
-
 ```bash
-docker run -d --name photo-ar-server -p {PORT}:{PORT} -e PHOTOAR_ROOTS=photos=/media/photos -e PHOTOAR_UPLOAD_DIR=/media/photos/_inbox -v /你的/照片:/media/photos -v photoar-data:/data {tag}
+docker run -d --name photo-ar-server -p {PORT}:{PORT} -e PHOTOAR_ROOTS=photos=/你的/照片 -v /你的/照片:/你的/照片:ro -v photoar-data:/data {tag}
 ```
-必填：`PHOTOAR_ROOTS`（容器内路径的白名单根目录）、`PHOTOAR_UPLOAD_DIR`（须在其内）、端口 `{PORT}`。登录 `admin`/`admin`，会被强制改密。
+必填只有 `PHOTOAR_ROOTS`（容器内路径的白名单根目录，与上面 CI 跑通的那组严格一致）和端口 `{PORT}`。登录 `admin`/`admin`，会被强制改密。
+要开手机上传再加 `-e PHOTOAR_UPLOAD_DIR=/你的/inbox -v /你的/inbox:/你的/inbox`（须在 `PHOTOAR_ROOTS` 之内、挂载可写、和照片目录是兄弟目录）——不设就只是关掉上传，容器照样 healthy。
 完整 compose：{doc("docker-compose.yml", "docker-compose.yml")}；首次部署：{doc("docs/deploy.md")}。
 """
 
@@ -176,14 +178,12 @@ def access() -> str:
 | `http://<host>:{PORT}/` | 网页版 |
 | `http://<host>:{PORT}/admin` | 管理台 |
 | `http://<host>:{PORT}/v1/*` | 后端 API，未登录 **401** |
-
 相机要 https（`https://` 或 `http://localhost`），见 {doc("docs/faq.md", "faq.md")}；给宾客发链接前：{doc("docs/deploy.md#7-发给宾客")}。
 """
 
 
 def caveats() -> str:
     return f"""### 几件要留意的
-
 * **GHCR 上的包默认 private**：拉之前先 `docker login ghcr.io`（或把 Package settings 改成 public）。
 * **要回滚**：`docker pull {IMAGE}:sha-xxxxxxx` —— 这个 tag 每次构建都有，精确对应一次提交。
 

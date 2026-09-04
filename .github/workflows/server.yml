@@ -1,8 +1,9 @@
 # 唯一的一条流水线：单元测试（Python + 网页版）→ 编镜像 → 把镜像当生产环境跑一遍
 # →（勾了 publish 时）推 GHCR →（勾了 release 时）建 Release。
 #
-# **只手动触发**（Actions → server → Run workflow）。版本号、要不要动 latest、要不要
-# 建 Release 全在那个界面上填，见下面 `on:` 那一段。
+# **发版只手动触发**（Actions → server → Run workflow）；推 main / 开 PR 只自动跑
+# 检查（test/web/lint，vendor/ 变动多一个 golden），不产出镜像。版本号、要不要动
+# latest、要不要建 Release 全在那个手动触发的界面上填，见下面 `on:` 那一段。
 #
 # 镜像里是**两个进程**：Node 的网页版在前（唯一的监听者）、Python 的后端在
 # 127.0.0.1:8965。所以 E2E 那一步同时打三种 URI：`/`（网页版）、`/admin`（反代）、
@@ -29,10 +30,6 @@
 # 挂了就只说"没有可部署的东西、先看哪一步"。它声称的每条 URI 都是上面那一步真打过的，
 # 那条最小 `docker run` 与上面跑通的那条是同一组必填项（`tests/test_ci_summary.py` 从这个
 # 文件里抠出来做比对）—— 所以它讲不出没被验证过的话。
-#
-# ⚠️ `arcoreimg` 不在仓库里（ARCore SDK 里的闭源二进制、不可再分发），所以镜像里没有它，
-# 入库那条路在 CI 上会回 503。这是**预期**的：E2E 只打不需要它的接口，入库那一整条的
-# 覆盖在单元测试里（`fake_arcoreimg` fixture）。
 #
 # ## 发版
 #
@@ -101,7 +98,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: pip install ruff && ruff check .
+      # 钉版本（与开发机 .venv 里那份一致）：ruff 的规则集偶尔跨版本变化，
+      # 不钉的话本地 ruff check . 绿、CI 上 ruff check . 红这种事会真的发生。
+      - run: pip install "ruff==0.16.6" && ruff check .
 
   test:
     runs-on: ubuntu-latest
@@ -137,10 +136,9 @@ jobs:
   # 网页版那 100 多条零依赖测试。单独一个 job 而不是接在 test 后面：它不需要 Python、
   # 不需要 opencv、不需要装系统库，十几秒就跑完，与上面那十分钟并行。
   #
-  # 只跑 `npm test`。要真浏览器的那几套（test:golden / test:e2e / test:worker）**没有**
-  # 放进 CI：它们要下 headless Chrome 并跑真的 ORB + RANSAC，而它们守的是「opencv.js
-  # 换版本了没」—— 那是一件手动的、罕见的事，值得手动跑一遍看数字，不值得每次推代码
-  # 等三分钟。`test:smoke` / `test:pages` 要一个跑着的容器 + 一个真库，CI 上没有。
+  # 只跑 `npm test`。`test:e2e` / `test:worker` 仍不进 CI（每次推代码等三分钟不值）；
+  # `test:golden` 只在 vendor/ 变动时跑，见下面的 golden job。`test:smoke` / `test:pages`
+  # 要一个跑着的容器 + 一个真库，CI 上没有。
   web:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -160,11 +158,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # fetch-depth: 0（全history）而不是 2：push 事件下一次推送可能带好几个 commit，
+      # `HEAD~1` 只看最后一个，中间那些改了 vendor/ 的会被漏掉。
       - uses: actions/checkout@v4
-        with: { fetch-depth: 2 }
+        with: { fetch-depth: 0 }
       - id: changed
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -q '^web-front/public/vendor/'; then echo "yes=1" >> "$GITHUB_OUTPUT"; fi
+          # PR 事件：checkout 出来的是那个合成 merge commit，`HEAD~1` 是它的第一父，
+          # 也就是 PR 的 base —— 天然就是整个 PR 的范围，不用换。
+          # push 事件：用 `github.event.before..HEAD` 覆盖这整次推送的所有 commit；
+          # `before` 是全零（新分支第一次推）或者已经不可达（强推）时退回 `HEAD~1`。
+          before="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = push ] && git cat-file -e "$before" 2>/dev/null; then
+            range="$before..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          if git diff --name-only $range | grep -q '^web-front/public/vendor/'; then echo "yes=1" >> "$GITHUB_OUTPUT"; fi
       - if: steps.changed.outputs.yes == '1'
         uses: actions/setup-node@v4
         with: { node-version: 22 }
@@ -276,6 +286,7 @@ jobs:
       # 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署走的那条 ——
       # 顺手把它验一遍。
       - name: 起容器
+        id: run
         run: |
           set -euo pipefail
           docker volume create photoar-ci-data
@@ -334,13 +345,18 @@ jobs:
           [ "$code" = "200" ] || { echo "::error::/healthz 不对"; exit 1; }
 
           # 登录 → 拿 token → 打 ping。这三步串起来就覆盖了「路由表装上了、
-          # 鉴权链通了、SQLite 能写」；默认口令触发的强制改密门在服务端这一侧
-          # 靠 `mustChangePassword` 标记实现，登录本身不受它阻挡。
-          tok=$(curl -s -X POST http://127.0.0.1:8964/v1/auth/login \
+          # 鉴权链通了、SQLite 能写」。用的是默认口令（admin/admin），所以顺手断言
+          # 服务端真的回了 mustChangePassword: true —— 口径抄 tests/server/test_app_auth.py
+          # 里 test_default_password_login_demands_a_change 断言登录响应体那一段；
+          # 断言而不是注释，才是真的验过而不是嘴上说说。
+          resp=$(curl -s -X POST http://127.0.0.1:8964/v1/auth/login \
                   -H 'Content-Type: application/json' \
-                  -d '{"name":"admin","password":"admin"}' \
-                | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+                  -d '{"name":"admin","password":"admin"}')
+          tok=$(printf '%s' "$resp" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['mustChangePassword'] is True, f'默认口令登录应当要求改密，回的是 {d}';print(d['token'])")
           test -n "$tok" || { echo "::error::登录没拿到 token"; exit 1; }
+          # 先打码再写进 GITHUB_OUTPUT：token 本身不敏感（下一步就用它打接口），
+          # 但日志/摘要里裸露一个能登录的活 token 没有任何好处。
+          echo "::add-mask::$tok"
           echo "tok=$tok" >> "$GITHUB_OUTPUT"
 
           curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping \
@@ -352,6 +368,7 @@ jobs:
           # cmdline 数进去（实测 5 而不是 2）。冗余的断言不如没有。
 
       - name: 版本号
+        id: version
         env:
           # 同上：不把 tag 名内联展开进脚本正文
           WANT_VERSION: ${{ steps.ver.outputs.value }}
@@ -475,10 +492,12 @@ jobs:
           VERSION: ${{ steps.ver.outputs.value }}
           TAGS: ${{ steps.meta.outputs.tags }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
-          # e2e 现在是四个 step（起容器/打接口/版本号/重启验持久化）串联，默认
-          # fail-fast：任何一步失败，后面的步骤直接 skipped（不是 success）。
-          # 所以最后一步（重启验持久化）的 outcome 就等价于「四步都过了」。
-          E2E_OUTCOME: ${{ steps.persist.outcome }}
+          # e2e 现在是四个 step，分别传各自的 outcome —— blocked() 里按这四个
+          # 名字（起容器/打接口/版本号/重启验持久化）分别显示，而不是只看最后一个。
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          VERSION_OUTCOME: ${{ steps.version.outcome }}
+          PERSIST_OUTCOME: ${{ steps.persist.outcome }}
           # 推失败也算没发布 —— 那时 registry 上还是上一版，说"已推送"就是谎话。
           PUBLISHED: ${{ steps.push.outcome == 'success' }}
         run: python3 .github/scripts/summary.py
