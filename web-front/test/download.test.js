@@ -131,4 +131,11 @@ describe('stageName', () => {
       assert.equal(stageName(s), '', `${s} 不该有阶段名`)
     }
   })
+
+  test('缓存命中时名字不再是「正在下载视频」', () => {
+    // 「正在下载视频」与 stageText 同一档给出的「本机已有，秒开」自相矛盾——
+    // 一句说在下，一句说已经有了。三个页面都拼过这两句，见 mediaload.js 的说明。
+    assert.notEqual(stageName(Stage.DOWNLOAD, { fromCache: true }), '正在下载视频')
+    assert.ok(stageName(Stage.DOWNLOAD, { fromCache: true }).length > 2)
+  })
 })

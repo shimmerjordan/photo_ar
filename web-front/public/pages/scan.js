@@ -135,14 +135,14 @@ export default {
       onFullscreen: () => {
         if (!st.lockedPhoto?.mediaUrl) return
         if (st.flatFull) {
-          // 退出满屏。**不在这儿贴回去** —— 满屏期间的四角全被忽略了，手上没有一份能用的
-          // 几何。置回"等四角"的状态就够了：下一份跟踪四角一到自然贴回（走 blend 那段
-          // 过渡），照片已经不在画面里时则由放手那一支退回 70% 平铺续播。
-          exitFlat()
-          st.blendStart = 0
-          st.filter.reset()
-          tip(st.hitTip || TIPS.flow_lost, { hit: Boolean(st.hitTip) })
-          setPrimary(ctl.sound)
+          // 退出满屏，**不等于**退出整条平铺续播（见 `exitFullscreen`）。
+          // 不在这儿贴回去 —— 满屏期间的四角全被忽略了（连 `st.quad` 都没写），手上
+          // 没有一份能用的几何；pipeline 的 `gaveUp` 是**一次性**事件，满屏期间若已经
+          // 报过那一次也被上面「进满屏」那支连同其余几何一起丢弃了，退出时不会再补
+          // 一份。所以落回的不是"等四角"，而是**已经在放的 70% 平铺**：下一份跟踪
+          // 四角一到，`onWorkerMessage` 里「从平铺贴回去」那支会走 4 步 blend 过渡
+          // 自然贴合；四角一直不来也不会黑屏，视频已经在屏幕中央续播着。
+          exitFullscreen()
           return
         }
         st.flat = true
@@ -170,9 +170,12 @@ export default {
     /**
      * 退出平铺（不管是 70% 还是满屏）：回到"贴合"那套状态。
      *
-     * 四处调用（贴回去、换照片、重新扫描、退出满屏）每一处都要连着做这三件事，而漏掉
-     * `loop` 那一件的后果是最难查的：平铺播完靠 `ended` 退出锁定，而带着 `loop` 的元素
-     * 在直连回退路径上永远不会发 `ended`。
+     * 四处调用（贴回去、`onHit` 无视频、`onHit` 换照片、重新扫描）每一处都要连着做这
+     * 三件事，而漏掉 `loop` 那一件的后果是最难查的：平铺播完靠 `ended` 退出锁定，而
+     * 带着 `loop` 的元素在直连回退路径上永远不会发 `ended`。
+     *
+     * **「退出全屏」不调这个** —— 见 `exitFullscreen`：退出满屏只退那一层，仍然
+     * 留在 70% 平铺里，要等下一份四角贴回去时才真正调到这里。
      */
     function exitFlat() {
       st.flat = false
@@ -180,6 +183,27 @@ export default {
       // 平铺时关掉的原生 loop 要还回去 —— 贴合状态下播完要接着放（见 onVideoEnded）。
       dom.clip.loop = true
       syncFullLabel()
+    }
+    /**
+     * 退出**满屏**，不等于退出整条平铺续播。用户点「退出全屏」时调。
+     *
+     * P1 修复：老代码这里调的是 `exitFlat()`，把 `st.flat` 也一并清掉、`loop` 拨回
+     * `true`。若照片此时已经离开画面（满屏期间 pipeline 唯一一次 `gaveUp` 被
+     * `onWorkerMessage` 的 `st.flatFull` 分支整帧丢弃，见那里的说明），退出后
+     * `st.quad` 为空、`lockedPhoto` 还在：渲染循环无几何可画（黑屏只剩相机），没有
+     * 70% 平铺兜底，`loop=true` 又永远等不到 `ended` 所以不会自动 `resetLock` ——
+     * 用户只能重新对准或点「重新扫描」。
+     *
+     * 所以这里只退**满屏**这一层：`st.flatFull=false`，**保留** `st.flat=true` 与
+     * `dom.clip.loop=false`，立刻退回 70% 平铺续播（渲染循环下一帧就会走 `flat`
+     * 兜底那支）；下一份跟踪四角到达时，既有的「从平铺贴回去」分支会在 4 步内自然
+     * 贴合并调用 `exitFlat()`。
+     */
+    function exitFullscreen() {
+      st.flatFull = false
+      syncFullLabel()
+      tip(TIPS.flat)
+      setPrimary(rescan)
     }
     /**
      * 开/关相机。**这个按钮同时是权限重试的入口** —— 权限弹窗被划掉、或相机被
@@ -494,10 +518,10 @@ export default {
         // **阶段名，不是 `stageText`。** 后者在下载那一档给的是数字（`0.0 / 8.1 MB`），
         // 而那串数字此刻已经在下面那行小字里了（`st.loadNote`）—— 同一句显示两遍，
         // 且 tip 上那句读起来不知道在干什么。上面那张表说的就是这条分工。
-        tip(`认出了 <b>${title}</b>，${stageName(s.stage) || '正在加载…'}…`, { hit: true })
-        bar(s.pct, stageName(s.stage) || '加载视频')
+        tip(`认出了 <b>${title}</b>，${stageName(s.stage, { fromCache: s.fromCache }) || '正在加载'}…`, { hit: true })
+        bar(s.pct, stageName(s.stage, { fromCache: s.fromCache }) || '加载视频')
       } else {
-        bar(s.pct, stageName(s.stage) || '加载视频')
+        bar(s.pct, stageName(s.stage, { fromCache: s.fromCache }) || '加载视频')
       }
       // 终局（不管是不是这一秒里最新的一条）必须立刻可见：往后不会再有下一条把它盖住。
       meta(terminal)
@@ -741,7 +765,13 @@ export default {
       st.renderer ??= new Renderer(dom.canvas)
       st.grabber ??= new FrameGrabber(dom.cam)
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
-      if (!st.lockedPhoto) tip(guideTip({}).text)
+      // 分档恢复。openCam() 一进来就把 tip 整句改写成「正在开相机…」（见上面），
+      // 成功后不能不分青红皂白地恢复成扫描引导 —— 满屏或平铺中切后台再回前台，
+      // 那样会把木牌钉在「正在开相机…」上，退出说明就此消失（见 P3 记录）。
+      if (st.flatFull) tip(TIPS.flat_full)
+      else if (st.flat) tip(TIPS.flat)
+      else if (st.hitTip) tip(st.hitTip, { hit: true })
+      else tip(guideTip({}).text)
       cancelAnimationFrame(st.raf)
       st.raf = requestAnimationFrame(loop)
     }

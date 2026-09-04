@@ -254,7 +254,8 @@ ONNX vs PyTorch：有效点 512，同位重合 512（100.0%），描述子 max|�
 **第 4 步不除 255**：InstanceNorm 逐样本归一化会抹掉全局尺度，两者等价；取 0..255 是因为
 客户端拿到的原始像素就是这个范围，少一次约定少一处错。
 
-这条契约有两份实现（Python 的 `xfeat.prepare()` 与 Kotlin 的 `XFeatPreprocess`），用一份
+这条契约有两份实现（Python 的 `xfeat.prepare()` 与 Kotlin 的 `XFeatPreprocess`，2026-09-03：
+Kotlin 那份随安卓客户端下线已删，见 §53），用一份
 **跨语言 golden**（合成图的张量总和与 7 个定点值，在两侧测试里逐字重复）钉住。改一边不改
 另一边，两边各红一条。
 

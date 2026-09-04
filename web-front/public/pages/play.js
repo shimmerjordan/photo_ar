@@ -84,7 +84,7 @@ export default {
         // **两行不能是同一句。** `s.text` 就是 `stageText(s.stage, s)`（见 mediaload 的
         // `say`），两处都写它的话「正在取视频信息…」会上下显示两遍。名字归 stageLine，
         // 数字归 detail —— 而只有下载那一档有数字（`3.2 / 8.1 MB`、`本机已有，秒开`）。
-        stageLine.textContent = stageName(s.stage) || '正在加载…'
+        stageLine.textContent = stageName(s.stage, { fromCache: s.fromCache }) || '正在加载…'
         detail.textContent = s.stage === Stage.DOWNLOAD ? s.text : ''
         setBar(bar, s.pct)
       },

@@ -101,7 +101,7 @@ export default {
             } else {
               // 这一页只有一行，所以名字与数字要拼成一句完整的话：
               // 光有数字（`3.2 / 8.1 MB`）读不出这是在下载视频，而那正是宾客最想知道的。
-              const name = stageName(s.stage) || '正在加载…'
+              const name = stageName(s.stage, { fromCache: s.fromCache }) || '正在加载…'
               stageLine.textContent = s.stage === Stage.DOWNLOAD ? `${name} ${s.text}` : name
               setBar(vbar, s.pct)
             }

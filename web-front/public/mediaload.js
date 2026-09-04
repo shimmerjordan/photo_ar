@@ -58,12 +58,17 @@ export const Stage = {
  * 所以名字与数字分成两个函数：一行里要一句完整的话就 `阶段名 + 数字`，
  * 两处分开显示就一处放名字、另一处只放数字（下载档才有）。
  */
-export const stageName = (stage) => ({
-  [Stage.INFO]: '正在取视频信息',
-  [Stage.TICKET]: '准备播放通道',
-  [Stage.DOWNLOAD]: '正在下载视频',
-  [Stage.BUFFER]: '正在缓冲首帧',
-}[stage] ?? '')
+export const stageName = (stage, { fromCache = false } = {}) => {
+  // 缓存命中时不能还叫「正在下载视频」——那句话与 `stageText` 同一档给出的
+  // 「本机已有，秒开」自相矛盾（一句说在下，一句说已经有了）。见调用点的三处拼接。
+  if (stage === Stage.DOWNLOAD && fromCache) return '正在从本机取视频'
+  return ({
+    [Stage.INFO]: '正在取视频信息',
+    [Stage.TICKET]: '准备播放通道',
+    [Stage.DOWNLOAD]: '正在下载视频',
+    [Stage.BUFFER]: '正在缓冲首帧',
+  }[stage] ?? '')
+}
 
 /**
  * 这一步的**细节**（下载档是数字，其余档回退成阶段名那句话）+ 一个 0..1 的进度
