@@ -29,7 +29,7 @@
 
 ## 安全上下文
 
-相机（`getUserMedia`）**只在安全上下文里存在**。这是浏览器规范，不是权限设置，没有工程绕法：
+相机（`getUserMedia`）**只在安全上下文里存在**。这是浏览器规范，不是权限设置，除下面三条出路外没有绕法：
 
 | 地址 | 相机 |
 |---|---|
@@ -43,7 +43,13 @@
 
 ⚠️ **iOS 的微信 / QQ 内置浏览器即使在 https 下也开不了相机。** Apple 只给 Safari 本体开放 WebRTC，第三方 App 的 WKWebView 没有；微信官方明确表示内页 WebRTC「暂无计划」。`web-front/public/camera.js` 会检测 UA 并直接说这句话 —— 只能引导用户「点右上角 ··· → 在浏览器中打开」。
 
-自测时怎么造出一个安全上下文，见下面[局域网里自测](#局域网里自测没有隧道也没有真证书)。
+**三条出路**（页面自己也会把这三条印在报错里，见 `web-front/public/camera.js`；前两条不需要任何证书）：
+
+1. **把它变成 `localhost`。** USB 连电脑，在电脑的 `chrome://inspect` 里开「Port forwarding」把 8964 转过来（命令行等价物是 `adb reverse tcp:8964 tcp:8964`），手机上打开 `http://localhost:8964`。
+2. **让浏览器把这个源当成安全的。** 手机浏览器打开 `chrome://flags`（Edge 是 `edge://flags`），搜 "Insecure origins treated as secure"，把本站地址填进去并**重启浏览器**。
+3. **用真证书的 https 地址**（隧道就是，见 [deploy.md 第 6b 步](deploy.md#6b-cloudflare-tunnel)）。
+
+第 1、2 条只适合自测，具体怎么做见下面[局域网里自测](#局域网里自测没有隧道也没有真证书)。
 
 ## `pull` 报 `denied` / `unauthorized`
 

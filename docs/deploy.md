@@ -73,6 +73,14 @@ volumes:
 
 `/data` 是唯一一条左右不一样的：镜像里写死了 `PHOTOAR_DATA=/data`，让它保持默认最省事。
 
+**两个地方都能写，语法不一样。** 上面是 compose 的 YAML（`environment:` 下面 `键: 值`）；照第 2 步的流程只改 `.env` 就够了，那边是 shell 风格的一行，**不加引号**：
+
+```
+PHOTOAR_ROOTS=照片=/share/Photo,文档=/share/Study
+```
+
+两种写法解析结果完全一样。分隔符是**英文逗号**（`,`），根之间不要用分号或空格 —— `parse_roots` 只按逗号切。
+
 `照片=` 那半截是**显示标签**，不是变量名 —— 变量名是 `PHOTOAR_ROOTS` 本身。标签只用来在管理台的目录浏览器里区分哪个根是哪个，不参与任何路径解析。三种写法都行：`照片=/share/Photo,视频=/share/Video`（界面上显示中文）、`photos=/share/Photo,videos=/share/Video`（ASCII 标签）、`/share/Photo,/share/Video`（不给标签，自动取目录名）。中文标签能用（compose 里 `LANG: C.UTF-8` 那行就是为它设的），换来的只是界面上几个字，纯偏好。两个根撞名（`/a/Photo` 与 `/b/Photo` 都取 `Photo`）会**直接报错**而不是后者覆盖 —— 覆盖的后果是其中一个目录整体访问不到，而界面上只是少了一项。
 
 **三条约束，每条都有一个不响的失败方式**：
@@ -92,6 +100,14 @@ docker compose logs -f photo-ar-server
 ```
 
 **算成**：日志里 `[photoar] 监听 0.0.0.0:8964｜照片 0 张｜后端 orb`，约 20 秒后 `docker compose ps` 的 health 变 `healthy`。
+
+**一个容器、一个端口，三样东西按 URI 分**：
+
+| URI | 是什么 |
+|---|---|
+| `http://<NAS>:8964/` | 宾客扫照片的网页版 |
+| `http://<NAS>:8964/admin` | 网页管理台 |
+| `http://<NAS>:8964/v1/*` | 后端 API（批量入库脚本打这里） |
 
 登录 `http://<NAS>:8964/admin`，账号 `admin`、初始口令 `admin`，**第一次登录会强制改口令**。
 （想跳过强制改密，先在 `.env` 里填 `PHOTOAR_ADMIN_PASSWORD`。）
@@ -276,6 +292,8 @@ docker image prune -f --filter label=org.opencontainers.image.source=https://git
 ```
 
 **算成**：`curl -s http://127.0.0.1:8964/api/config` 里的 `version` 变成新的。
+
+（自己改了代码就 `build` 而不是 `pull`，依赖层有缓存，通常几十秒。）
 
 第二行不是卫生习惯、那个 `--filter` 也不能省，理由见 [deploy-details.md](deploy-details.md#升级后为什么要-prune以及为什么必须带过滤器)。
 

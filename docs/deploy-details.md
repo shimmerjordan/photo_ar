@@ -22,7 +22,7 @@
 
 ## 两条外网通道，各跑什么
 
-网页版只有**一个源、一个端口**（三条 URI 各是什么见 [deploy.md](deploy.md)），所以「走哪条
+网页版只有**一个源、一个端口**（三条 URI 各是什么见 [deploy.md 第 3 步](deploy.md#3-起服务)），所以「走哪条
 路」完全由用户打开哪个地址决定，没有客户端探活那一层。
 
 | 通道 | 跑什么 | 什么时候用 |
@@ -213,10 +213,10 @@ ffmpeg 链的是 oneVPL，而它的 GPU runtime（`libmfx-gen1.2`）只覆盖 Ge
 
 | 手段 | 值不值得 | 依据 / 怎么做（一句） |
 |---|---|---|
-| `TUNNEL_EDGE_IP_VERSION=6` | ✅ 值得先试 | `edge-ip-version` 官方默认是 `4`（不是 `auto`），所以哪怕 NAS 有 v6 也不会用；`curl -s -6 --max-time 8 https://api64.ipify.org` 有输出就给 cloudflared 容器加上它 |
+| `TUNNEL_EDGE_IP_VERSION=6` | ✅ 值得先试 | `edge-ip-version` 官方默认是 `4`（不是 `auto`），所以哪怕 NAS 有 v6 也不会用；`curl -s -6 --max-time 8 https://api64.ipify.org` 有输出就给 cloudflared 容器加上它（或 `auto`）。**验证**：重启后 `cloudflared tunnel info <tunnel 名>` 看连接是否落在 `2606:4700:a0::/48` / `a8::/48` |
 | 边缘 IP 优选（改 `/etc/hosts`） | ⚠️ 先量再说 | 用 `tools/cf_edge_probe.py`。为什么要扫 7844、两个会让人以为「优选没用」的坑、以及「本机实测只差 1.3ms 等于没收益」，全部在那个脚本的模块 docstring 里 |
 | 固定 `TUNNEL_TRANSPORT_PROTOCOL=http2` | ⚠️ 有症状再改 | `protocol` 默认 `auto` = 先试 QUIC（UDP/7844）。国内线路对 UDP 限速或干扰时症状是**隧道能连上但抖**（偶发 502、延迟毛刺），怀疑就固定 http2 试一周；线路对 UDP 友好时 QUIC 的丢包恢复更好，只能实测 |
-| SaaS 回源优选（分线路 DNS） | ⚠️ 最后手段 | 先实测：`for i in $(seq 10); do curl -o /dev/null -s -w '%{time_total}\n' -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping; done`，中位数 < 400ms 就别折腾（客户端 2 秒超时、服务端 P95 约 180ms，余量很大）。要上：两个域名 + 支持分线路的 DNS（腾讯云 DNSPod 免费版的「境内 / 境外」够用）+ Cloudflare for SaaS（Free 可用、含 100 个 custom hostname，超出 $0.10/个）。⚠️「优选域名」是第三方，随时失效，且失效时**境内直接连不上而境外一切正常**，很难第一时间归因 |
+| SaaS 回源优选（分线路 DNS） | ⚠️ 最后手段 | 先实测：`for i in $(seq 10); do curl -o /dev/null -s -w '%{time_total}\n' -H "Authorization: Bearer $T" https://arphoto.<你的域名>/v1/ping; done`，中位数 < 400ms 就别折腾（客户端 2 秒超时、服务端 P95 约 180ms，余量很大）。要上：两个域名 + 支持分线路的 DNS（腾讯云 DNSPod 免费版的「境内 / 境外」够用）+ Cloudflare for SaaS（Free 可用、含 100 个 custom hostname，超出 $0.10/个；Free 档**不支持**通配符 custom hostname、自定义证书与 Non-SNI）。⚠️「优选域名」是第三方，随时失效，且失效时**境内直接连不上而境外一切正常**，很难第一时间归因 |
 | **把静态资源缓存到边缘**（Cache Rule） | ✅ **收益最大** | 2.6MB × 每个宾客，见上面[「CDN：该缓存什么、绝对不该缓存什么」](#cdn该缓存什么绝对不该缓存什么) |
 | 把视频也挂到隧道上 | ⚠️ 已接受 | 违反 CDN 条款、风险是账号级的。2026-08-05 明确接受，理由见[「两条外网通道」](#两条外网通道各跑什么) |
 | Argo Smart Routing（已并入 Smart Shield） | ❌ | 付费加购、官方没有公开的价格与提速数字，而且它优化的是 Cloudflare **网络内部**的路由，对「国内出口 → 最近边缘」那一段无能为力 —— 而那一段恰好是国内慢的主要原因 |
