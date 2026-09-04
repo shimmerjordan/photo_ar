@@ -48,7 +48,27 @@ export const Stage = {
   ERROR: 'error',
 }
 
-/** 一句人话 + 一个 0..1 的进度（`null` = 不定长）。纯函数，好测。 */
+/**
+ * 这一步**在干什么**。与 `stageText` 分工，而这条分工是三个页面都踩过的一个坑：
+ *
+ * `stageText` 报的是这一步的**细节**，而下载那一档的细节是一串数字（`3.2 / 8.1 MB`）——
+ * 单独显示时它不说明自己是在下载（宾客页那一行就只剩了「3.2 / 8.1 MB」），而与阶段名
+ * 并排显示时又会重复一遍（试播页的 `stageLine` 与 `detail` 曾经是同一句）。
+ *
+ * 所以名字与数字分成两个函数：一行里要一句完整的话就 `阶段名 + 数字`，
+ * 两处分开显示就一处放名字、另一处只放数字（下载档才有）。
+ */
+export const stageName = (stage) => ({
+  [Stage.INFO]: '正在取视频信息',
+  [Stage.TICKET]: '准备播放通道',
+  [Stage.DOWNLOAD]: '正在下载视频',
+  [Stage.BUFFER]: '正在缓冲首帧',
+}[stage] ?? '')
+
+/**
+ * 这一步的**细节**（下载档是数字，其余档回退成阶段名那句话）+ 一个 0..1 的进度
+ * （`null` = 不定长）。纯函数，好测。跟阶段名并排显示时只取下载那一档，见 `stageName`。
+ */
 export function stageText(stage, { loaded = 0, total = 0, fromCache = false } = {}) {
   switch (stage) {
     case Stage.INFO: return '正在取视频信息…'

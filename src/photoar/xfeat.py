@@ -93,15 +93,16 @@ class XFeatUnavailable(RuntimeError):
 def canvas_size(h: int, w: int) -> tuple[int, int]:
     """原始尺寸 (h, w) → 缩放后的**有效区**尺寸 (nh, nw)。
 
-    单独一个函数而不是留在 `prepare` 里，因为这个公式现在有**三份实现**：这里、
-    Android 侧的 `XFeatPreprocess`、以及服务端收下相机帧后的预处理里用来验"坐标
-    有没有落在有效区里"的那道检查。三份不一致不会报错，只会让
-    关键点被判在补边区（或者反过来放过一个补边全错的客户端），所以服务端这两处
-    至少要共用同一个名字。
+    这个公式现在**只有这一份实现**（端上提特征那条路 2026-09-03 已经下线，见
+    `docs/decisions.md` §53：`POST /v1/recognize/features` 里那道"关键点有没有落在
+    补边区"的检查、以及 Android 侧的 `XFeatPreprocess` 都随之删掉了）。
 
-    这个函数对"客户端已经先缩过一次"是**不敏感**的：只要长宽比没变，
-    `canvas_size(720, 1280)` 与 `canvas_size(360, 640)` 都是 (360, 640)。所以那道
-    坐标检查允许客户端上报原始帧尺寸或已缩过的尺寸，两者都对得上。
+    仍然单独成一个函数而不是留在 `prepare` 里，是为了**测试能单独钉住它**：
+    `tests/test_xfeat_prepare.py` 拿它与 `prepare` 真的算出来的有效区逐个尺寸比对 ——
+    两者一旦走散，关键点坐标会整体平移，而那不会报错，只表现为识别率莫名偏低。
+
+    这个函数对"调用方已经先缩过一次"是**不敏感**的：只要长宽比没变，
+    `canvas_size(720, 1280)` 与 `canvas_size(360, 640)` 都是 (360, 640)。
     """
     scale = CANVAS / max(h, w)
     nh = max(1, min(CANVAS, int(round(h * scale))))

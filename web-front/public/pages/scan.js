@@ -29,7 +29,7 @@ import {
   FULL_RECT, TTL_MS, clipVertices, flatQuadImage, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
-import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
+import { Stage, loadPhotoVideo, stageName } from '../mediaload.js'
 import { button, esc, h, playerControls } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
@@ -85,7 +85,9 @@ const BLEND_STEPS = 4
 const TIPS = {
   flat: '跟丢了，视频继续放；对准照片会贴回去。',
   // 点「全屏」是**用户自己要的**满屏播放，不是跟丢 —— 说"跟丢了"会让他以为点坏了。
-  flat_full: '满屏播放中。对准照片会贴回去。',
+  // 而且**不能**说"对准照片会贴回去"：满屏只能显式退出（见 onFullscreen 那条裁决），
+  // 举着照片对准它什么都不会发生 —— 那句话会让用户以为满屏坏了。
+  flat_full: '满屏播放中。再点一次「全屏」贴回照片，或点「重新扫描」。',
   flow_lost: '跟丢了，正在重新识别…',
   homography_lost: '跟丢了，正在重新识别…',
   quad_implausible: '角度太斜了，正一点。',
@@ -94,14 +96,6 @@ const TIPS = {
   appearance_lost: '贴合可能偏了，正对照片重新识别…',
   no_seed: '重新识别…',
   forbidden: '认出来了，但这张没有授权给你。',
-}
-
-/** 顶部那条金条的 `aria-label`。不换的话读屏会在播视频时念「加载识别引擎 40%」。 */
-const STAGE_LABEL = {
-  [Stage.INFO]: '取视频信息',
-  [Stage.TICKET]: '准备播放通道',
-  [Stage.DOWNLOAD]: '下载视频',
-  [Stage.BUFFER]: '缓冲首帧',
 }
 
 export default {
@@ -126,22 +120,67 @@ export default {
      * 「全屏」在这一页不能是原生全屏：视频是画进 GL 的一块面片，`<video>` 元素本身是
      * 1px 的隐藏元素（见 `.offscreen`），全屏它等于全屏一个看不见的东西。所以这里换成
      * **满屏平铺** —— 同一段视频，占满屏宽、不再跟着照片走。
+     *
+     * ## 它必须是个**开关**，而且满屏只能显式退出
+     *
+     * 上一版按下去几乎看不出效果：pipeline 仍然是 LOCKED，下一帧（几十毫秒后）就有一份
+     * 合格四角回来，而 `onWorkerMessage` 里「从平铺贴回去」那一支会把 `flat/flatFull`
+     * 清零 —— 于是满屏当场被撤销，按钮形同不存在。
+     *
+     * 裁决：**满屏是用户显式要的，就只能显式退出** —— 再点一次这个按钮、点「重新扫描」、
+     * 或者视频播完。所以满屏期间跟踪四角一律忽略（连 `st.quad` 都不写，见
+     * `onWorkerMessage`），而这个按钮在「全屏 / 退出全屏」之间来回切。
      */
     const ctl = playerControls(dom.clip, {
       onFullscreen: () => {
         if (!st.lockedPhoto?.mediaUrl) return
+        if (st.flatFull) {
+          // 退出满屏。**不在这儿贴回去** —— 满屏期间的四角全被忽略了，手上没有一份能用的
+          // 几何。置回"等四角"的状态就够了：下一份跟踪四角一到自然贴回（走 blend 那段
+          // 过渡），照片已经不在画面里时则由放手那一支退回 70% 平铺续播。
+          exitFlat()
+          st.blendStart = 0
+          st.filter.reset()
+          tip(st.hitTip || TIPS.flow_lost, { hit: Boolean(st.hitTip) })
+          setPrimary(ctl.sound)
+          return
+        }
         st.flat = true
         st.flatFull = true
         // 平铺期间**必须关掉原生 loop**，理由见 `onWorkerMessage` 里放手那一支。
         dom.clip.loop = false
         st.quad = null
+        st.blendStart = 0
         st.filter.reset()
+        syncFullLabel()
         tip(TIPS.flat_full)
         setPrimary(rescan)
       },
     })
     rescan.hidden = true
     ctl.hidden = true
+    /**
+     * 「全屏」按钮的标签。**只能由 `st.flatFull` 派生**，不在 click 里自己改 —— 满屏会被
+     * 三条与这个按钮无关的路撤掉（重新扫描、换了一张照片、平铺播完退出锁定），
+     * 每条都自己改一次标签的话，总有一条会漏（声音按钮就是这么错过一次的，见上面）。
+     */
+    const syncFullLabel = () => {
+      ctl.full.querySelector('span').textContent = st.flatFull ? '退出全屏' : '全屏'
+    }
+    /**
+     * 退出平铺（不管是 70% 还是满屏）：回到"贴合"那套状态。
+     *
+     * 四处调用（贴回去、换照片、重新扫描、退出满屏）每一处都要连着做这三件事，而漏掉
+     * `loop` 那一件的后果是最难查的：平铺播完靠 `ended` 退出锁定，而带着 `loop` 的元素
+     * 在直连回退路径上永远不会发 `ended`。
+     */
+    function exitFlat() {
+      st.flat = false
+      st.flatFull = false
+      // 平铺时关掉的原生 loop 要还回去 —— 贴合状态下播完要接着放（见 onVideoEnded）。
+      dom.clip.loop = true
+      syncFullLabel()
+    }
     /**
      * 开/关相机。**这个按钮同时是权限重试的入口** —— 权限弹窗被划掉、或相机被
      * 别的 App 占着时，原来唯一的出路是刷新整页（引擎白重载一遍）。现在关掉再开
@@ -399,9 +438,9 @@ export default {
       ctl.hidden = true
       st.lastEvidenceAt = performance.now(); st.lastReason = ''
       st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
-      st.flat = false; st.flatFull = false; st.blendStart = 0; st.hitTip = ''
-      // 平铺时关掉的原生 loop 要还回去 —— 下一段视频是从贴合开始的。
-      dom.clip.loop = true
+      // 下一段视频是从贴合开始的，所以平铺（含满屏）连带那个按钮的标签一起撤掉。
+      exitFlat()
+      st.blendStart = 0; st.hitTip = ''
       setPrimary(null)
       tip(guideTip({}).text)
     }
@@ -426,6 +465,8 @@ export default {
       st.loadStage = s.stage
       // -1 = 不定长（走扫描动画）。**不给不定长的阶段编一个假百分比** —— 编出来的数字
       // 会让用户对剩余时间形成一个必然错误的预期。理由与 ui.js 的 loading() 同一条。
+      // `label` 是这条金条的 `aria-label`：**必须换**，不换的话读屏会在播视频时
+      // 一直念「加载识别引擎 40%」（那是引擎加载时留在上面的那句）。
       const bar = (pct, label) =>
         ctx.progress?.(typeof pct === 'number' ? pct * 100 : -1, { label })
 
@@ -450,10 +491,13 @@ export default {
         // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
         tip(`认出了 ${title}，但${esc(s.text)}。`, { hit: true })
       } else if (changed) {
-        tip(`认出了 <b>${title}</b>，${stageText(s.stage, s) || '正在加载…'}`, { hit: true })
-        bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
+        // **阶段名，不是 `stageText`。** 后者在下载那一档给的是数字（`0.0 / 8.1 MB`），
+        // 而那串数字此刻已经在下面那行小字里了（`st.loadNote`）—— 同一句显示两遍，
+        // 且 tip 上那句读起来不知道在干什么。上面那张表说的就是这条分工。
+        tip(`认出了 <b>${title}</b>，${stageName(s.stage) || '正在加载…'}…`, { hit: true })
+        bar(s.pct, stageName(s.stage) || '加载视频')
       } else {
-        bar(s.pct, STAGE_LABEL[s.stage] ?? '加载视频')
+        bar(s.pct, stageName(s.stage) || '加载视频')
       }
       // 终局（不管是不是这一秒里最新的一条）必须立刻可见：往后不会再有下一条把它盖住。
       meta(terminal)
@@ -474,16 +518,28 @@ export default {
       // 管理员填的自由文本，一个 `<` 就会把后面的标签吃掉。
       const title = photo?.title ? `「${esc(photo.title)}」` : '这张照片'
       if (!photo?.mediaUrl) {
-        // **这一支也要退出平铺。** 锁定的已经是另一张（没视频的）照片了，而平铺画的是
-        // 上一段视频 —— 不清的话它继续在屏幕中央放，`hitTip` 还会在下一次四角到达时
-        // 被放回 HUD（说的是上一张的标题）。
-        st.flat = false
-        st.flatFull = false
+        // **这一支要把上一段视频整个撤掉，不只是退出平铺。** 锁定的已经是另一张（没视频的）
+        // 照片了，而上一段视频还在元素里：清了平铺却不撤视频的话，新照片的四角一到，
+        // 渲染循环的贴合分支就把**旧视频**贴到新照片上继续播（那条分支只看几何与
+        // `readyState`，不查 mediaUrl）—— 表现是"这张照片配的是别人的视频"。
+        // 所以照 `resetLock()` 里那几行来，顺序也一样：先掐流再动元素。
+        exitFlat()
         st.blendStart = 0
         st.hitTip = ''
-        dom.clip.loop = true
+        st.stopLoad?.()
+        st.stopLoad = null
+        st.loadStage = null
+        st.loadNote = null
+        ctx.progress?.(null, { hide: true })
+        dom.clip.pause()
+        dom.clip.removeAttribute('src')
+        delete dom.clip.dataset.photo
+        dom.clip.load()
+        ctl.hidden = true
         diagAlways(`命中 ${photo?.id?.slice(0, 8)} 但没有 mediaUrl（这张没配视频）`)
         tip(`认出了 ${title}，但它还没有配视频。`, { hit: true })
+        // 声音/全屏刚被收起来了（没视频可放），这一屏能做的只剩「重新扫描」。
+        setPrimary(rescan)
         meta(true)
         return
       }
@@ -492,11 +548,9 @@ export default {
         return
       }
       // 换了一张照片：上一段的平铺状态跟这一段无关（新视频要从贴合开始）。
-      st.flat = false
-      st.flatFull = false
+      exitFlat()
       st.blendStart = 0
       st.hitTip = ''
-      dom.clip.loop = true
       dom.clip.dataset.photo = photo.id
       diagAlways(`命中 ${photo.id?.slice(0, 8)} 内点=${m.inliers} aspect=${photo.aspect ?? 'null'} → 取媒体信息`)
       dom.clip.muted = true
@@ -549,15 +603,30 @@ export default {
       // 命中就加载视频，与这一帧四角合不合格**无关**（命中那一帧算不出四角是常态）。
       if (m.fresh) onHit(m).catch((e) => diagAlways(`onHit 失败 ${e.message}`))
 
-      if (m.quad && plausible(m.quad)) {
+      /**
+       * 满屏平铺期间**这一帧的几何整个扔掉** —— 连 `st.quad` 都不写。
+       *
+       * 满屏是用户显式要的，所以只能显式退出（再点一次「全屏」/「重新扫描」/ 视频播完，
+       * 见 `onFullscreen` 那条裁决）。而 pipeline 在满屏期间照样是 LOCKED、照样每几十
+       * 毫秒送回一份合格四角：一写进 `st.quad`，渲染循环下一帧就优先拿它去贴合（那是
+       * `quadToDraw` 三个来源里的第一个），下面那支「从平铺贴回去」还会顺手把
+       * `flat/flatFull` 清零 —— 满屏当场被撤销，按钮形同不存在。这就是上一版的 bug。
+       *
+       * 代价是满屏期间 `paceArgs().locked` 恒为 false（`st.quad` 一直是空的），送帧
+       * 节奏回到"找照片"那一档满速。**可接受**：满屏时贴合已经不重要了，而满速扫描
+       * 意味着退出满屏后能最快拿到第一份四角贴回去。
+       */
+      if (st.flatFull) {
+        // 什么都不做，见上面。
+      } else if (m.quad && plausible(m.quad)) {
         if (st.flat) {
           // 从平铺贴回去：起点是当前平铺矩形，4 步 200ms 走到跟踪四角（像素风只用 steps）。
           // `plausible` 挡的是"还没画过一帧平铺"（`flatQuad` 还是零）—— 从一个退化的
           // 四边形插过去会有 200ms 的怪形状，那种情况下直接贴上更好。
           if (plausible(st.flatQuad)) { st.blendFrom.set(st.flatQuad); st.blendStart = performance.now() }
-          st.flat = false; st.flatFull = false
           // 贴回照片上了 → 循环恢复（贴合状态下播完要接着放，见 onVideoEnded）。
-          dom.clip.loop = true
+          // 这里只会是 70% 平铺 —— 满屏那一档在上面就被挡掉了，走不到这儿。
+          exitFlat()
           setPrimary(ctl.sound)
           // 把起播那一句放回去：视频已经贴回照片上了，HUD 不能还写着"跟丢了"。
           if (st.hitTip) tip(st.hitTip, { hit: true })
@@ -755,7 +824,11 @@ export default {
         const photoAspect = st.lockedPhoto.aspect > 0 ? st.lockedPhoto.aspect : 1.5
         quadToDraw = flatQuadImage(photoAspect, vw / vh, canvasAspect, st.flatFull ? 1.0 : FLAT_WIDTH, st.flatQuad)
       }
-      if (quadToDraw) {
+      // `st.lockedPhoto?.mediaUrl` 是**这一页唯一挡住"把旧视频贴到新照片上"的地方**：
+      // 平铺那一支自己查过，贴合这一支不查 —— 它只看几何与 `readyState`，而元素里那段
+      // 视频属于谁它无从得知。锁到一张没配视频的照片时（见 onHit 那一支）四角照样会来，
+      // 于是上一段视频会被贴上去继续播。onHit 那边已经把元素撤了，这里是第二道。
+      if (quadToDraw && st.lockedPhoto?.mediaUrl) {
         const ndc = imageToNdc(quadToDraw, vw / vh, canvasAspect, st.ndc)
         const hm = unitSquareH(ndc, st.hm)
         if (hm) {

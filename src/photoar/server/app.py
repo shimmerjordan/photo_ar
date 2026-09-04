@@ -37,8 +37,8 @@ from .. import backend as backend_mod
 from .. import sheet as sheet_mod
 from .. import streak, verify, xfeat
 from ..nullvocab import NullVocab
+from ..scannability import stars
 from ..sheet import SheetError
-from photoar.scannability import stars
 from . import (
     batch,
     framedump,

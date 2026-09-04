@@ -128,8 +128,9 @@ def test_channel_order_is_rgb():
 def test_canvas_size_matches_prepare(h, w, nh, nw):
     """`canvas_size` 必须与 `prepare` 真的算出来的有效区一致。
 
-    两者分开之后，服务端收下相机帧后的预处理拿 `canvas_size` 去判「关键点有没有落在
-    补边区」—— 它算错的话，那道检查会去挡合法请求，或者放过一个补边全错的客户端。
+    这是那个函数单独存在的**唯一理由**（端上提特征那条路已下线，见 decisions §53，
+    所以现在只剩服务端这一份实现）：公式一旦与 `prepare` 走散，关键点坐标会整体平移，
+    而那不会报错 —— 只表现为识别率莫名偏低。这条测试是它唯一的哨兵。
     """
     assert xfeat.canvas_size(h, w) == (nh, nw)
     _, size = xfeat.prepare(block_image(h, w))

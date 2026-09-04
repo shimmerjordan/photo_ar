@@ -142,6 +142,7 @@ export default {
       busy = true
       runBtn.disabled = true
       cancelBtn.hidden = false
+      cancelBtn.disabled = false
       ctl = new AbortController()
       log.innerHTML = ''
       const t0 = Date.now()
@@ -209,6 +210,11 @@ export default {
         const videoUp = videoFile ? await upOne(videoFile, '视频') : null
 
         phase = 'ingest'
+        // **入库这一步取消不了**：`ctl.signal` 只接上传那一段（见 `api.upload`），
+        // 特征提取已经在服务端跑起来了，abort 掉这条连接不会让它停下。按钮留着但压灰 ——
+        // 一个点了没反应的「取消」比没有按钮更糟（用户会以为整页卡死了，见 Android 那边
+        // 同一条教训），而收起来又会让人以为"刚才那个取消去哪了"。
+        cancelBtn.disabled = true
         say('入库并建立映射…（要跑特征提取，可能几十秒）')
         const widthMm = PRINT_SIZES.find((s) => s.key === sizeKey)?.widthMm ?? 0
         const payload = {
@@ -264,6 +270,7 @@ export default {
       } finally {
         clearInterval(tick)
         cancelBtn.hidden = true
+        cancelBtn.disabled = false
         if (alive) {
           busy = false
           runBtn.disabled = !photoFile

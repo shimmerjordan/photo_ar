@@ -12,7 +12,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { extFromContentType, safeFileName } from '../public/download.js'
-import { Stage, stagePct, stageText } from '../public/mediaload.js'
+import { Stage, stageName, stagePct, stageText } from '../public/mediaload.js'
 
 describe('extFromContentType', () => {
   test('认得出入库允许的那几种图片', () => {
@@ -107,6 +107,28 @@ describe('stageText', () => {
   test('每个非播放阶段都有一句能读的话', () => {
     for (const s of [Stage.INFO, Stage.TICKET, Stage.BUFFER]) {
       assert.ok(stageText(s).length > 2, `${s} 没有文案`)
+    }
+  })
+})
+
+describe('stageName', () => {
+  test('每个非播放阶段都有名字', () => {
+    for (const s of [Stage.INFO, Stage.TICKET, Stage.DOWNLOAD, Stage.BUFFER]) {
+      assert.ok(stageName(s).length > 2, `${s} 没有阶段名`)
+    }
+  })
+
+  test('下载档：名字与数字是两句不同的话', () => {
+    // 这条分工是三个页面各踩过一次的坑：只显示 `stageText`（`3.2 / 8.1 MB`）读不出
+    // 这是在下载视频（宾客页），而名字与数字两处都写 `stageText` 会把同一句显示两遍
+    // （试播页）。所以名字必须与数字**不相等**，两者拼起来才是一行完整的话。
+    assert.equal(stageName(Stage.DOWNLOAD), '正在下载视频')
+    assert.notEqual(stageName(Stage.DOWNLOAD), stageText(Stage.DOWNLOAD, { loaded: 1, total: 2 }))
+  })
+
+  test('播放与终局没有阶段名 —— 那几档的话由页面自己说', () => {
+    for (const s of [Stage.PLAYING, Stage.UNAVAILABLE, Stage.ERROR]) {
+      assert.equal(stageName(s), '', `${s} 不该有阶段名`)
     }
   })
 })

@@ -13,8 +13,8 @@ own NAS. No cloud service, no third-party recognition API. Who may see which
 photos is configured in the built-in web admin panel.
 
 **Recognition and fitting run entirely in the browser; the server is not in the
-hot path.** The page downloads the recognition library once (about 1 KB per
-authorised photo); after
+hot path.** The page downloads the recognition library once (about 12 KB per
+authorised photo, ~120 MB for 10,000); after
 that every frame — feature extraction, matching, homography, fitting — is local.
 The server does three things: index resources, transport (the library and the
 videos), and manage (users / grants / config).

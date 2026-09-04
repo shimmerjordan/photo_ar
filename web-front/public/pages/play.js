@@ -13,7 +13,7 @@
  * 报得对不对。链路本身为什么要绕成这样，写在 `mp4stream.js` 顶部那张表里。
  */
 import { MEDIA_ERR, NETWORK_STATE, READY_STATE } from '../diag.js'
-import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
+import { Stage, loadPhotoVideo, stageName } from '../mediaload.js'
 import { bytes, duration, failed, h, row, section, setBar } from '../ui.js'
 
 export default {
@@ -81,8 +81,11 @@ export default {
           errBox.textContent = s.text
           return
         }
-        stageLine.textContent = stageText(s.stage, s) || '正在加载…'
-        detail.textContent = s.text
+        // **两行不能是同一句。** `s.text` 就是 `stageText(s.stage, s)`（见 mediaload 的
+        // `say`），两处都写它的话「正在取视频信息…」会上下显示两遍。名字归 stageLine，
+        // 数字归 detail —— 而只有下载那一档有数字（`3.2 / 8.1 MB`、`本机已有，秒开`）。
+        stageLine.textContent = stageName(s.stage) || '正在加载…'
+        detail.textContent = s.stage === Stage.DOWNLOAD ? s.text : ''
         setBar(bar, s.pct)
       },
     })

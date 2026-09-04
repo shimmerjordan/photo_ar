@@ -20,7 +20,7 @@
  */
 import * as api from '../api.js'
 import { savePhotoImage, savePhotoVideo } from '../download.js'
-import { Stage, loadPhotoVideo, stageText } from '../mediaload.js'
+import { Stage, loadPhotoVideo, stageName } from '../mediaload.js'
 import { cachedThumbUrl } from '../prefetch.js'
 import { button, failed, framed, h, loading, section, setBar } from '../ui.js'
 
@@ -99,7 +99,10 @@ export default {
               stageLine.textContent = `视频播不了：${s.text}`
               vbar.hidden = true
             } else {
-              stageLine.textContent = stageText(s.stage, s) || '正在加载…'
+              // 这一页只有一行，所以名字与数字要拼成一句完整的话：
+              // 光有数字（`3.2 / 8.1 MB`）读不出这是在下载视频，而那正是宾客最想知道的。
+              const name = stageName(s.stage) || '正在加载…'
+              stageLine.textContent = s.stage === Stage.DOWNLOAD ? `${name} ${s.text}` : name
               setBar(vbar, s.pct)
             }
           },
