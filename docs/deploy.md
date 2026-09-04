@@ -46,27 +46,42 @@ curl -fsSL $R/.env.example -o .env
 curl -fsSL $R/tools/batch_ingest.py -o tools/batch_ingest.py    # 第 5 步用
 ```
 
-改两处：
+改两处：`.env` 里的 `PHOTOAR_ROOTS`，和 `docker-compose.yml` 里的 `volumes`。要批量入库再给 `.env` 加一行 `PHOTOAR_TOKEN=$(openssl rand -hex 24)`。
 
-**`.env`** —— 只有 `PHOTOAR_ROOTS` 必须看一眼，写的是**容器内**路径：
+### PHOTOAR_ROOTS 怎么填
+
+白名单根目录 —— 服务只允许访问这些目录以下的文件。要动的是**成对的三处**，而它们必须互相对得上：
 
 ```
-PHOTOAR_ROOTS=照片=/share/Photo,视频=/share/Video,网盘=/share/CloudDrive
+volumes 冒号左边    宿主机上的真实路径
+volumes 冒号右边    容器内的路径   ┐ 这两个写成**一模一样**
+PHOTOAR_ROOTS       容器内的路径   ┘
 ```
 
-要批量入库再加 `PHOTOAR_TOKEN=$(openssl rand -hex 24)`。
-
-**`docker-compose.yml`** —— 把 `volumes` 改成自己的共享文件夹，**冒号两边写成一样**：
+一样是刻意的：入库时填的那个路径，在宿主机、在容器里、在白名单里是同一个字符串，不用在脑子里换算。素材全在 `/share/Study/media_bed/photo-ar` 下面时（推荐分四个子目录）：
 
 ```yaml
-- /share/Photo:/share/Photo:ro        # 左宿主机，右容器内
+environment:
+  PHOTOAR_ROOTS: photos=/share/Study/media_bed/photo-ar/photos,videos=/share/Study/media_bed/photo-ar/videos
+  PHOTOAR_UPLOAD_DIR: /share/Study/media_bed/photo-ar/inbox
+volumes:
+  - /share/Study/media_bed/photo-ar/data:/data                                        # 库，可写
+  - /share/Study/media_bed/photo-ar/photos:/share/Study/media_bed/photo-ar/photos:ro
+  - /share/Study/media_bed/photo-ar/videos:/share/Study/media_bed/photo-ar/videos:ro
+  - /share/Study/media_bed/photo-ar/inbox:/share/Study/media_bed/photo-ar/inbox        # 上传落地，可写
 ```
 
-一样是故意的：入库时填的路径在三个地方是同一个字符串，不用换算。改完让 `PHOTOAR_ROOTS` 与它们对得上。
+`/data` 是唯一一条左右不一样的：镜像里写死了 `PHOTOAR_DATA=/data`，让它保持默认最省事。
 
-> 三条**不报错**的失败方式，见 [docker-compose.yml](../docker-compose.yml) 顶部：`/data` 别落在 `PHOTOAR_ROOTS` 之内；上传目录必须在 `PHOTOAR_ROOTS` 之内且挂载可写；宿主机目录要先 `mkdir -p`（不建的话 dockerd 会以 root 建个空目录，然后服务真去索引它）。
+`照片=` 那半截是**显示标签**，不是变量名 —— 变量名是 `PHOTOAR_ROOTS` 本身。标签只用来在管理台的目录浏览器里区分哪个根是哪个，不参与任何路径解析。三种写法都行：`照片=/share/Photo,视频=/share/Video`（界面上显示中文）、`photos=/share/Photo,videos=/share/Video`（ASCII 标签）、`/share/Photo,/share/Video`（不给标签，自动取目录名）。中文标签能用（compose 里 `LANG: C.UTF-8` 那行就是为它设的），换来的只是界面上几个字，纯偏好。两个根撞名（`/a/Photo` 与 `/b/Photo` 都取 `Photo`）会**直接报错**而不是后者覆盖 —— 覆盖的后果是其中一个目录整体访问不到，而界面上只是少了一项。
 
-**算成**：`ls .env docker-compose.yml` 都在。
+**三条约束，每条都有一个不响的失败方式**：
+
+1. **`/data` 别落在 `PHOTOAR_ROOTS` 之内。** 落进去的话，服务自己的 SQLite 和索引会出现在管理台的目录浏览器里。不致命（列目录是只读的），但没有理由把它们摆在「选一张照片」的界面上 —— 所以上面那个例子把 ROOTS 指到 `photos/` 和 `videos/` 两个子目录，而不是整个 `photo-ar/`。
+2. **`PHOTOAR_UPLOAD_DIR` 必须在 `PHOTOAR_ROOTS` 之内，且那条挂载不能是 `:ro`。** 三种失败长得完全不一样，而只有第一种说了实话：不设 → 503 `upload_disabled`，明说「上传功能关闭」；设了但落在 ROOTS 之外 → **启动时不报错**，每次上传 403 `path_denied`（落地路径要再过一遍白名单，不信任配置里的前缀）；挂载写成 `:ro` → 前两关都过，写的时候才失败。不用上传功能就干脆留空，那是唯一会明说的那一种。
+3. **宿主机上的目录要先 `mkdir -p` 出来。** bind mount 的源不存在时，dockerd 会**以 root 身份建一个空目录**，一声不响 —— 然后服务真的去索引那个空目录，表现是「入库一张都找不到」。
+
+**算成**：`ls .env docker-compose.yml` 都在，且 `PHOTOAR_ROOTS` 与 `volumes` 冒号右边逐字相同。
 
 ## 3. 起服务
 

@@ -4,6 +4,7 @@
 
 | 症状 | 多半是 | 去哪 |
 |---|---|---|
+| 相机打不开 / 连权限弹窗都不出 | 地址不是安全上下文，或 iOS 微信内置浏览器 | [↓](#安全上下文) |
 | `pull` 报 `denied` / `unauthorized` | GHCR 包默认 private | [↓](#pull-报-denied--unauthorized) |
 | 硬编回退成了 `libx264` | 核显没透进容器 | [↓](#硬编回退成了-libx264) |
 | 入库被拒（4xx） | 照片本身或路径 | [↓](#入库被拒了) |
@@ -25,6 +26,24 @@
 | 手机上所有通道都 401 | token 不一致 | 改了 `.env` 并重启了容器，但手机里还是旧的 |
 
 ---
+
+## 安全上下文
+
+相机（`getUserMedia`）**只在安全上下文里存在**。这是浏览器规范，不是权限设置，没有工程绕法：
+
+| 地址 | 相机 |
+|---|---|
+| `https://` 任意域名（公网、隧道、反代，都算） | ✅ |
+| `http://localhost` / `http://127.0.0.1` | ✅（只有本机；手机上可以用 `adb reverse` 造出来） |
+| `http://192.168.x.x:8964`（局域网 IP） | ❌ |
+| `http://100.x.x.x:8964`（Tailscale） | ❌ |
+| `http://<公网 IP>:8964` | ❌ |
+
+所以**广域网 https 是最标准的那一档**：宾客扫码打开 `https://...` 一切正常，手机上什么都不用装。真正不能用的只有「局域网 http 直连」这一条 —— 而它恰好最容易误导人，症状看起来像相机权限没给。
+
+⚠️ **iOS 的微信 / QQ 内置浏览器即使在 https 下也开不了相机。** Apple 只给 Safari 本体开放 WebRTC，第三方 App 的 WKWebView 没有；微信官方明确表示内页 WebRTC「暂无计划」。`web-front/public/camera.js` 会检测 UA 并直接说这句话 —— 只能引导用户「点右上角 ··· → 在浏览器中打开」。
+
+自测时怎么造出一个安全上下文，见下面[局域网里自测](#局域网里自测没有隧道也没有真证书)。
 
 ## `pull` 报 `denied` / `unauthorized`
 
@@ -147,7 +166,10 @@ adb reverse tcp:8964 tcp:8964      # 手机上的 8964 转到这台机器
 
 `localhost` 按规范就是安全上下文，相机能开，也没有 TLS 那层要绕。
 
-要给别人用就得自签证书（`gen-dev-cert.sh` 会把本机所有 IPv4 和 tailnet 域名写进 SAN —— 少了 SAN 现代浏览器连「继续访问」都不给）：
+要给别人用就得有证书，两条路，**优先第一条**：
+
+1. **Tailscale 真证书**（无警告，iOS 上尤其省事）：先在 Tailscale 后台 DNS 页面打开 **HTTPS Certificates**，再 `tailscale cert <机器>.<tailnet>.ts.net`。必须用 MagicDNS 主机名 —— 公共 CA 不给 `100.x` 的 IP 签证书。
+2. **自签**（`gen-dev-cert.sh` 会把本机所有 IPv4 和 tailnet 域名写进 SAN —— 少了 SAN 现代浏览器连「继续访问」都不给）：
 
 ```bash
 cd web-front && ./tools/gen-dev-cert.sh
