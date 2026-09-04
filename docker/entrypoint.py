@@ -134,7 +134,7 @@ def _model_source() -> tuple[str | None, str]:
     """
     url = (os.environ.get("PHOTOAR_MODEL_URL") or "").strip()
     if url:
-        return url, f"取 XFeat 模型（PHOTOAR_MODEL_URL）→"
+        return url, "取 XFeat 模型（PHOTOAR_MODEL_URL）→"
     if BUNDLED_MODEL.is_file():
         return BUNDLED_MODEL.as_uri(), "安装镜像内置的 XFeat 模型 →"
     return None, "取 XFeat 模型 →"
@@ -186,7 +186,7 @@ def _summary(cfg, layout: "Layout") -> str:
         f"[entrypoint]   后端监听    {layout.backend_desc}",
         f"[entrypoint]   数据目录    {cfg.data_dir}",
         f"[entrypoint]   模型/词表   {cfg.model_dir}",
-        f"[entrypoint]   白名单根    "
+        "[entrypoint]   白名单根    "
         + ("、".join(f"{k}={v}" for k, v in cfg.roots.items()) or "（空）"),
         f"[entrypoint]   上传落地    {cfg.upload_dir_root or '（关闭）'}",
         f"[entrypoint]   识别后端    "

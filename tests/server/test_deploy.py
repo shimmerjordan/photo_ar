@@ -19,7 +19,6 @@ from photoar import backend as backend_mod
 from photoar import synth
 from photoar.nullvocab import NullVocab
 from photoar.server import app
-from photoar.server.config import ServerConfig
 
 from .conftest import ADMIN_NAME, ADMIN_PASSWORD, TOKEN
 

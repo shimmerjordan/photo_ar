@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 from photoar import corpus as C
-from photoar import features as F
 from photoar import synth
 from photoar import vocab as V
 from photoar.corpus import (
@@ -17,7 +16,7 @@ from photoar.corpus import (
     select_holdout,
     write_holdout,
 )
-from photoar.descstore import DescStore, DescStoreWriter
+from photoar.descstore import DescStore
 from photoar.index import InvertedIndexBuilder
 
 

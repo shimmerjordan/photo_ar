@@ -233,7 +233,7 @@ def _fine_sweep(
 
     log(f"\n[scan] RATIO={RATIO} 上按 1 细扫（可行窗口 MIN_INLIERS ∈ [{lo}, {hi}]，"
         f"宽 {hi - lo + 1} 档）：")
-    log(f"[scan]  MIN | 真实误识别(条) | 库内命中    漏检 | 库外总误识")
+    log("[scan]  MIN | 真实误识别(条) | 库内命中    漏检 | 库外总误识")
     for mi in range(max(1, lo - 4), min(200, hi + 3) + 1):
         p, n_g = at(mi)
         edge = ""

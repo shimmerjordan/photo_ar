@@ -129,7 +129,7 @@ docker pull {first}
 > `docker compose pull` 会报 `denied`。仓库右侧 Packages → photo-ar-server →
 > Package settings → Change visibility 改成 public（或者在 NAS 上 `docker login ghcr.io`）。
 """
-    return f"""### 1 · 拿镜像
+    return """### 1 · 拿镜像
 
 **这次没有推镜像。** 它编出来了、也跑通了，但只存在于这台 runner 上，run 结束就没了 ——
 因为这次跑的时候 **publish 没勾**。

@@ -49,3 +49,13 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["bench/logs", "web-front", ".venv", "src/photoar.egg-info"]
+
+[tool.ruff.lint]
+# 默认 E/F 加 W；不开风格类规则（这个仓库的注释密度与行宽是刻意的）。
+select = ["E", "F", "W"]
+ignore = ["E501"]   # 行宽由 line-length 控，注释里的长 URL 与表格不折

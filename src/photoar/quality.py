@@ -454,7 +454,7 @@ _MAX_BUILD_PASSES = 4
 
 
 def _unusable_paths(stderr: str) -> set[str]:
-    """从**原始 stderr** 里挑出"关键点不够"的那些图片路径。
+    r"""从**原始 stderr** 里挑出"关键点不够"的那些图片路径。
 
     格式是每行 `<绝对路径>: Failed to get enough keypoints from target image.`。
 

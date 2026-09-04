@@ -231,7 +231,7 @@ def main() -> int:
         comps = len(dedup.cluster(prs, n))
         greedy = len(dedup.select_keep(prs, kept_paths, n))
         contrast[crit_name] = (comps, greedy)
-    log(f"[dedup] 对照（剔除张数，判据 x 选择算法）：")
+    log("[dedup] 对照（剔除张数，判据 x 选择算法）：")
     for crit_name, (comps, greedy) in contrast.items():
         log(f"[dedup]   {crit_name:>10}（{len(floor_pairs) if crit_name == '绝对阈值' else len(dup_pairs)} 对）"
             f"  连通分量留一 {n - comps}（{(n - comps) / n:.1%}）"

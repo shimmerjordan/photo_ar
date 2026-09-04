@@ -1,5 +1,3 @@
-import numpy as np
-
 from photoar import evaluate as E
 from photoar import synth
 from photoar.verify import Decision

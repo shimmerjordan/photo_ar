@@ -369,7 +369,7 @@ def _http_error(exc: urllib.error.HTTPError) -> WebDavError:
         )
     if code == 404:
         return WebDavError(
-            "webdav_not_found", f"WebDAV 上找不到这个路径（HTTP 404）。"
+            "webdav_not_found", "WebDAV 上找不到这个路径（HTTP 404）。"
         )
     if code in (405, 501):
         return WebDavError(

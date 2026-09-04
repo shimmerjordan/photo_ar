@@ -11,8 +11,6 @@ ambiguous，941 帧真机记录只命中 44 帧 —— 而那张历史表里只�
 import cv2
 import pytest
 
-from photoar.server import app
-
 
 @pytest.fixture
 def env(make_env):

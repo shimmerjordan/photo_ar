@@ -12,8 +12,6 @@ QNAP QTS 的 Container Station 也是 cgroup v1，也就是说**目标机器正�
 恰恰是"这个函数去读哪几个路径、怎么解析"，mock 掉解析就什么都没测。
 """
 
-from pathlib import Path
-
 import pytest
 
 from photoar import xfeat
