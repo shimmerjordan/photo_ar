@@ -161,182 +161,33 @@ def deploy() -> str:
     tag = TAGS[0] if (PUBLISHED and TAGS) else f"{IMAGE}:latest"
     return f"""### 2 · 起容器
 
-**一份自包含的 compose，不用 clone 仓库。** 这就是 NAS 上实际在跑的那份 ——
-把 `/share/Study/media_bed/photo-ar` 换成你自己的目录（**六处都要换**），其余照抄：
-
-```yaml
-services:
-  photo-ar-server:
-    image: {tag}
-    container_name: photo-ar-server
-    restart: unless-stopped
-    ports:
-      - "{PORT}:{PORT}"
-    environment:
-      PHOTOAR_ROOTS: photos=/share/Study/media_bed/photo-ar/photos,videos=/share/Study/media_bed/photo-ar/videos
-      PHOTOAR_UPLOAD_DIR: /share/Study/media_bed/photo-ar/inbox
-      LANG: C.UTF-8
-    volumes:
-      # 服务自己的库。**必须持久**，丢了要全库重新入库（每张约 5s）
-      - /share/Study/media_bed/photo-ar/data:/data
-      # 素材：只读，这个服务永远不改你的原始文件
-      - /share/Study/media_bed/photo-ar/photos:/share/Study/media_bed/photo-ar/photos:ro
-      - /share/Study/media_bed/photo-ar/videos:/share/Study/media_bed/photo-ar/videos:ro
-      # 上传落地：唯一可写的用户目录，且必须在 ROOTS 之内
-      - /share/Study/media_bed/photo-ar/inbox:/share/Study/media_bed/photo-ar/inbox
-    healthcheck:
-      test: ["CMD", "python", "/opt/photoar/docker/healthcheck.py"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-```
-
 ```bash
-mkdir -p /share/Study/media_bed/photo-ar/{{photos,videos,inbox,data}}   # 先建出来，见下
-docker compose up -d
-docker compose logs -f photo-ar-server
+docker run -d --name photo-ar-server -p {PORT}:{PORT} -e PHOTOAR_ROOTS=photos=/media/photos -e PHOTOAR_UPLOAD_DIR=/media/photos/_inbox -v /你的/照片:/media/photos -v photoar-data:/data {tag}
 ```
-
-登录用 **`admin` / `admin`**，进去会被强制改密（见下面「第一次登录」）。想跳过那一步
-就在 `environment:` 里加一行 `PHOTOAR_ADMIN_PASSWORD: 你的强口令`。
-
-必填与必须持久的只有两样，其余全部有能用的默认值（完整变量表在 {doc(".env.example")}；
-阈值、闸门、识别后端这些是**热配置**，在 `/admin` 里改，不用动这份文件）：
-
-| | 为什么 |
-|---|---|
-| `PHOTOAR_ROOTS` | 白名单根目录，**容器内**的路径。不给的话 entrypoint 直接拒绝启动 —— 症状是容器 2 秒就 unhealthy |
-| `/data` | 索引、SQLite、缩略图、转码产物。**必须是持久卷** |
-
-**四个不响的坑**，每个都真踩过：
-
-1. **宿主机目录要先 `mkdir -p`。** bind mount 的源不存在时 dockerd 会**以 root 建一个空目录**，
-   不报错 —— 然后服务真的去索引那个空目录，表现是"一张都认不出来"。
-2. **`/data` 别落在 `PHOTOAR_ROOTS` 之内**，否则服务自己的 SQLite 会出现在管理台的目录浏览器里。
-   上面把 ROOTS 指到 `photos/` 和 `videos/` 两个子目录而不是整个 `photo-ar/`，就是为了这个。
-3. **别设 `WEBFRONT_TLS_CERT/KEY`**，除非你知道自己在干什么。设了之后容器在 {PORT} 上说的是
-   TLS，而 Cloudflare Tunnel 的 ingress 若仍写 `http://` 会**502，且容器看起来完全健康**
-   （`docker ps` 绿的、日志干净、healthcheck 也过，因为它在容器内部探）。
-   走隧道时证书由 Cloudflare 提供，容器不需要再包一层。
-4. **有核显想走硬件转码**，再加 `devices: [/dev/dri:/dev/dri]`。不加会**静默**回退 libx264 ——
-   在 N5095 上慢一个量级，慢到会撞上隧道的 125 秒超时。
-
-**只想快速试一下**（不落盘配置）：
-
-```bash
-docker run -d --name photo-ar-server -p {PORT}:{PORT} \\
-  -e PHOTOAR_ROOTS=photos=/media/photos \\
-  -v /你的/照片:/media/photos:ro -v photoar-data:/data \\
-  {tag}
-```
+必填：`PHOTOAR_ROOTS`（容器内路径的白名单根目录）、`PHOTOAR_UPLOAD_DIR`（须在其内）、端口 `{PORT}`。登录 `admin`/`admin`，会被强制改密。
+完整 compose：{doc("docker-compose.yml", "docker-compose.yml")}；首次部署：{doc("docs/deploy.md")}。
 """
 
 
 def access() -> str:
     return f"""### 3 · 从哪访问
-
-**一个容器、一个端口，按 URI 分。** 容器里其实是两个进程（Node 在前发页面并反代、
-Python 在后跑识别与 API），后者绑在容器内的 `127.0.0.1:8965` 上，不 EXPOSE 也打不到。
-
 | URI | 谁用 |
 |---|---|
-| `http://<host>:{PORT}/` | 宾客扫照片的网页版 |
-| `http://<host>:{PORT}/admin` | 网页管理台：入库、绑视频、阈值、用户与授权 |
-| `http://<host>:{PORT}/v1/*` | 后端 API（`tools/batch_ingest.py` 打这里）。未登录 **401** |
-| `http://<host>:{PORT}/healthz` | 网页版自己的存活探测，不碰上游也不碰识别库 |
-| `http://<host>:{PORT}/api/config` | 确认线上跑的是哪一版：回的 JSON 里 `version` 字段 |
+| `http://<host>:{PORT}/` | 网页版 |
+| `http://<host>:{PORT}/admin` | 管理台 |
+| `http://<host>:{PORT}/v1/*` | 后端 API，未登录 **401** |
 
-**第一次登录**：默认是 **`admin` / `admin`**。
-
-管理台会**强制**你先改掉它才让进（服务端在 `/auth/login` 与 `/auth/me` 上都回一个
-`mustChangePassword`，前端见到就把界面锁成只剩改密表单）。
-
-⚠️ **但在你改掉之前，这个站等于没有口令** —— 那个默认值就印在公开源码里，而这里
-没挂 Cloudflare Access、登录也没有速率限制。所以**部署完立刻登录**，别放着过夜。
-更好的做法是一开始就设 `PHOTOAR_ADMIN_PASSWORD`，那样默认值根本不会被用到、
-也不会弹强制改密页。
-
-```bash
-curl -s http://<host>:{PORT}/api/config    # 顺手确认版本号是 {VERSION}
-```
-
-`PHOTOAR_ADMIN_PASSWORD` **只在库里一个 admin 都没有时**生效 —— 改过口令之后它不会
-把口令顶回去，忘了也不能靠改它找回（那时只能 `delete from user where name='admin'`
-再重启，让它重新引导）。
-
-#### ⚠️ 要给宾客用，前面必须有一层 https
-
-网页版要相机，而 `getUserMedia` **只在安全上下文里存在**：
-
-| | |
-|---|---|
-| `https://` 任意域名 | ✅ 公网、隧道、反代都算 |
-| `http://localhost` | ✅ 只有本机（手机上可以用 `adb reverse` 造出来） |
-| `http://192.168.x.x` | ❌ |
-| `http://100.x.x.x`（Tailscale） | ❌ |
-
-现成的 Cloudflare Tunnel 加一条 ingress 指到这个端口就够。**只用 `/admin` 和 `/v1`
-的话 http 直连没问题** —— 那两条不碰相机。
-
-而且真证书不是"体验优化"：**Chromium 对有证书错误的源整站禁用磁盘缓存**，自签之下
-每次进页面都要重下 4.87MB 的识别引擎（实测 16 秒 vs 1.6 秒）。手机自测用
-`WEBFRONT_TLS_CERT` / `WEBFRONT_TLS_KEY`（两个必须同时给，只给一个进程直接退出），
-优先用 `tailscale cert` 的真证书。
+相机要 https（`https://` 或 `http://localhost`），见 {doc("docs/faq.md", "faq.md")}；给宾客发链接前：{doc("docs/deploy.md#7-发给宾客")}。
 """
 
 
 def caveats() -> str:
-    verified = ""
-    if E2E_OK:
-        verified = f"""
-<details><summary><b>这一版被真的验过什么</b></summary>
+    return f"""### 几件要留意的
 
-镜像编出来之后被**当生产环境起了一遍**（非 root、`/data` 是 volume、healthcheck 用
-镜像自己带的那条），然后：
+* **GHCR 上的包默认 private**：拉之前先 `docker login ghcr.io`（或把 Package settings 改成 public）。
+* **要回滚**：`docker pull {IMAGE}:sha-xxxxxxx` —— 这个 tag 每次构建都有，精确对应一次提交。
 
-* 等到 healthcheck 变 `healthy`（不是 sleep 固定秒数 —— 用它就顺手验了那条命令是对的）
-* `/v1/ping` 未登录 → **401**（不是 200 也不是 500）
-* `/` → **200**：网页版那一半真的起来了，而且 `public/` 拷进了镜像
-* `/admin` → **200**：反代到后端那条路由是通的
-* `/healthz` → **200**
-* 登录 → 拿 token → 打 `/v1/ping`：路由表、鉴权链、SQLite 能写，三样一起过
-* 容器 `restart` 一次，原来的会话仍然有效 → `/data` 真的持久
-* 容器报出来的版本号确实是 `{VERSION}`（不然设置页那行是假的）
-
-覆盖不到的：入库全流程（特征、去重、转码）。那一整条的覆盖在单元测试里。
-
-</details>
-"""
-    return f"""### 镜像里**故意**没有的一样
-
-| 缺什么 | 后果 | 怎么给 |
-|---|---|---|
-| `vocab.npz` | 能起、能识别，但扫一扫读数显示**「无词表」**，走全量比对、慢 | 入完库再训（用的是你这批照片自己的描述子）：`docker compose exec photo-ar-server photoar-server build-vocab` |
-
-（xfeat.onnx **在**镜像里 —— 曾经要启动时下载，改成随镜像分发了；arcoreimg
-那条已下线安卓客户端的依赖链整个删了，见 {doc("docs/decisions.md", "decisions §46")}。）
-
-<details><summary><b>出问题时先看这三条</b></summary>
-
-* **一直 restarting** —— 先怀疑 `PHOTOAR_ROOTS` 没给或者路径写的是宿主机的。
-  QNAP 上还有一条：用 `/share/Photo` 这一层，**不要用 `ls -l` 出来的
-  `/share/CACHEDEV1_DATA/Photo`** —— 前者是符号链接，两者混用会 403。
-* **`/` 打不开但 `/v1` 正常** —— 网页版那一半的问题。退路是设 `PHOTOAR_WEB=0`：
-  `/` 变 404，管理台与 API 照常，**不用回滚镜像**。
-* **要回滚** —— `docker pull {IMAGE}:sha-xxxxxxx`，那个 tag 每次构建都有，精确对应一次提交。
-
-</details>
-{verified}
-### 更细的
-
-| | |
-|---|---|
-| 第一次部署照着走（带「看到什么算成」） | {doc("docs/deploy.md")} |
-| 取舍、实测数字、排障 | {doc("docs/deploy-details.md")} |
-| 例行维护命令、`/data` 里每个文件丢了会怎样 | {doc("deploy/README.md")} |
-| 全部环境变量 | {doc(".env.example")} |
-| 为什么两个进程一个端口 | {doc("docker/entrypoint.py")} 的模块 docstring |
+更多排障（隧道 502、latest 没更新、入库被拒……）：{doc("docs/faq.md")}。
 """
 
 
