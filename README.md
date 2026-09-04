@@ -154,4 +154,5 @@ Android, iOS and HarmonyOS; the full chain has been verified on an Android phone
 
 Not yet verified on the target hardware: the XFeat backend's latency on the N5095
 (measured 800 ms p50 under a 3-CPU budget on a faster machine — likely too slow
-there). It is off by default. See [docs/decisions.md](docs/decisions.md) §11.
+there). It is off by default. See the "已知风险与下一步必须做的测量" section of
+[docs/decisions.md](docs/decisions.md#11-已知风险与下一步必须做的测量).

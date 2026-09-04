@@ -1,6 +1,6 @@
 # vendor/
 
-一个第三方二进制：`opencv.js`。这里记清它是什么、为什么必须是它、以及换版本要重做哪一步。
+一组第三方产物：`opencv.js` / `opencv.wasm` 与各自的 `.br`。这里记清它是什么、为什么必须是它、以及换版本要重做哪一步。
 
 ## opencv.js
 
@@ -55,7 +55,7 @@ Harris 响应排序、8 层金字塔、intensity-centroid 方向、每层 7×7 �
 
 ### 体积：知道它重，也知道怎么减
 
-13.3MB 单文件（gzip 后约 3.5MB，brotli 约 2.8MB），因为 wasm 是 base64 内联的。
+13.3MB 单文件（gzip 后约 3.5MB，brotli 约 2.8MB —— 那是单文件原版的数；拆分后 wasm 为 2.43MB），因为 wasm 是 base64 内联的。
 浏览器只下一次（`Cache-Control: immutable` + Cache Storage），但首屏确实要等。
 
 两条能减的路，都**没有在这一版做**，理由是它们都要引入构建步骤，而现在这个仓库是

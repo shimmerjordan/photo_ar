@@ -26,7 +26,7 @@
 
 下面这张表的左列是**已下线的安卓客户端**里对应的那一屏。留着它不是为了兼容什么，
 是因为右两列那些"为什么这么设计"的理由多半是从那次对照里来的 —— 删掉左列，右边就成了
-一串没有出处的断言。（安卓客户端 2026-08-05 下线，见 `docs/decisions.md` §36。）
+一串没有出处的断言。（安卓客户端 2026-08-05 下线，见 [decisions.md 的「安卓客户端下线，前后端合成一个容器」](../docs/decisions.md#36-第-13-轮安卓客户端下线前后端合成一个容器)。）
 
 | 曾经的安卓页 | 这里 | 差别 |
 |---|---|---|
@@ -181,7 +181,7 @@ OffscreenCanvas（10.2ms）。改完：迟到帧 **0/3062**、渲染 p95 帧间�
 ### 单帧判定过不了门槛时要**跨帧累积**
 
 真机实测：内点中位 30、最大 38，而门槛 40 —— 96 次检测一次都没锁上，而照片确实被匹配
-上了（runner-up 个位数）。`recognize/streak.js` 与服务端 §35 同一套规则。
+上了（runner-up 个位数）。`recognize/streak.js` 与服务端的跨帧证据累积（`photoar.streak`）同一套规则。
 门槛恢复 40 后从"永不锁定"变成"锁上并稳定跟踪 82 秒"。
 
 ### 检测与跟踪必须分层
@@ -233,25 +233,11 @@ Python 的 `cv2 5.0.0` 与浏览器的 `opencv.js 5.0.0` 各提一次：
 
 ### ⚠️ 两条必须知道的限制
 
-1. **iOS 微信/QQ 内置浏览器打不开相机。** Apple 只给 Safari 本体开放 WebRTC，第三方 App
-   的 WKWebView 没有；微信官方明确表示内页 WebRTC「暂无计划」。这不是权限问题、也没有
-   工程绕法 —— 只能引导用户「点右上角 ··· → 在浏览器中打开」。`public/camera.js` 会
-   检测 UA 并直接说这句话。
-2. **必须 HTTPS —— 但这不是障碍，现有的 Cloudflare Tunnel 就是。**
-   `getUserMedia` 只在**安全上下文**里存在：
-
-   | 地址 | 相机 |
-   |---|---|
-   | `https://任意域名`（公网、隧道、反代，都算） | ✅ |
-   | `http://localhost` / `http://127.0.0.1` | ✅（仅开发） |
-   | `http://192.168.1.10:8964` | ❌ |
-   | `http://公网IP:8964` | ❌ |
-
-   也就是说**广域网 HTTPS 是最标准的那一档**，宾客扫码打开 `https://...` 一切正常，
-   手机上不装任何东西（前端零构建、wasm 是预编译的）。真正不能用的只有一条：
-   **局域网 http 直连** —— 而那恰好是 App 版最快的那条路，所以排查时很容易被它误导，
-   一直怀疑相机权限。
-
+1. **iOS 微信/QQ 内置浏览器打不开相机**（Apple 只给 Safari 本体开放 WebRTC）。
+   `public/camera.js` 会检测 UA 并直接说这句话。
+2. **必须 HTTPS —— 但这不是障碍，现有的 Cloudflare Tunnel 就是。** 相机只在安全上下文
+   里存在，地址对照表与这两条限制的完整说明都在
+   [docs/faq.md 的「安全上下文」](../docs/faq.md#安全上下文)。这里只补一句本地开发用得上的：
    要在现场也走局域网（省 CDN 流量，见下面「视频出口」）就得给局域网也配上真证书：
    真域名 + split-horizon DNS 解析到 NAS 内网 IP + Let's Encrypt。那是**优化**，
    不是让它能用的前提。
@@ -274,9 +260,8 @@ PHOTOAR_UPSTREAM=http://127.0.0.1:8964 PHOTOAR_LIBRARY=../data/library node serv
 
 上游填一个跑着的后端（本机容器就是 8964，那时这里要换个 PORT 免得撞）。
 
-⚠️ `http://127.0.0.1` 是安全上下文（localhost 例外），所以本机开发能开相机。换成
-**局域网 IP 的 http** 就不行 —— 但那不代表要 localhost 才能用：任何 **https** 地址
-（包括公网、隧道）都算安全上下文，见上面那张表。
+⚠️ `http://127.0.0.1` 能开相机（localhost 例外），换成**局域网 IP 的 http** 就不行；
+任何 **https** 地址都可以。判据见 [docs/faq.md 的「安全上下文」](../docs/faq.md#安全上下文)。
 
 ### 整套（容器）
 
@@ -286,8 +271,8 @@ cp .env.example .env     # 只有 PHOTOAR_ROOTS 必须看一眼
 docker compose up -d     # → 8964，一个端口
 ```
 
-一个端口按 URI 分：`/` 这一半、`/api/*` 这一半自己的端点、`/admin` 管理台（反代）、
-`/v1/*` API（反代）。识别库直接读容器里的 `${PHOTOAR_DATA}/library`。
+一个端口按 URI 分（哪条 URI 是什么见 [README](../README.zh-CN.md)）；`/` 与 `/api/*`
+由这一半自己处理，`/admin` 与 `/v1` 反代给后端。识别库直接读容器里的 `${PHOTOAR_DATA}/library`。
 
 ### 让宾客能用（这一步就够了）
 
@@ -324,7 +309,7 @@ docker compose up -d              # 配好 WEBFRONT_TLS_CERT/KEY 后（见根目
 | 场景 | 做法 |
 |---|---|
 | **iOS 自测**（Safari 对自签更严） | 去 Tailscale 后台 DNS 页面打开 **HTTPS Certificates**，然后 `tailscale cert <机器>.<tailnet>.ts.net` —— 那是 Let's Encrypt 真证书，无警告、不用装描述文件 |
-| **安卓自测**（想连证书都不要） | `adb reverse tcp:8964 tcp:8964`，手机上打开 `http://localhost:8964` —— localhost 按规范就是安全上下文，一个字节的证书都不用。比改 `chrome://flags` 干净 |
+| **安卓自测**（想连证书都不要） | `adb reverse tcp:8964 tcp:8964`，手机上打开 `http://localhost:8964` —— localhost 是例外，一个字节的证书都不用。比改 `chrome://flags` 干净 |
 
 ⚠️ 自签证书的 SAN **必须**带 IP/DNS，`tools/gen-dev-cert.sh` 已经处理了。少了 SAN 现代
 浏览器连「继续」都不给，只报 `ERR_CERT_COMMON_NAME_INVALID` —— 那看起来像证书生成失败，
@@ -616,7 +601,7 @@ sourcebuffer 错误）。所以 `transcode.py` 改成产 fMP4，存量文件由
 | **Tailscale**（自己和家里人） | 后台 DNS 页面打开 **HTTPS Certificates**（默认关），再 `tailscale cert <机器>.<tailnet>.ts.net` | **必须用 MagicDNS 主机名** —— 公共 CA 不给 `100.64.0.0/10` 这样的 IP 签证书 |
 
 自测又不想碰证书，就 `adb reverse tcp:8964 tcp:8964` 然后在手机上打开
-`http://localhost:8964` —— localhost 按规范就是安全上下文，相机能开、缓存正常、
+`http://localhost:8964` —— localhost 是例外，相机能开、缓存正常、
 一个字节的证书都不用。上面那些真机数字里"1.6 秒"那一列就是这么量的。
 
 ## 已知限制与还没做的事

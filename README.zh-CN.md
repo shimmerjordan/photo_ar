@@ -131,4 +131,4 @@ cd web-front && npm test                 # 网页版（零依赖，只用 node -
 工作，而它的识别与贴合质量已经够。
 
 还没在目标硬件上验证的：XFeat 后端在 N5095 上的延迟（在更快的机器上按 3 核预算实测
-p50 800ms，那台上大概太慢）。它默认关着。见 [docs/decisions.md](docs/decisions.md) §11。
+p50 800ms，那台上大概太慢）。它默认关着。见 [decisions.md 的「已知风险与下一步必须做的测量」](docs/decisions.md#11-已知风险与下一步必须做的测量)。

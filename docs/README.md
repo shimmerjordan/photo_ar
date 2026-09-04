@@ -7,7 +7,8 @@
 | 从零把它部署起来 | [deploy.md](deploy.md) —— 每步都带「看到什么算成」 |
 | 用管理台：建账号、授权、配视频、批量导入 | [usage.md](usage.md) |
 | 出问题了 | [faq.md](faq.md) —— 症状对照表 |
-| 我的照片不在 `/share/Photo`，compose 怎么改 | [../docker-compose.yml](../docker-compose.yml) 顶部「改成你自己的路径」 |
+| 我的照片不在 `/share/Photo`，compose 怎么改 | [deploy.md 第 2 步「PHOTOAR_ROOTS 怎么填」](deploy.md#photoar_roots-怎么填) |
+| 升级、回滚、备份 | [deploy.md 第 8 节](deploy.md#8-升级与回滚) |
 | 知道某个数字/限制是怎么来的 | [deploy-details.md](deploy-details.md) —— 取舍与实测基线 |
 | 搞清楚"为什么是这样设计的" | [decisions.md](decisions.md) —— 按时间排的决策日志 |
 | 手上有一次 CI 构建，想知道**这一版**怎么拉怎么起 | 那次 run 的页面（Actions → server），顶部就是 |
@@ -27,5 +28,6 @@
 
 ## 不在这里的
 
-- `§N` 引用的那份内部设计文档没有随仓库发布 —— 每处注释都把理由写在了旁边。
+- 代码注释里 `§N` 引用的那份内部设计文档没有随仓库发布 —— 每处注释都把理由写在了旁边。
+  **使用者文档里不出现 `§N`**：要么写成一句话结论，要么链到 `decisions.md` 的章节标题。
 - `docs/superpowers/` 是过程产物（spec / plan），在 `.gitignore` 里。
