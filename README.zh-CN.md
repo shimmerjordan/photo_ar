@@ -111,8 +111,9 @@ cd web-front && npm test                 # 网页版（零依赖，只用 node -
 网页版还有几套要真浏览器的：`npm run test:browser`（识别管线的黄金用例）、
 `npm run test:smoke` 与 `npm run test:pages`（对着一个跑着的容器点一遍每个页面）。
 
-发一版新镜像是个明确动作，不是推代码的副作用：**只能手动触发** —— Actions → server → Run workflow，
-填 `publish` / `version` / `latest` / `release` 四项。推代码或打 tag 都不会触发任何自动检查或发版。
+发一版新镜像是个明确动作，不是推代码的副作用：**发版只能手动触发** —— Actions → server → Run workflow，
+填 `publish` / `version` / `latest` / `release` 四项。推 main 或开 PR 会自动跑测试与 lint，**不会**发版；
+发版只能手动触发。
 
 读源码的一点提醒：注释里的 `§N` 指的是一份没有随仓库发布的内部设计文档。每处注释
 都把真正的理由写在了旁边，所以不看那份文档也不缺信息。

@@ -9,19 +9,9 @@
 # `/v1/*`（反代）。只打 `/v1` 的话，合并这件事本身一个字都没被验证到。
 #
 # ════════════════════════════════════════════════════════════════════════
-# 为什么是一条而不是两条
-#
-# 原来是 `server.yml`（每次推 main 跑测试 + 编镜像 + 起容器打接口）和
-# `publish-image.yml`（打 tag 时跑测试 + 编镜像 + 推 GHCR）两条。它们**都**跑一遍
-# 完整测试、**都**编一遍镜像 —— 发版时等于把同样的事做两遍。
-#
-# 但合并不只是省时间，它补上了一个真实的洞：`publish-image` 只 `docker build` 就
-# `docker push`，**推出去的镜像从来没被跑起来看过一眼**。而「编得出来」和「起得来
-# 并能对外服务」是两件事（非 root 写不了挂载进来的 /data、healthcheck 脚本路径对不上、
-# EXPOSE 的端口和实际监听的不一致 —— 三样都真实发生过）。症状是在 NAS 上
-# `docker compose up` 之后一直 restarting，而那时你第一反应不会是「镜像是坏的」。
-#
-# 合并后 publish 挂在 image 之后，所以推上去的那一版**必然**是被起来打过接口的。
+# 发版是明确动作：只有 workflow_dispatch 会构建并推镜像。
+# 推 main / 开 PR 自动跑 test、web、lint —— 不产出任何镜像。
+# vendor/ 下的 opencv 变动会额外跑一次浏览器 golden（换 OpenCV 版本 = 换特征空间）。
 #
 # ## 三层各守什么
 #
@@ -63,21 +53,6 @@
 
 name: server
 
-# **只手动触发**（2026-08-06 改）。
-#
-# 原来是 push main / push tag / PR 都跑。改成纯手动是用户的决定，代价要写清楚：
-#
-#   ⚠️ **推代码不再有任何自动检查。** 1150 个 Python 用例 + 152 个网页版用例 + 镜像
-#      构建 + 起容器打接口，现在一次都不会自动跑 —— 坏代码可以静静躺在 main 上，
-#      直到下次有人手动点一下才发现。
-#   ⚠️ **打 tag 不再自动发版。** `git tag v0.1.2 && git push` 什么也不会发生，
-#      发版一律走下面的手动入口（版本号在界面上填）。
-#
-# 想把自动跑测试加回来（**不编镜像**，十几分钟、不产出任何东西），加这一段就行：
-#     push:
-#       branches: [main]
-# 然后给 image job 加 `if: github.event_name == 'workflow_dispatch'`。
-# 那样推代码只跑 test/web 两个 job，发版仍然只能手动。
 on:
   workflow_dispatch:
     inputs:
@@ -100,6 +75,18 @@ on:
         description: "建 GitHub Release + git tag（需填版本号）"
         type: boolean
         default: false
+  push:
+    branches: [main]
+  pull_request:
+
+# 推代码只跑检查（test / web / lint），零产出；发版（image）只在手动触发时跑，见那个 job 的 if。
+permissions:
+  contents: read
+
+concurrency:
+  # 手动重复点两次 Run workflow 不该并行推同一组 tag；push 之间按 ref 排队。
+  group: server-${{ github.event_name }}-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
 
 env:
   # ghcr.io/<owner>/photo-ar-server。用 repository_owner 而不是写死用户名，
@@ -107,11 +94,20 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/photo-ar-server
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff && ruff check .
+
   test:
     runs-on: ubuntu-latest
     # 1000+ 个用例里有一批要跑真的 ORB + RANSAC，比纯逻辑测试慢；本机整套约 6 分钟，
     # runner 上约 10 分钟。
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -158,9 +154,36 @@ jobs:
         working-directory: web-front
         run: npm test
 
-  image:
+  golden:
+    # 换 OpenCV 版本 = 换特征空间。golden 一红说明全库 desc.bin 作废，这件事不能靠人记得。
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: [test, web]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - id: changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q '^web-front/public/vendor/'; then echo "yes=1" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.changed.outputs.yes == '1'
+        uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      # harness.js 不用 playwright（见它自己的 docstring）——它 spawn 的是系统的
+      # google-chrome，直接调 CDP。GH 的 ubuntu-latest runner 本来就带 google-chrome，
+      # 这里只是兜底：真的没有就装系统 Chromium，并通过 CHROME 环境变量告诉 harness。
+      - if: steps.changed.outputs.yes == '1'
+        run: |
+          command -v google-chrome >/dev/null && exit 0
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends chromium-browser
+          echo "CHROME=$(command -v chromium-browser)" >> "$GITHUB_ENV"
+      - if: steps.changed.outputs.yes == '1'
+        working-directory: web-front
+        run: npm run test:golden
+
+  image:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: [lint, test, web]
     timeout-minutes: 30
     permissions:
       # contents 要 write 是为了「建 Release」那一步（它顺带打 git tag）。
@@ -213,6 +236,13 @@ jobs:
           fi
           echo "value=$v" >> "$GITHUB_OUTPUT"
           echo "版本号 $v"
+          # `0.1.2` → `0.1`。metadata-action 的 `{{major}}.{{minor}}` 只认从 git ref
+          # 解析出来的 semver，而我们的版本号是界面上手输的，所以自己派生；没填版本号
+          # （`sha-` 前缀）时没有 major.minor 可言，不输出。
+          case "$v" in
+            sha-*) : ;;
+            *) echo "majmin=${v%.*}" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       # 只构建 linux/amd64。目标机器是 QNAP TS-464C2（Celeron N5095，x86-64）；
       # 加 arm64 会让构建时间翻倍（opencv 的 arm64 wheel 要走 QEMU 模拟），而现在没有
@@ -222,8 +252,8 @@ jobs:
       # 这样**推上去的就是被测过的那一个镜像**（分两次 build 的话，推的那一份严格来说
       # 没被跑过）。
       #
-      # 镜像里不含 arcoreimg 和 vocab.npz：前者不可再分发，后者是你自己照片训出来的
-      # 数据。两个都在运行时 bind mount 送进容器（见 docker-compose.yml）。
+      # 镜像里不含 vocab.npz（你自己照片训的数据，运行时 bind mount 送进容器，
+      # 见 docker-compose.yml）。
       - name: 编镜像
         id: build
         uses: docker/build-push-action@v6
@@ -238,18 +268,14 @@ jobs:
             PHOTOAR_VERSION=${{ steps.ver.outputs.value }}
           # 层缓存存在 Actions 的缓存里：不改依赖的话，opencv 那层不会重装。
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       # 把它当生产环境跑：非 root、/data 是 volume、healthcheck 由镜像自己带。
       #
       # 不设 PHOTOAR_TOKEN 是**刻意**的：`docker/healthcheck.py` 在没配 token 时把 401
       # 也算健康（理由在那个文件的 docstring 里），而这条路径正是默认部署走的那条 ——
       # 顺手把它验一遍。
-      - name: 起容器并打接口
-        id: e2e
-        env:
-          # 同上：不把 tag 名内联展开进脚本正文
-          WANT_VERSION: ${{ steps.ver.outputs.value }}
+      - name: 起容器
         run: |
           set -euo pipefail
           docker volume create photoar-ci-data
@@ -277,22 +303,16 @@ jobs:
 
           # 等 healthcheck 变 healthy，而不是 sleep 一个固定秒数：镜像自己带
           # HEALTHCHECK，用它就等于顺手验证了那条命令是对的。
-          for i in $(seq 1 60); do
-            st=$(docker inspect -f '{{.State.Health.Status}}' photoar-ci 2>/dev/null || echo starting)
-            echo "[$i] $st"
-            [ "$st" = "healthy" ] && break
-            if [ "$st" = "unhealthy" ] || [ "$i" = "60" ]; then
-              echo "::error::容器没能变 healthy"
-              docker logs photoar-ci
-              exit 1
-            fi
-            sleep 2
-          done
+          docker/wait-healthy.sh photoar-ci
 
+      - name: 打接口
+        id: login
+        run: |
+          set -euo pipefail
           # 未登录必须被拒（401），不是 200 也不是 500。
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/v1/ping)
           echo "未登录 /v1/ping -> $code"
-          [ "$code" = "401" ] || { echo "::error::未登录的请求本该 401"; docker logs photoar-ci; exit 1; }
+          [ "$code" = "401" ] || { echo "::error::未登录的请求本该 401"; exit 1; }
 
           # ---- 合并容器的三种 URI 都在同一个端口上 ----
           #
@@ -301,66 +321,67 @@ jobs:
           # 来说是完全不可用的（`/` 连不上），对运维却看不出问题（`/v1` 正常）。
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/)
           echo "网页版 / -> $code"
-          [ "$code" = "200" ] || { echo "::error::网页版没起来（/ 应当是 200）"; docker logs photoar-ci; exit 1; }
+          [ "$code" = "200" ] || { echo "::error::网页版没起来（/ 应当是 200）"; exit 1; }
 
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/admin)
           echo "管理台 /admin -> $code"
-          [ "$code" = "200" ] || { echo "::error::/admin 没被反代到后端"; docker logs photoar-ci; exit 1; }
+          [ "$code" = "200" ] || { echo "::error::/admin 没被反代到后端"; exit 1; }
 
           # 网页版自己的存活端点。它不碰上游也不碰识别库，所以它 200 而 `/` 500 的
           # 组合能把「进程活着但静态目录没拷进镜像」区分出来。
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8964/healthz)
           echo "存活探测 /healthz -> $code"
-          [ "$code" = "200" ] || { echo "::error::/healthz 不对"; docker logs photoar-ci; exit 1; }
-
-          # 版本号真的烧进去了吗。`/api/config` 不需要登录（访客也要拿阈值），所以这一句
-          # 也顺带证明了"确认线上是哪一版"那条 curl 是真能用的。
-          #
-          # 断言而不是只打印：漏掉 build-arg 的表现是设置页上写着 `x.y.z-dev`，
-          # 而那**看起来完全正常** —— 不比对就永远发现不了。（这一步加进来之前，
-          # CI 出的每一个镜像都是 -dev。）
-          curl -sf http://127.0.0.1:8964/api/config | tee /tmp/config.json
-          python3 -c "import json,os;g=json.load(open('/tmp/config.json'))['version'];w=os.environ['WANT_VERSION'];assert g==w,f'版本号没烧进镜像：容器说 {g}，应当是 {w}';print('版本号 ok:',g)"
+          [ "$code" = "200" ] || { echo "::error::/healthz 不对"; exit 1; }
 
           # 登录 → 拿 token → 打 ping。这三步串起来就覆盖了「路由表装上了、
-          # 鉴权链通了、SQLite 能写」。
+          # 鉴权链通了、SQLite 能写」；默认口令触发的强制改密门在服务端这一侧
+          # 靠 `mustChangePassword` 标记实现，登录本身不受它阻挡。
           tok=$(curl -s -X POST http://127.0.0.1:8964/v1/auth/login \
                   -H 'Content-Type: application/json' \
                   -d '{"name":"admin","password":"admin"}' \
                 | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
-          test -n "$tok" || { echo "::error::登录没拿到 token"; docker logs photoar-ci; exit 1; }
-          curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping | tee /tmp/ping.json
-          # 用 python3 -c 而不是 heredoc：YAML 的字面块会把整段一起缩进，于是结束标记
-          # `PY` 前面带着空格，bash 认不出来（`<<-` 只吃 tab 不吃空格），heredoc 永不
-          # 终止、这一步挂到超时。这个坑不会在本地 shell 里复现。
-          python3 -c "import json;d=json.load(open('/tmp/ping.json'));assert d['ok'] is True,d;assert d.get('backendDegraded') is not True,d;print('ping ok:',d)"
+          test -n "$tok" || { echo "::error::登录没拿到 token"; exit 1; }
+          echo "tok=$tok" >> "$GITHUB_OUTPUT"
 
-          # 重启一次，验证 /data 上的东西是持久的（登录还在、库还在）。
-          docker restart photoar-ci
-          for i in $(seq 1 60); do
-            st=$(docker inspect -f '{{.State.Health.Status}}' photoar-ci 2>/dev/null || echo starting)
-            [ "$st" = "healthy" ] && break
-            [ "$i" = "60" ] && { echo "::error::重启后没能变 healthy"; docker logs photoar-ci; exit 1; }
-            sleep 2
-          done
-          curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping >/dev/null \
-            || { echo "::error::重启之后原来的会话失效了 —— /data 没持久化"; exit 1; }
-          echo "重启后会话仍然有效，/data 持久化正常"
+          curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:8964/v1/ping \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);assert d['ok'] is True,d;assert d.get('backendDegraded') is not True,d;print('ping ok:',d)"
 
           # 「两个进程都活着」不用另外数进程去证：上面 `/` 是 200 就说明 Node 在，
           # 而这一句登录之后的 `/v1/ping` 是 200 就说明 Python 在（它走的是反代）。
           # 试过在这里数 /proc —— slim 镜像里没有 ps，按 /proc 数又会把检查命令自己的
           # cmdline 数进去（实测 5 而不是 2）。冗余的断言不如没有。
 
+      - name: 版本号
+        env:
+          # 同上：不把 tag 名内联展开进脚本正文
+          WANT_VERSION: ${{ steps.ver.outputs.value }}
+        run: |
+          set -euo pipefail
+          # 版本号真的烧进去了吗。`/api/config` 不需要登录（访客也要拿阈值），所以这一句
+          # 也顺带证明了"确认线上是哪一版"那条 curl 是真能用的。
+          #
+          # 断言而不是只打印：漏掉 build-arg 的表现是设置页上写着 `x.y.z-dev`，
+          # 而那**看起来完全正常** —— 不比对就永远发现不了。（这一步加进来之前，
+          # CI 出的每一个镜像都是 -dev。）
+          curl -sf http://127.0.0.1:8964/api/config \
+            | python3 -c "import json,os,sys;g=json.load(sys.stdin)['version'];w=os.environ['WANT_VERSION'];assert g==w,f'版本号没烧进镜像：容器说 {g}，应当是 {w}';print('版本号 ok:',g)"
+
+      - name: 重启验持久化
+        id: persist
+        env:
+          TOK: ${{ steps.login.outputs.tok }}
+        run: |
+          set -euo pipefail
+          # 重启一次，验证 /data 上的东西是持久的（登录还在、库还在）。
+          docker restart photoar-ci
+          docker/wait-healthy.sh photoar-ci
+          curl -sf -H "Authorization: Bearer $TOK" http://127.0.0.1:8964/v1/ping >/dev/null \
+            || { echo "::error::重启之后原来的会话失效了 —— /data 没持久化"; exit 1; }
+          echo "重启后会话仍然有效，/data 持久化正常"
+
       - name: 容器日志（失败时看这里）
         if: always()
         run: docker logs photoar-ci || true
-
-      - name: 收摊
-        if: always()
-        run: |
-          docker rm -f photoar-ci || true
-          docker volume rm photoar-ci-data || true
 
       # ---- 到这里镜像已经被起来打过接口了，才允许推出去 ----
 
@@ -372,19 +393,6 @@ jobs:
           username: ${{ github.actor }}
           # 仓库自带的 token 就够，不用另配 PAT
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # `0.1.2` → `0.1`。metadata-action 的 `{{major}}.{{minor}}` 只认从 git ref 解析
-      # 出来的 semver，而我们的版本号是界面上手输的，所以自己派生。
-      - id: majmin
-        if: inputs.publish == true
-        env:
-          V: ${{ steps.ver.outputs.value }}
-        run: |
-          set -euo pipefail
-          case "$V" in
-            sha-*) echo "value=" >> "$GITHUB_OUTPUT" ;;   # 没填版本号，没有 major.minor 可言
-            *) echo "value=${V%.*}" >> "$GITHUB_OUTPUT" ;;
-          esac
 
       - id: meta
         if: inputs.publish == true
@@ -403,7 +411,7 @@ jobs:
           # 那种"我只是想推一个能拉的镜像试试"不该把 latest 一起带走。
           tags: |
             type=raw,value=${{ steps.ver.outputs.value }},enable=${{ inputs.version != '' }}
-            type=raw,value=${{ steps.majmin.outputs.value }},enable=${{ steps.majmin.outputs.value != '' }}
+            type=raw,value=${{ steps.ver.outputs.majmin }},enable=${{ steps.ver.outputs.majmin != '' }}
             type=sha,format=short
             type=raw,value=latest,enable=${{ inputs.latest == true }}
 
@@ -467,7 +475,10 @@ jobs:
           VERSION: ${{ steps.ver.outputs.value }}
           TAGS: ${{ steps.meta.outputs.tags }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
-          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+          # e2e 现在是四个 step（起容器/打接口/版本号/重启验持久化）串联，默认
+          # fail-fast：任何一步失败，后面的步骤直接 skipped（不是 success）。
+          # 所以最后一步（重启验持久化）的 outcome 就等价于「四步都过了」。
+          E2E_OUTCOME: ${{ steps.persist.outcome }}
           # 推失败也算没发布 —— 那时 registry 上还是上一版，说"已推送"就是谎话。
           PUBLISHED: ${{ steps.push.outcome == 'success' }}
         run: python3 .github/scripts/summary.py

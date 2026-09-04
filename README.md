@@ -128,9 +128,10 @@ The web app also has suites that need a real browser: `npm run test:browser`
 
 Publishing a new image is a deliberate act, not a side effect of pushing:
 
-The pipeline is **manual-trigger only**: Actions → server → Run workflow, then
-fill in `publish` / `version` / `latest` / `release`. Pushing code — or pushing a
-git tag — triggers nothing.
+The pipeline is **manual-trigger only for publishing**: Actions → server → Run
+workflow, then fill in `publish` / `version` / `latest` / `release`. Pushing to
+main or opening a PR runs tests and lint automatically — it never publishes.
+Publishing is manual-only.
 
 One note for anyone reading the source: `§N` references in comments point to an
 internal design document that is not published with the repository. The
