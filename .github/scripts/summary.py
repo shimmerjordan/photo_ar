@@ -166,7 +166,7 @@ def deploy() -> str:
 docker run -d --name photo-ar-server -p {PORT}:{PORT} -e PHOTOAR_ROOTS=photos=/你的/照片 -v /你的/照片:/你的/照片:ro -v photoar-data:/data {tag}
 ```
 必填只有 `PHOTOAR_ROOTS`（容器内路径的白名单根目录，与上面 CI 跑通的那组严格一致）和端口 `{PORT}`。登录 `admin`/`admin`，会被强制改密。
-要开手机上传再加 `-e PHOTOAR_UPLOAD_DIR=/你的/inbox -v /你的/inbox:/你的/inbox`（须在 `PHOTOAR_ROOTS` 之内、挂载可写、和照片目录是兄弟目录）——不设就只是关掉上传，容器照样 healthy。
+要开手机上传再加 `-e PHOTOAR_UPLOAD_DIR=/你的/照片/_inbox -v /你的/照片/_inbox:/你的/照片/_inbox`（必须在 `PHOTOAR_ROOTS` 之内且挂载可写；照片目录本身保持 `:ro`）——不设就只是关掉上传，容器照样 healthy。
 完整 compose：{doc("docker-compose.yml", "docker-compose.yml")}；首次部署：{doc("docs/deploy.md")}。
 """
 
