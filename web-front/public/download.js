@@ -1,24 +1,36 @@
 /**
  * 存到手机。**Android 那边「保存到相册」的网页等价物 —— 但只能做到"存进下载目录"。**
  *
- * ## 两条路，按「本机有没有」分
+ * ## 四条路，按「本机有没有、有没有人在下、要不要走数据源」分（设计 §3.1）
  *
  * | 情况 | 走哪条 | 为什么 |
  * |---|---|---|
- * | 视频已被预取（Cache Storage 里有） | 读缓存 → `blob:` → `<a download>` | **零网络**。婚礼现场那张网正是最该省的东西 |
- * | 其余（图片、没预取的视频） | 直接 `<a download href="/v1/…">` | 交给浏览器自己的下载器：不占内存、有系统级的下载通知、断了能续 |
+ * | 本机缓存里有（视频 `photoar-media-v1` / 原图 `photoar-ref-v1`） | 读缓存 → `blob:` → `<a download>` | **零网络**。婚礼现场那张网正是最该省的东西 |
+ * | 有进行中的下载任务（预取 / 「缓存」按钮 / 正在播放） | 挂上去等它下完 → `blob:` | 同一段不下第二遍（mediastore 的去重）；进度跟着那个任务走 |
+ * | 开了整站数据源，或这张视频设了单个来源 | 开一个下载任务（顺便落缓存）→ `blob:` | 数据源只能经 `fetch` 走（跨源票据，见 netsrc.js），浏览器下载器用不上它；单个来源本来就不在服务端 |
+ * | 其余 | 直接 `<a download href="/v1/…">` | 交给浏览器自己的下载器：不占内存、有系统级的下载通知、断了能续 |
  *
  * 全部走 blob 看着统一，但那意味着把一段 16MB 的视频整条读进内存再交出去 —— 换来的
  * 只是"进度条长在我们页面上"。浏览器的下载器在这件事上比我们做得好，**而且 iOS Safari
  * 对 `blob:` 的 `download` 支持有坑**（可能变成新标签打开而不是存文件）。所以只在
- * 已经有本机副本、blob 是唯一出路的时候才用它。
+ * 字节已经（或者必然要）经过我们自己手里的时候才用它。
  *
+ * ## 挂到别人任务上的那条路，任务失败了怎么办（fix1 #2）
+ *
+ * 「有进行中的下载任务」那一档不是我们主动开的口（多半是预取），它最终失败**不该
+ * 连累这次「存到手机」**——退回「其余」那一档，交给浏览器自己的下载器（旧代码在
+ * 挂任务这回事出现之前本来就是这么成功的）。真正**我们自己开的口**（数据源 / 单个
+ * 来源直链）失败了才应该让调用方知道；直链那条套用与播放同一句 CORS 提示
+ * （`overrideUrlFailText`，与 mediaload.js 共用，别写两份容易走样的文案）。
+ *
+
  * ## 为什么图片要先发一次 HEAD
  *
  * 入库允许 JPEG / PNG / WebP，服务端按扩展名给 `Content-Type`（`_photo_ref` 的注释写明
  * 了"不能一律写 image/jpeg"）。而 `download` 属性给的文件名里那个后缀是**我们**写的 ——
  * 一律写 `.jpg` 的话，一张 PNG 存进相册就是一个打不开的文件。HEAD 在服务端会正确地
  * 不发响应体（`httpd.py` 里 `req.method == "HEAD"` 那一支），所以这一问是廉价的。
+ * 走 blob 的那几条路不用问：字节在手上，类型就在 blob 上。
  *
  * ## 这一层做不到的事，必须由界面说出来
  *
@@ -27,8 +39,12 @@
  * 用户点了「存到手机」之后在相册里找不到，会以为没存成。
  */
 import * as api from './api.js'
-import { cachedStream } from './prefetch.js'
-import { mediaInfo } from './mediaload.js'
+import { mediaInfo, overrideUrlFailText } from './mediaload.js'
+import {
+  OVERRIDE_CACHE, Priority, REF_CACHE, VIDEO_CACHE, cached, download, jobFor, overrideKey, refKey, videoKey,
+} from './mediastore.js'
+import { activeBase, overrideSources } from './netsrc.js'
+import { overrideOf } from './prefs.js'
 
 /**
  * `Content-Type` → 文件名后缀。纯函数，好测。
@@ -91,12 +107,71 @@ function triggerDownload(href, filename, { revoke = false } = {}) {
   if (revoke) setTimeout(() => URL.revokeObjectURL(href), 60_000)
 }
 
+/** 本机那份 / 下载任务下完的那份，存成文件。 */
+function saveBlob(blob, filename) {
+  triggerDownload(URL.createObjectURL(blob), filename, { revoke: true })
+}
+
+/**
+ * 等一个下载任务下完，拿到整段 Blob。进度跟着**任务**报（它可能是预取早就开始下的，
+ * 已经收了一半 —— 从 0 数起的话进度条会先瞬间冲到一半）。
+ *
+ * `response()` 在任务开跑之后立刻要：它给的是「已收重放 + 实时后续」，就算下完之后没写进
+ * 缓存（配额满），我们手里这条也还是完整的。
+ */
+async function blobOfJob(job, onProgress) {
+  const off = onProgress ? job.subscribe((s) => onProgress({ loaded: s.loaded, total: s.total })) : null
+  onProgress?.({ loaded: job.loaded, total: job.total })
+  try {
+    return await job.response().blob()
+  } finally {
+    off?.()
+  }
+}
+
+/** 下载任务那条路的结果句：顺便落缓存成没成要说实话（「下次秒开」不是每次都成立）。 */
+function jobResult(job) {
+  if (job.cacheFailed) return `已下完，去下载目录里找（没存进本机：${job.cacheFailed}）`
+  return '已下完，去下载目录里找；本机也留了一份，下次秒开'
+}
+
+/**
+ * 按「本机缓存 → 进行中的任务 → 该开任务就开」取一段字节。都不是返回 null（交给浏览器下载器）。
+ *
+ * @param open 为真时本机没有、也没人在下就开一个任务（开了数据源 / 单个来源）
+ */
+async function viaStore(key, { cacheName, sources, open, onProgress }) {
+  const hit = await cached(key, cacheName)
+  if (hit) return { blob: await readWithProgress(hit, onProgress), local: true }
+  if (!jobFor(key) && !open) return null
+  // 用户点的：已有的任务就地提到 USER（排着队的后台任务不必等预取让路）。
+  const job = download(key, { cacheName, sources, priority: Priority.USER })
+  try {
+    const blob = await blobOfJob(job, onProgress)
+    await job.done
+    return { blob, local: false, job }
+  } catch (e) {
+    // `open` 是假的：这段字节不是我们主动要下的，只是恰好挂到了别人的任务上（比如
+    // 正在预取）——那个任务失败不该连累「存到手机」，退回浏览器自己的下载器，旧代码
+    // （没有挂任务这回事时）在这种情况下本来就能成功（fix1 #2）。
+    // `open` 是真的：这次下载是我们自己开的口（数据源 / 单个来源直链），失败要让
+    // 调用方知道——直链那条会在上层套一句与播放一致的 CORS 提示。
+    if (!open) return null
+    throw e
+  }
+}
+
 /**
  * 存这张照片的**原图**（不是缩略图）。
  *
  * @returns 一句给用户看的结果
  */
 export async function savePhotoImage(photoId, title) {
+  const got = await viaStore(refKey(photoId), { cacheName: REF_CACHE, open: Boolean(activeBase()) })
+  if (got) {
+    saveBlob(got.blob, safeFileName(title, photoId, extFromContentType(got.blob.type, '.jpg')))
+    return got.local ? '本机已有这张原图，没走网络' : jobResult(got.job)
+  }
   const url = api.refUrl(photoId)
   let ct = null
   try {
@@ -116,13 +191,32 @@ export async function savePhotoImage(photoId, title) {
 /**
  * 存这张照片配的那段视频。
  *
- * 命中预取缓存时**一个字节都不走网络** —— 那正是登录后台预取真正兑现的时刻。
+ * 本机已有时**一个字节都不走网络** —— 那正是预取 / 手动缓存真正兑现的时刻。
+ * 设了单个来源的，存的是**那一份**（用户在这台手机上看到的就是它）。
  *
- * @param onProgress `({loaded, total})`，只在读本机缓存那条路上有（走浏览器下载器时
- *   进度在系统通知里，我们看不到也不该假装看得到）
+ * @param onProgress `({loaded, total})`，只在字节经过我们手里的那几条路上有（走浏览器
+ *   下载器时进度在系统通知里，我们看不到也不该假装看得到）
  * @returns 一句给用户看的结果
  */
 export async function savePhotoVideo(photoId, title, { onProgress } = {}) {
+  const ov = overrideOf(photoId)
+  if (ov?.kind === 'file') {
+    const res = await cached(overrideKey(photoId), OVERRIDE_CACHE)
+    if (!res) throw new Error('你设的本机文件不在浏览器存储里了，去设置 → 高级设置重新选一次')
+    const blob = await readWithProgress(res, onProgress)
+    saveBlob(blob, safeFileName(title, photoId, extFromContentType(blob.type || ov.type, '.mp4')))
+    return '这段就是你设的本机文件，没走网络'
+  }
+  if (ov?.kind === 'url' && ov.url) {
+    // 与播放同一个键（直链地址本身，见 mediaload.js）：播过的这里直接是本机那份。
+    // 失败时套用与播放同一句提示（`overrideUrlFailText`，不是原始的任务错误文案），
+    // 别在两处各写一份容易走样的 CORS 措辞（fix1 #2）。
+    const got = await viaStore(ov.url, { cacheName: OVERRIDE_CACHE, sources: overrideSources(ov), open: true, onProgress })
+      .catch((e) => { throw new Error(overrideUrlFailText(e?.message)) })
+    saveBlob(got.blob, safeFileName(title, photoId, extFromContentType(got.blob.type, '.mp4')))
+    return got.local ? '本机已有这段视频，没走网络' : jobResult(got.job)
+  }
+
   const info = await mediaInfo(photoId)
   if (!info?.url) throw new Error('这张照片还没有配视频')
   if (info.missing) throw new Error('视频文件不在服务器上了')
@@ -136,11 +230,12 @@ export async function savePhotoVideo(photoId, title, { onProgress } = {}) {
   // 分片 MP4（MediaSource 只吃 fMP4，见 mp4stream.js）。拿 `nasPath` 的扩展名反而会错 ——
   // 那是**原始**文件的名字，而下下来的是转码后的那一份。
   const filename = safeFileName(title, photoId, '.mp4')
-  const cached = await cachedStream(info.url)
-  if (cached) {
-    const blob = await readWithProgress(cached, onProgress)
-    triggerDownload(URL.createObjectURL(blob), filename, { revoke: true })
-    return '本机已有这段视频，没走网络'
+  // 与播放 / 预取同一个缓存键（mediastore 的 videoKey）；老服务端没给 assetId 就退回 url。
+  const key = info.assetId ? videoKey(info.assetId) : info.url
+  const got = await viaStore(key, { cacheName: VIDEO_CACHE, open: Boolean(activeBase()), onProgress })
+  if (got) {
+    saveBlob(got.blob, filename)
+    return got.local ? '本机已有这段视频，没走网络' : jobResult(got.job)
   }
   triggerDownload(info.url, filename)
   return '已交给浏览器下载，去下载目录里找'
@@ -151,10 +246,12 @@ export async function savePhotoVideo(photoId, title, { onProgress } = {}) {
  *
  * 读缓存本来很快，报进度是为了**大文件在慢机器上也有东西在动** —— 一个 16MB 的 blob
  * 在老手机上组装起来也要几百毫秒，那段时间界面不能是死的。
+ *
+ * 类型缺省按手上这份的类型来，不再一律写 video/mp4：原图也走这里。
  */
 async function readWithProgress(res, onProgress) {
   const total = Number(res.headers.get('content-length')) || 0
-  const type = res.headers.get('content-type') || 'video/mp4'
+  const type = res.headers.get('content-type') || 'application/octet-stream'
   if (!res.body || !onProgress) return await res.blob()
   const reader = res.body.getReader()
   const chunks = []

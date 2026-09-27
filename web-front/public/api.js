@@ -101,7 +101,7 @@ export const refUrl = (id) => `/v1/photo/${id}/ref`
  * cookie**，后端日志里是每 3 秒一次、连续十次的 `401`，而同一页 `fetch()` 同一个
  * 地址是 `206`。页面上的表现是视频永远 `readyState=0`，**一声不响，没有任何报错**。
  *
- * `/api/ticket` 用当前会话换一张短命的一次性票，`/api/stream/<票>` 不需要 cookie，
+ * `/api/ticket` 用当前会话换一张票（10 分钟内有效且可重复使用，不绑定来源；票本身就是凭证），`/api/stream/<票>` 不需要 cookie，
  * 服务端在转发时把真凭证补上（见 server/index.js 的「媒体票据」一节）。
  *
  * 拿不到票就退回原地址：那样在能用的浏览器上照旧工作，比整个播不了强。
@@ -114,6 +114,20 @@ export async function playableUrl(streamUrl) {
   } catch {
     return streamUrl
   }
+}
+
+/**
+ * 换一张票，但**不**像 `playableUrl` 那样拿不到就退回原地址。
+ *
+ * `netsrc.js` 的 `lan` 来源要把票据拼到整站数据源地址上（`base + await api.ticketFor(key)`）——
+ * 这条路径一旦失败就必须让调用方知道（好去试下一个来源），静默退回 `streamUrl`
+ * 会拼出一个指向**默认源**的相对路径却发到**数据源**主机上，那是一次必然 404/连不上
+ * 的请求，还看不出原因。所以这里让异常照原样往外抛，交给 `mediastore.js` 的续传逻辑
+ * （来源失败 → 换下一个）去接。
+ */
+export async function ticketFor(path) {
+  const t = await req(`/api/ticket?path=${encodeURIComponent(path)}`)
+  return t?.url
 }
 
 // ── 历史 ──────────────────────────────────────────────────────────────
@@ -132,6 +146,10 @@ export const history = (limit = 100) =>
  *
  * 所以清洗的责任在**这一边**。安卓相册导出的文件名基本都是干净的，但
  * `Camera/IMG_1234.jpg` 这种带目录的、以及 iOS 分享出来的 `.HEIC` 临时名都出现过。
+ *
+ * ⚠️ 管理台（`src/photoar/server/webui/app.js` 的 `uploadName`）有一份逐条相同的拷贝
+ * （管理台零依赖、不能 import 这个模块）。**改这里要改那里**：两边往同一个落地目录传，
+ * 清出来的名字不一样，按名字判重就认不出同一个文件。
  */
 export function uploadName(raw) {
   // 正反斜杠都切：服务端在 posix 上跑，`a\b.jpg` 的 `Path().name` 还是它自己，

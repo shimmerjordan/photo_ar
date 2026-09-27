@@ -18,6 +18,7 @@ import * as api from './api.js'
 import { junimo } from './art.js'
 import { bindToggle, diagAlways, initDiag } from './diag.js'
 import { Shell } from './shell.js'
+import { setUser } from './mediastore.js'
 import { startPrefetch } from './prefetch.js'
 import { hardRefresh, staleAgainst } from './staleguard.js'
 import { esc, mb } from './ui.js'
@@ -29,7 +30,17 @@ const els = {
   enter: $('enter'), togglePw: $('toggle-pw'),
   app: $('app'), topbar: $('topbar'), title: $('title'), back: $('back'),
   view: $('view'), tabbar: $('tabbar'),
-  bar: $('bar'), barFill: $('bar')?.firstElementChild, boot: $('boot'),
+  bar: $('bar'), barFill: $('bar')?.querySelector('i'), barBuf: null, boot: $('boot'),
+}
+/**
+ * 金条的第二层（暗的那层 = 已下载），垫在 `<i>`（亮的那层 = 播放进度）下面。建在这里而不是
+ * 写进 index.html：只有扫描页边下边播时用得上，而 HTML 里那一格是给引擎加载准备的。
+ * 插在 `<i>` **前面**：两者都定位了（theme.css），同层按文档顺序画，后面的 `<i>` 压在上面。
+ */
+if (els.bar) {
+  els.barBuf = document.createElement('b')
+  els.barBuf.hidden = true
+  els.bar.prepend(els.barBuf)
 }
 
 /**
@@ -55,22 +66,33 @@ initDiag()
  *
  * `label` 必须能换：这个元素上的 `aria-label` 在 HTML 里写死是「加载识别引擎」，
  * 复用时不换的话读屏会在播视频的时候念"加载识别引擎 40%"。
+ *
+ * `buffered`（0..1）= 第二层：边下边播时**已下载**到哪（暗金），亮的那层照旧是 `pct`（播放
+ * 进度）。两件事同时在发生，只画一层必然顶掉一件 —— 原来顶掉的是下载（设计 §3.6）。
+ * 不给 / null = 不画这一层；每次调用都要重新给，**不沿用上一次的**：调用方不说，就是现在
+ * 没有可报的下载（下完了、本机已有、换了一段）。不定长那一档也不画：扫描动画上再垫一层
+ * 暗条读不出在说什么。
  */
-function progress(pct, { hide = false, label = null } = {}) {
+function progress(pct, { hide = false, label = null, buffered = null } = {}) {
   if (!els.bar) return
   if (label) els.bar.setAttribute('aria-label', label)
   if (hide) return void (els.bar.hidden = true)
   els.bar.hidden = false
-  if (typeof pct === 'number' && pct >= 0) {
+  const clamp01 = (x) => Math.min(1, Math.max(0, x))
+  const known = typeof pct === 'number' && pct >= 0
+  if (known) {
     els.bar.classList.remove('indeterminate')
     // 动 transform 而不是 width：这条在相机预览之上、加载期间每 200ms 更新一次。
-    els.barFill.style.transform = `scaleX(${Math.min(1, Math.max(0, pct / 100))})`
+    els.barFill.style.transform = `scaleX(${clamp01(pct / 100)})`
     els.bar.setAttribute('aria-valuenow', String(Math.round(pct)))
   } else {
     els.bar.classList.add('indeterminate')
     els.barFill.style.transform = ''
     els.bar.removeAttribute('aria-valuenow')
   }
+  const buf = known && typeof buffered === 'number' && Number.isFinite(buffered)
+  els.barBuf.hidden = !buf
+  if (buf) els.barBuf.style.transform = `scaleX(${clamp01(buffered)})`
 }
 const bootSay = (text) => { bootText.textContent = text }
 
@@ -232,6 +254,9 @@ async function boot() {
     diagAlways(`取不到身份（${e.status ?? ''} ${e.message}），按访客处理 —— 管理功能会看不到`)
     state.me = { role: 'viewer', isAdmin: false }
   }
+  // 固定记录按人分（mediastore.js 顶部「固定」一节）。**必须在 startPrefetch 之前**：
+  // 预取的预算与清理都要先知道"这个人固定了哪些"，晚一步就是拿 anon 那份去删缓存。
+  setUser(state.me.userId ?? 'anon')
 
   bootSay('正在加载识别引擎…')
   progress(0)
@@ -323,7 +348,7 @@ function mountShell() {
   )
   state.shell.renderTabs(isAdmin())
   state.shell.start()
-  // 后台预取视频（宾客全取、管理员取最新几张，见 prefetch.js）。放在 shell 起来
+  // 后台预取视频（固定的组 + 按空间预算从新到旧，见 prefetch.js）。放在 shell 起来
   // 之后、延迟几秒起跑：先让扫描页的引擎与相机把关键路径走完，预取只吃空闲带宽。
   startPrefetch({ isAdmin: isAdmin() })
 }

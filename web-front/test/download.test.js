@@ -8,11 +8,16 @@
  * - 后缀：入库允许 PNG/WebP，一律写 `.jpg` 的话存进相册就是一张打不开的图。
  * - 进度分母：`Content-Length` 拿不到时是 0，拿它当分母得到的是 Infinity ——
  *   进度条会直接跳满然后停在那儿，看起来像"卡在 100%"。
+ *
+ * 末尾一组钉「存到手机」接进 mediastore 之后的四条路（设计 §3.1）：本机有 → 零网络；
+ * 正在下 → 等它、不下第二遍；开了数据源 → 走任务（顺便落缓存）；都不是 → 照旧交给
+ * 浏览器下载器。假 `document`（只记录被点的锚点）+ `mediastore._setEnv` 注入的假 fetch/caches。
  */
-import { test, describe } from 'node:test'
+import { test, describe, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { extFromContentType, safeFileName } from '../public/download.js'
-import { Stage, stageName, stagePct, stageText } from '../public/mediaload.js'
+import { extFromContentType, safeFileName, savePhotoImage, savePhotoVideo } from '../public/download.js'
+import { Stage, mediaInfo, stageName, stagePct, stageText } from '../public/mediaload.js'
+import * as M from '../public/mediastore.js'
 
 describe('extFromContentType', () => {
   test('认得出入库允许的那几种图片', () => {
@@ -137,5 +142,161 @@ describe('stageName', () => {
     // 一句说在下，一句说已经有了。三个页面都拼过这两句，见 mediaload.js 的说明。
     assert.notEqual(stageName(Stage.DOWNLOAD, { fromCache: true }), '正在下载视频')
     assert.ok(stageName(Stage.DOWNLOAD, { fromCache: true }).length > 2)
+  })
+})
+
+// ── 存到手机 × mediastore 的假件 ──────────────────────────────────────────
+const store = new Map()
+globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) }
+function fakeCaches() {
+  const all = new Map()
+  const open = async (name) => {
+    if (!all.has(name)) all.set(name, new Map())
+    const m = all.get(name)
+    return {
+      match: async (k) => (m.has(k) ? m.get(k).clone() : undefined),
+      put: async (k, r) => { m.set(k, new Response(await r.arrayBuffer(), { headers: r.headers })) },
+      delete: async (k) => m.delete(k),
+      keys: async () => [...m.keys()].map((k) => new Request(`http://x${k}`)),
+    }
+  }
+  return { open, delete: async (n) => all.delete(n), keys: async () => [...all.keys()] }
+}
+const bytes = (...xs) => new Uint8Array(xs)
+const media = (id, n) => ({ assetId: id, url: `/v1/asset/${id}/stream`, via: 'nas_serve', absolute: false, bytes: n, missing: false })
+async function until(cond, ms = 3000) {
+  const t0 = Date.now()
+  while (!cond()) {
+    if (Date.now() - t0 > ms) throw new Error('等不到条件成立')
+    await new Promise((r) => setTimeout(r, 2))
+  }
+}
+/**
+ * 装一个只记录「点了哪个锚点」的假 document，跑完 `fn` 再拆掉。
+ *
+ * 顺带拦掉 `triggerDownload` 那只 60 秒后 revoke 的定时器：不拦的话这个测试进程要多挂
+ * 一分钟才退出（Node 等事件循环空了才走）。只拦 60000ms 这一种，别的定时器照常。
+ */
+async function withDom(fn) {
+  const clicks = []
+  const realSetTimeout = globalThis.setTimeout
+  globalThis.document = {
+    createElement: () => ({ style: {}, click() { clicks.push({ href: this.href, download: this.download }) }, remove() {} }),
+    body: { appendChild() {} },
+  }
+  globalThis.setTimeout = (f, ms, ...a) => (ms === 60_000 ? 0 : realSetTimeout(f, ms, ...a))
+  try {
+    return { result: await fn(), clicks }
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    delete globalThis.document
+  }
+}
+
+describe('存到手机：本机有就零网络、正在下就等它、开了数据源就顺便缓存', () => {
+  let caches, calls, next, realFetch
+  beforeEach(() => {
+    store.clear()
+    caches = fakeCaches()
+    calls = []
+    M._setEnv({ cachesImpl: caches, fetchImpl: async (url, init) => { calls.push(url); return next(url, init) } })
+    realFetch = globalThis.fetch
+  })
+  const restoreFetch = () => { globalThis.fetch = realFetch }
+
+  test('视频已在本机缓存：一个字节都不走网络', async () => {
+    await mediaInfo('p-dl-a', async () => media('dl-a', 2))
+    await (await caches.open(M.VIDEO_CACHE)).put('/v1/asset/dl-a/stream',
+      new Response(bytes(1, 2), { headers: { 'content-type': 'video/mp4', 'content-length': '2' } }))
+    const { result, clicks } = await withDom(() => savePhotoVideo('p-dl-a', '第一支舞'))
+    assert.equal(result, '本机已有这段视频，没走网络')
+    assert.deepEqual(calls, [])
+    assert.equal(clicks.length, 1)
+    assert.match(clicks[0].href, /^blob:/)
+    assert.equal(clicks[0].download, '第一支舞.mp4')
+  })
+
+  test('视频正在被预取：等那个任务下完再存，不另下一遍，进度跟着任务走', async () => {
+    await mediaInfo('p-dl-b', async () => media('dl-b', 2))
+    let ctl
+    next = () => new Response(new ReadableStream({ start(c) { ctl = c } }), { headers: { 'content-length': '2', 'content-type': 'video/mp4' } })
+    M.download('/v1/asset/dl-b/stream', { priority: M.Priority.BACKGROUND })
+    await until(() => ctl)
+    const seen = []
+    const saving = withDom(() => savePhotoVideo('p-dl-b', '敬酒', { onProgress: (x) => seen.push(x) }))
+    await until(() => seen.length > 0)
+    ctl.enqueue(bytes(3)); ctl.enqueue(bytes(4)); ctl.close()
+    const { result, clicks } = await saving
+    assert.equal(calls.length, 1, '只下了一次')
+    assert.equal(clicks.length, 1)
+    assert.match(clicks[0].href, /^blob:/)
+    assert.equal(clicks[0].download, '敬酒.mp4')
+    assert.ok(seen.some((x) => x.loaded === 2 && x.total === 2), JSON.stringify(seen))
+    assert.match(result, /下载目录/)
+  })
+
+  test('开了数据源：走下载任务（经局域网）再存 blob，顺便落进本机缓存', async () => {
+    store.set('photoar.adv.v1', JSON.stringify({ mediaBaseOn: true, mediaBase: 'http://192.168.1.10:8964' }))
+    await mediaInfo('p-dl-c', async () => media('dl-c', 2))
+    globalThis.fetch = async () => new Response(JSON.stringify({ url: '/api/stream/T1' }), { headers: { 'content-type': 'application/json' } })
+    next = () => new Response(bytes(5, 6), { headers: { 'content-length': '2', 'content-type': 'video/mp4' } })
+    try {
+      const { result, clicks } = await withDom(() => savePhotoVideo('p-dl-c', '入场'))
+      assert.deepEqual(calls, ['http://192.168.1.10:8964/api/stream/T1'])
+      assert.equal(clicks.length, 1)
+      assert.match(clicks[0].href, /^blob:/)
+      assert.ok(await M.cached('/v1/asset/dl-c/stream'), '下下来的那份要留在本机缓存里')
+      assert.match(result, /本机/)
+    } finally {
+      restoreFetch()
+    }
+  })
+
+  test('原图已在本机缓存：从 photoar-ref-v1 存，后缀跟着 Content-Type 走', async () => {
+    await (await caches.open(M.REF_CACHE)).put('/v1/photo/p-img-a/ref',
+      new Response(bytes(7), { headers: { 'content-type': 'image/webp', 'content-length': '1' } }))
+    const { result, clicks } = await withDom(() => savePhotoImage('p-img-a', '合影'))
+    assert.deepEqual(calls, [])
+    assert.equal(clicks[0].download, '合影.webp')
+    assert.match(clicks[0].href, /^blob:/)
+    assert.match(result, /本机已有/)
+  })
+
+  test('原图：本机没有、没开数据源 → 照旧交给浏览器下载器（HEAD 问一次后缀）', async () => {
+    const heads = []
+    globalThis.fetch = async (url, init) => { heads.push([url, init.method]); return new Response(null, { headers: { 'content-type': 'image/png' } }) }
+    try {
+      const { result, clicks } = await withDom(() => savePhotoImage('p-img-b', '合影'))
+      assert.deepEqual(heads, [['/v1/photo/p-img-b/ref', 'HEAD']])
+      assert.deepEqual(calls, [])
+      assert.deepEqual(clicks, [{ href: '/v1/photo/p-img-b/ref', download: '合影.png' }])
+      assert.equal(result, '已交给浏览器下载，去下载目录里找')
+    } finally {
+      restoreFetch()
+    }
+  })
+
+  // ── fix1 #2：挂到别人的任务上，那个任务最终失败不该直接抛错 ──────────────
+  test('视频正在被预取，但那个任务最终失败：退回浏览器下载器（旧代码这种情况本来能成功，fix1 #2）', async () => {
+    await mediaInfo('p-dl-fail', async () => media('dl-fail', 2))
+    next = () => { throw new Error('network down') }        // 每次来源都连不上
+    M.download('/v1/asset/dl-fail/stream', { priority: M.Priority.BACKGROUND })
+    await until(() => calls.length >= 1)                     // 任务已经在跑（挂得上去）
+    const { result, clicks } = await withDom(() => savePhotoVideo('p-dl-fail', '失败重下'))
+    assert.match(result, /已交给浏览器下载/, `不该抛错，实际：${result}`)
+    assert.equal(clicks.length, 1)
+    assert.equal(clicks[0].href, '/v1/asset/dl-fail/stream')
+  })
+
+  test('单个来源是直链，下载失败时套用与播放一致的 CORS 提示，不是抛原始错误（fix1 #2）', async () => {
+    store.set('photoar.adv.v1', JSON.stringify({ overrides: { 'p-ov-fail': { kind: 'url', url: 'https://cdn.example.com/v.mp4' } } }))
+    next = () => { throw new Error('network down') }
+    await assert.rejects(
+      () => savePhotoVideo('p-ov-fail', '失败'),
+      (e) => {
+        assert.match(e.message, /对方服务器要允许跨域（CORS）/, `文案没套用，实际：${e.message}`)
+        return true
+      },
+    )
   })
 })

@@ -16,6 +16,8 @@ import {
   BUDGET_FALLBACK, BUDGET_MAX, BUDGET_MIN, budget, cachedStream,
   pickPlan, planWithinBudget, staleKeys,
 } from '../public/prefetch.js'
+import { keepSet, _runForTest } from '../public/prefetch.js'
+import { refKey, pin, unpin, setUser, VIDEO_CACHE } from '../public/mediastore.js'
 
 const MB = 1024 * 1024
 
@@ -211,5 +213,101 @@ describe('cachedStream：环境退化', () => {
     } finally {
       delete globalThis.caches
     }
+  })
+})
+
+describe('keepSet：清理口径（固定 / 计划 / 正在下）', () => {
+  test('清理口径：固定的、计划里的、正在下的都留；换了人之后别人的全删', () => {
+    const photos = [{ photoId: 'a', videoAssetId: 'va' }, { photoId: 'b', videoAssetId: 'vb' }]
+    const keep = keepSet({ photos, pinned: new Set(['a', 'zz']), planKeys: ['/v1/asset/vb/stream'], running: ['/v1/asset/vx/stream'] })
+    assert.deepEqual([...keep].sort(), ['/v1/asset/va/stream', '/v1/asset/vb/stream', '/v1/asset/vx/stream'])
+  })
+
+  test('原图缓存同一个口径：只留当前用户授权清单里、且被固定的那些', () => {
+    // `zz` 是固定过、但这个人已经看不到的照片（撤了授权，或者是上一个人固定的）——
+    // 它不在 photos 里，就一定不在留下的集合里：缓存里不该留别人才有权限的东西。
+    const photos = [{ photoId: 'a' }, { photoId: 'b' }]
+    const keep = keepSet({ photos, pinned: new Set(['a', 'zz']), running: [], keyOf: (p) => refKey(p.photoId) })
+    assert.deepEqual([...keep], ['/v1/photo/a/ref'])
+  })
+
+  test('固定了但没视频的照片不产生视频键', () => {
+    const keep = keepSet({ photos: [{ photoId: 'a', videoAssetId: null }], pinned: new Set(['a']) })
+    assert.deepEqual([...keep], [])
+  })
+})
+
+describe('run：每段下载前现查「已在本机 / 还固定着」（fix round 1 #1）', () => {
+  // 循环要跑好几分钟，期间播放 / 手动缓存 / 从本机移除都可能改掉「这一段该不该下」。
+  // 上一版在进循环前拍一次快照，于是：播放刚下完并缓存的那段被预取再下一遍；运行中被移除的
+  // 固定组又被下回缓存。这两条各钉一次。
+
+  /** 假 Cache Storage（Map 实现），与 mediastore.test.js 的同形。 */
+  function fakeCaches() {
+    const all = new Map()
+    const open = async (name) => {
+      if (!all.has(name)) all.set(name, new Map())
+      const m = all.get(name)
+      return {
+        match: async (k) => (m.has(k) ? m.get(k).clone() : undefined),
+        put: async (k, r) => { m.set(k, new Response(await r.arrayBuffer(), { headers: r.headers })) },
+        delete: async (k) => m.delete(k),
+        keys: async () => [...m.keys()].map((k) => new Request(`http://x${k}`)),
+      }
+    }
+    return { open, delete: async (n) => all.delete(n), keys: async () => [...all.keys()] }
+  }
+
+  /**
+   * 装好 run 需要的全局（fetch / caches），跑一轮，还原。`asked` 只记视频与原图的请求 ——
+   * 照片列表与缩略图不算（缩略图一律回 404，跟这里要钉的无关）。
+   * `onFetch(url, caches)` 在对应请求发出时被调，用来模拟「这一刻用户 / 播放做了什么」。
+   */
+  async function runWith(photos, onFetch) {
+    const cs = fakeCaches()
+    const asked = []
+    const prevFetch = globalThis.fetch
+    globalThis.caches = cs
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u === '/v1/photos') return new Response(JSON.stringify({ photos }), { status: 200 })
+      if (u.endsWith('/thumb')) return new Response('', { status: 404 })
+      asked.push(u)
+      await onFetch?.(u, cs)
+      return new Response(new Uint8Array([1, 2]), { status: 200 })
+    }
+    try {
+      await _runForTest()
+    } finally {
+      globalThis.fetch = prevFetch
+      delete globalThis.caches
+    }
+    return asked
+  }
+
+  test('轮到某段之前它已经进了本机缓存（播放刚下完 / 手动缓存）：不再下第二遍', async () => {
+    setUser('run-cached')
+    const photos = [
+      { photoId: 'a', createdAt: 2, hasVideo: true, videoAssetId: 'va', videoBytes: 2 * MB },
+      { photoId: 'b', createdAt: 1, hasVideo: true, videoAssetId: 'vb', videoBytes: 2 * MB },
+    ]
+    // 预取在下 a 的时候，播放把 b 下完并写进了缓存（任务随即从任务表删掉）。
+    const asked = await runWith(photos, async (u, cs) => {
+      if (u === '/v1/asset/va/stream') await (await cs.open(VIDEO_CACHE)).put('/v1/asset/vb/stream', new Response(new Uint8Array([9])))
+    })
+    assert.deepEqual(asked, ['/v1/asset/va/stream'])
+  })
+
+  test('运行中被「从本机移除」（取消固定）的组：还没轮到的那几段不再下回来', async () => {
+    setUser('run-unpin')
+    pin('p1'); pin('p2')
+    const photos = [
+      { photoId: 'p1', createdAt: 2, hasVideo: true, videoAssetId: 'v1', videoBytes: 2 * MB },
+      { photoId: 'p2', createdAt: 1, hasVideo: true, videoAssetId: 'v2', videoBytes: 2 * MB },
+    ]
+    const asked = await runWith(photos, async (u) => {
+      if (u === '/v1/photo/p1/ref') unpin('p2')
+    })
+    assert.deepEqual(asked, ['/v1/photo/p1/ref', '/v1/asset/v1/stream'])
   })
 })
