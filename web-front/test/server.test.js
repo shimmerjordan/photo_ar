@@ -83,6 +83,13 @@ function startUpstream() {
         res.writeHead(200, { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' })
         return res.end(body)
       }
+      // 原图 / 缩略图：票据（Task 3）扩到这两类之后，`issueTicket` 的探测请求
+      // （`Range: bytes=0-0`）要落到一个不是 404 的分支上，发票才可能成功。
+      // 不模拟 206——`headUpstream` 只看状态码，200 已经够判定。
+      if (req.url?.startsWith('/v1/photo/') && (req.url.endsWith('/ref') || req.url.endsWith('/thumb'))) {
+        res.writeHead(200, { 'Content-Type': 'image/jpeg' })
+        return res.end(Buffer.from('JPEGDATA'))
+      }
       // asset 流：**只认 cookie**。这是真机上那个失败的复刻 —— 安卓平台媒体组件
       // 发的请求拿不到 HttpOnly 的会话 cookie，于是每 3 秒一个 401。
       if (req.url?.startsWith('/v1/asset/')) {
@@ -595,5 +602,85 @@ describe('媒体票据', () => {
   test('上游拒绝（401/403）时不发票 —— 票不能凭空放大权限', async () => {
     const r = await ask(RAW, { cookie: 'nothing=here' })
     assert.equal(r.status, 401)
+  })
+
+  // ── 跨源：CORS / 预检 / 私网头（Task 3，spec §2.2） ──────────────────
+  //
+  // 前端 Task 4 的 netsrc.js 会从「隧道 https 页面」跨源去「局域网地址」取
+  // `/api/stream/<票>` 与 `/healthz`（整站媒体数据源）。跨源 fetch 先发一次
+  // OPTIONS 预检，通不过（或者正式响应没有 ACAO）浏览器直接报错，连字节都拿不到——
+  // 这一组盯的就是这几个头，不是业务逻辑本身。
+
+  /** 发票并断言成功，返回 `{url, expiresInMs}`。这几个新用例只测「成功换到票之后」的事。 */
+  const issue = async (path) => {
+    const r = await ask(path, { cookie: 'photoar_session=SECRET-TOKEN' })
+    assert.equal(r.status, 200, path)
+    return r.json()
+  }
+
+  test('票据流的预检：204 + 允许 Range + 私网头', async () => {
+    const r = await fetch(url('/api/stream/whatever'), {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://tunnel.example',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'range',
+        'Access-Control-Request-Private-Network': 'true',
+      },
+    })
+    assert.equal(r.status, 204)
+    assert.equal(r.headers.get('access-control-allow-origin'), '*')
+    assert.match(r.headers.get('access-control-allow-headers'), /range/i)
+    // Chromium 142 起的 Local Network Access：私网地址的跨源请求会先带这个头预检，
+    // 通不过就直接拦——局域网数据源（spec §2.1）必须这个头才通。
+    assert.equal(r.headers.get('access-control-allow-private-network'), 'true')
+  })
+
+  test('凭票取流带 CORS 头与 CORP cross-origin', async () => {
+    const t = await issue('/v1/asset/abc/stream')
+    const r = await fetch(url(t.url), { headers: { Origin: 'https://tunnel.example' } })
+    assert.equal(r.status, 200)
+    assert.equal(r.headers.get('access-control-allow-origin'), '*')
+    assert.match(r.headers.get('access-control-expose-headers'), /Content-Length/)
+    // proxyWith 默认给同源资源发 CORP: same-origin（COEP 需要），这条路必须覆盖成
+    // cross-origin，否则隧道页面自己的 COEP 会把这段视频拦掉。
+    assert.equal(r.headers.get('cross-origin-resource-policy'), 'cross-origin')
+    await r.arrayBuffer()
+  })
+
+  test('healthz 允许跨源探测', async () => {
+    const r = await fetch(url('/healthz'), { headers: { Origin: 'https://tunnel.example' } })
+    assert.equal(r.headers.get('access-control-allow-origin'), '*')
+    const pre = await fetch(url('/healthz'), { method: 'OPTIONS' })
+    assert.equal(pre.status, 204)
+  })
+
+  test('healthz 对跨源请求只回 {ok:true}，不回显上游内部地址（final-fix M3）', async () => {
+    // 它对任意来源开放、预检还带私网头：任何公网网页都能借访客的浏览器探到局域网里的
+    // photo-ar。探得到「活着」是数据源测试的本意，挡不住；但不能顺带把上游地址也读走。
+    const cross = await fetch(url('/healthz'), { headers: { Origin: 'https://evil.example' } })
+    assert.equal(cross.status, 200)
+    assert.deepEqual(await cross.json(), { ok: true })
+    // 不带 Origin（容器健康检查、运维 curl）保持原样：排障时看上游指到哪儿还用得着。
+    const local = await fetch(url('/healthz'))
+    const body = await local.json()
+    assert.equal(body.ok, true)
+    assert.equal(typeof body.upstream, 'string')
+  })
+
+  test('票据能发给原图与缩略图，别的路径仍然 400', async () => {
+    for (const p of ['/v1/photo/abc/ref', '/v1/photo/abc/thumb']) {
+      const r = await ask(p, { cookie: 'photoar_session=SECRET-TOKEN' })
+      assert.equal(r.status, 200, p)
+    }
+    const bad = await ask('/v1/admin/users', { cookie: 'photoar_session=SECRET-TOKEN' })
+    assert.equal(bad.status, 400)
+  })
+
+  test('发票接口本身不开 CORS', async () => {
+    // 发票必须同源带 HttpOnly cookie，`*` 的 ACAO 会让浏览器把这一步也当成
+    // 可跨源发起——那正是不能开的理由（spec §2.2）。
+    const r = await ask(RAW, { cookie: 'photoar_session=SECRET-TOKEN', Origin: 'https://evil.example' })
+    assert.equal(r.headers.get('access-control-allow-origin'), null)
   })
 })

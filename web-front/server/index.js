@@ -6,8 +6,14 @@
  *   2. **反代 photo-ar 服务端的 `/v1/*` 与 `/admin`**，让页面、API、管理台同源
  *   3. **`/api/lib`**：拿用户的 cookie 去问服务端「你能看哪些照片」，再从 `data/library/`
  *      里把那些照片的 ORB 描述子打成一个包发下去
- *   4. **`/api/ticket` + `/api/stream/<票>`**：给安卓的平台媒体组件用的一次性票据
- *      （它拿不到 HttpOnly cookie，理由写在 `issueTicket` 上面）
+ *   4. **`/api/ticket` + `/api/stream/<票>`**：把「要 cookie 才能取的媒体」换成一个
+ *      「URL 自带凭证」的地址。安卓的平台媒体组件拿不到 HttpOnly cookie 是原因之一
+ *      （理由写在 `issueTicket` 上面）；另一个原因是跨源——「整站媒体数据源」（高级
+ *      设置）要从隧道页面跨源去局域网地址取流，会话 cookie 跨源带不过去也不该带，
+ *      于是这条路也是它的凭证载体（spec §2.2）。票 10 分钟内可重复用，不绑来源；
+ *      票就是凭证，谁拿到票谁能读，所以 `/api/stream/*` 与 `/healthz` 对这两条路
+ *      开了 `Access-Control-Allow-Origin: *`（`corsHeaders()`），`/api/ticket`
+ *      本身不开——发票必须同源带 cookie
  *
  * ## 整个服务只有一个端口，按 URI 分
  *
@@ -179,7 +185,22 @@ const tls = tlsOptions()
 const handler = async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`)
-    if (url.pathname === '/healthz') return json(res, 200, { ok: true, upstream: UPSTREAM.origin })
+    // 跨源预检要在具体路由之前处理：OPTIONS 落进 serveTicket 会被当成对上游的
+    // 代理请求转发出去（上游未必认 OPTIONS），落进 /healthz 的 json() 会回 200
+    // 而不是预检要的 204。见 corsHeaders()/isCorsPath() 上面的说明（spec §2.2）。
+    if (req.method === 'OPTIONS' && isCorsPath(url.pathname)) {
+      res.writeHead(204, corsHeaders(req, { preflight: true }))
+      return res.end()
+    }
+    if (url.pathname === '/healthz') {
+      // 带 `Origin` 的（跨源，浏览器里别的页面发的）只回 `{ok:true}`：这条路对任意来源开放、
+      // 预检还带私网头，任何公网网页都能借访客的浏览器探到局域网里的这台机器 ——「活着」
+      // 是数据源测试（netsrc.probeBase，只看 res.ok）要的，挡不住也不该挡；上游内部地址
+      // 不是，不能让它顺带读走。不带 Origin 的（容器 healthcheck.py、运维 curl）保持原样，
+      // 排障时看上游指到哪儿还用得着 —— 这两个调用方都只看状态码，不依赖这个字段。
+      const body = req.headers.origin ? { ok: true } : { ok: true, upstream: UPSTREAM.origin }
+      return json(res, 200, body, corsHeaders(req))
+    }
     if (url.pathname === '/ca.crt') return serveCa(res)
     if (url.pathname === '/api/lib') return await serveLib(req, res, url)
     if (url.pathname === '/api/config') return await serveConfig(req, res)
@@ -489,6 +510,49 @@ async function serveLib(req, res, url) {
   res.end(packed.buf)
 }
 
+// ── 跨源：CORS / 预检 / 私网头 ──────────────────────────────────────────
+/**
+ * 哪些路径要开跨源。**只有这两条**：`/api/stream/<票>`（凭证在票里，谁拿到票谁能读）
+ * 与 `/healthz`（数据源探测用它判断"这个地址通不通"，不带任何敏感信息）。
+ * `/api/ticket` 故意不在这张表里——发票必须同源带 HttpOnly cookie，开了 CORS
+ * 等于让任何源都能诱导浏览器带着这个源的会话去发票（spec §2.2）。
+ */
+function isCorsPath(pathname) {
+  return pathname === '/healthz' || pathname.startsWith('/api/stream/')
+}
+
+/**
+ * 算出要发的跨源头。`preflight` 为真时是 OPTIONS 预检的那一套（允许的方法/头/
+ * 缓存时长，外加私网头），否则是正式响应要加的那一套（ACAO + 暴露的响应头 +
+ * 把 CORP 从 `proxyWith` 默认的 same-origin 覆盖成 cross-origin）。
+ *
+ * ## 私网头（Private Network Access）
+ *
+ * Chromium 142 起，https 页面对私网地址（私网 IP 字面量 / `.local`）发跨源 `fetch`
+ * 会先带 `Access-Control-Request-Private-Network: true` 单独预检一次，通不过就
+ * 直接拦——连正式请求都不发。这条头**只在收到那个请求头时才回**，不是无条件加：
+ * 不带这个请求头的预检（比如同源工具探测）没有理由声称自己支持私网豁免。
+ */
+function corsHeaders(req, { preflight = false } = {}) {
+  const h = { 'Access-Control-Allow-Origin': '*' }
+  if (preflight) {
+    h['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+    h['Access-Control-Allow-Headers'] = 'Range'
+    h['Access-Control-Max-Age'] = '600'
+    if (req.headers['access-control-request-private-network'] === 'true') {
+      h['Access-Control-Allow-Private-Network'] = 'true'
+    }
+  } else {
+    // `<video>`/MSE 边下边播要读 Content-Range/Accept-Ranges 才能算出续传位置，
+    // 跨源默认只暴露几个"简单响应头"，这几个都不在其中，必须显式列出来。
+    h['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Accept-Ranges, Content-Type'
+    // COEP require-corp 下同源资源默认发 same-origin（见 proxyWith），这两条路
+    // 要被跨源页面读，必须是 cross-origin——覆盖顺序见 proxyWith 里的注释。
+    h['Cross-Origin-Resource-Policy'] = 'cross-origin'
+  }
+  return h
+}
+
 // ── 媒体票据 ──────────────────────────────────────────────────────────
 /**
  * 把「要 cookie 才能取的视频」换成一个「URL 自带凭证」的地址。
@@ -510,13 +574,16 @@ async function serveLib(req, res, url) {
  *     `EDGE_DEMUXER_ERROR_MEDIA_EXTRACTOR_FAILED`。
  *   - 把 cookie 去掉 HttpOnly —— 拿会话安全换一个浏览器的怪癖，不划算。
  *
- * 所以只剩一条：**让凭证进 URL**。浏览器（带着 cookie）先来换一张票，票是一次性的
- * 随机串，媒体组件拿着票来取流，web-front 在服务端把真凭证补上去转发。
+ * 所以只剩一条：**让凭证进 URL**。浏览器（带着 cookie）先来换一张票，票是随机串、
+ * 10 分钟内有效且可重复使用、不绑定来源；票本身就是凭证。媒体组件拿着票来取流，
+ * web-front 在服务端把真凭证补上去转发。
  *
  * ## 票据的安全边界
  *
  * - **短命**：10 分钟。视频最长 30 秒，10 分钟足够覆盖重连与拖动，又短到捡到也没用。
- * - **一物一票**：票里钉死了 asset 路径，换不了别的资源。
+ * - **一物一票**：票里钉死了具体路径，换不了别的资源。现在是三类之一——
+ *   asset 流、photo 原图（`ref`）、photo 缩略图（`thumb`），一张票只认发它时钉住
+ *   的那一个。
  * - **不进日志**：票是随机串，不是会话 token —— 泄漏一张票最多让人看到一段视频，
  *   而泄漏会话 token 是整个账号。
  * - **有上限**：`MAX_TICKETS` 挡住「有人狂调 /api/ticket 把内存撑爆」。
@@ -533,17 +600,26 @@ function sweepTickets(now = Date.now()) {
 }
 
 /**
- * `GET /api/ticket?path=/v1/asset/<id>/stream` → `{url}`。
+ * `GET /api/ticket?path=<三类之一>` → `{url}`。允许 `/v1/asset/<id>/stream`（视频）、
+ * `/v1/photo/<id>/ref`（原图）、`/v1/photo/<id>/thumb`（缩略图）——「整站媒体数据源」
+ * （高级设置，spec §2.2）取这三类都要先在同源换票，跨源发不了带 HttpOnly cookie
+ * 的请求。
  *
  * **这一步是带 cookie 的普通 fetch**，所以鉴权照旧由上游把关：这里先拿调用方的凭证
  * 去上游发一个 1 字节的 Range 探一下，200/206 才发票。不探的话，任何人都能拿一张票
  * 去读任意 asset —— 票本身不鉴权，它只是把已经通过的鉴权结果延长一小段时间。
  */
+const TICKETABLE_PATH = /^\/v1\/(?:asset\/[A-Za-z0-9_-]+\/stream|photo\/[A-Za-z0-9_-]+\/(?:ref|thumb))$/
+
 async function issueTicket(req, res, url) {
   const path = url.searchParams.get('path') ?? ''
-  // 只允许 asset 流。别的路径没有"给媒体元素用"的需求，放开就是凭空多一个代理入口。
-  if (!/^\/v1\/asset\/[A-Za-z0-9_-]+\/stream$/.test(path)) {
-    return json(res, 400, { error: 'bad_path', message: '只能给 /v1/asset/<id>/stream 发票' })
+  // 只允许这三类。别的路径没有"给媒体元素/跨源数据源用"的需求，放开就是凭空
+  // 多一个代理入口。
+  if (!TICKETABLE_PATH.test(path)) {
+    return json(res, 400, {
+      error: 'bad_path',
+      message: '只能给 /v1/asset/<id>/stream、/v1/photo/<id>/ref、/v1/photo/<id>/thumb 发票',
+    })
   }
   const cookie = req.headers.cookie ?? ''
   const auth = req.headers.authorization
@@ -571,7 +647,10 @@ function serveTicket(req, res, url) {
   const t = tickets.get(id)
   if (!t || t.exp <= Date.now()) {
     tickets.delete(id)
-    return json(res, 404, { error: 'ticket_expired', message: '票据不存在或已过期' })
+    // 这个错误响应同样要带跨源头：数据源探测/取流失败也得让跨源页面的 fetch
+    // 读到状态码，而不是被 CORS 挡成一个网络错误（那样区分不出"票过期"与
+    // "地址不对"）。
+    return json(res, 404, { error: 'ticket_expired', message: '票据不存在或已过期' }, corsHeaders(req))
   }
   // 用票里存的凭证去上游取，把调用方自己的 cookie（多半没有）整个丢掉。
   const headers = { ...req.headers }
@@ -580,7 +659,7 @@ function serveTicket(req, res, url) {
   delete headers['accept-encoding']
   if (t.cookie) headers.cookie = t.cookie
   if (t.auth) headers.authorization = t.auth
-  proxyWith(req, res, t.path, headers)
+  proxyWith(req, res, t.path, headers, { extraHeaders: corsHeaders(req) })
 }
 
 /** 探一下上游认不认这个凭证。只取 1 个字节 —— 目的是鉴权，不是取内容。 */
@@ -620,7 +699,7 @@ function proxy(req, res, url, opts) {
 }
 
 /** `proxy` 的内核：路径与请求头由调用方决定（票据那条路要换掉凭证）。 */
-function proxyWith(req, res, path, headers, { isolate = true } = {}) {
+function proxyWith(req, res, path, headers, { isolate = true, extraHeaders = {} } = {}) {
   const isHttps = UPSTREAM.protocol === 'https:'
   const doRequest = isHttps ? httpsRequest : httpRequest
   // Host 必须换成上游的，否则服务端按我们的 Host 生成的绝对 URL 会指回自己。
@@ -641,6 +720,9 @@ function proxyWith(req, res, path, headers, { isolate = true } = {}) {
       // 少了它，视频在跨源隔离的页面里加载失败，而控制台只说 "net::ERR_BLOCKED"。
       // 管理台那条路（isolate=false）不需要，但给了也无害 —— 它本来就只吃同源资源。
       out['Cross-Origin-Resource-Policy'] = 'same-origin'
+      // 必须放在上面这行**之后**：票据那条路传 corsHeaders() 进来，要把这个默认值
+      // 覆盖成 cross-origin（spec §2.2），顺序反了就是覆盖了个寂寞。
+      Object.assign(out, extraHeaders)
       res.writeHead(upRes.statusCode ?? 502, out)
       upRes.pipe(res)
     },
@@ -724,7 +806,8 @@ function pickThresholds(cfg) {
   return out
 }
 
-function json(res, status, body) {
+/** `extraHeaders` 目前只有 `/healthz` 与票据的 404 会传（跨源头，见 corsHeaders()）。 */
+function json(res, status, body, extraHeaders = {}) {
   const buf = Buffer.from(JSON.stringify(body), 'utf8')
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -732,6 +815,7 @@ function json(res, status, body) {
     'Cache-Control': 'no-store',
     ...ISOLATION_HEADERS,
     ...SECURITY_HEADERS,
+    ...extraHeaders,
   })
   res.end(buf)
 }
