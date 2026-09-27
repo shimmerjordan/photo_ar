@@ -29,7 +29,8 @@ import {
   FULL_RECT, TTL_MS, clipVertices, flatQuadImage, imageToNdc, plausible, unitSquareH,
   videoCrop,
 } from '../render/screenquad.js'
-import { Stage, loadPhotoVideo, stageName } from '../mediaload.js'
+import { Stage, dlText, loadPhotoVideo, stageName } from '../mediaload.js'
+import { soundUnlocker } from '../playback.js'
 import { button, esc, h, playerControls } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
@@ -113,9 +114,13 @@ export default {
     }
     const rescan = button('重新扫描', () => resetLock(), { kind: 'ghost', iconName: 'refresh' })
     /**
-     * 声音 + 全屏。**共用 `ui.playerControls`**（试播页与宾客页是原生控件，这一页没有）：
-     * 声音按钮的标签由 `dom.clip.muted` 派生，而不是在 click 里自己改 —— 上一版就是
-     * 自己改的，于是重扫之后视频被重新静音，按钮还写着「静音」，用户点它反而关了声音。
+     * 播放/暂停 + 声音 + 全屏。**共用 `ui.playerControls`**（试播页与宾客页是原生控件，这一页
+     * 没有）：两个标签分别由 `dom.clip.paused` / `dom.clip.muted` 派生，而不是在 click 里自己
+     * 改 —— 上一版声音按钮就是自己改的，于是重扫之后视频被重新静音，按钮还写着「静音」，
+     * 用户点它反而关了声音。
+     *
+     * 暂停按下去就**停得住**：边下边播时新数据到达不会把它播回去（mp4stream 只在第一次有数据
+     * 可播时起播一次，见设计 §2.5）；切后台再回来也只续播"切走时本来在播"的（见 `onVis`）。
      *
      * 「全屏」在这一页不能是原生全屏：视频是画进 GL 的一块面片，`<video>` 元素本身是
      * 1px 的隐藏元素（见 `.offscreen`），全屏它等于全屏一个看不见的东西。所以这里换成
@@ -238,16 +243,49 @@ export default {
      * 同一屏只能有**一个**金框按钮 —— 金框的含义是"这一刻该点的就是它"，两个金框等于
      * 没有金框。所以主次不是各按钮自己的属性，而是这一屏的状态：由这个函数一次定完，
      * 其余全部落回 `ghost`。
+     *
+     * 落定的是谁记在 `primary` 里（null = 这一屏没有金框）：`onVolume` 要知道「开声音」是不是还亮着。
      */
+    let primary = null
     const setPrimary = (btn) => {
       // 指向一个**收起来的**按钮就等于这一屏没有金框，而调用点常常判断不了那个按钮
       // 此刻在不在（`rescan` 在没锁定时是 hidden 的）。退化成"谁都不是主动作"总比
       // 把金框发给一个看不见的按钮好。
-      // `closest('[hidden]')` 而不是 `btn.hidden`：声音按钮自己从不 hidden，
-      // 收起来的是包着它的那个 `ctl`（见 ui.playerControls）。
+      // `closest('[hidden]')` 而不是 `btn.hidden`：播放 / 声音按钮自己从不 hidden，
+      // 收起来的是包着它们的那个 `ctl`（见 ui.playerControls）。
       const target = btn && !btn.hidden && !btn.closest?.('[hidden]') ? btn : null
-      for (const b of [rescan, ctl.sound, camBtn, browse]) b.className = b === target ? '' : 'ghost'
+      primary = target
+      for (const b of [rescan, ctl.play, ctl.sound, camBtn, browse]) b.className = b === target ? '' : 'ghost'
     }
+    /**
+     * 「开声音」该不该是金框：**只在视频此刻是静音的时候**。默认有声（playback.startPlayback），
+     * 所以通常起播时它不亮；被浏览器拦下退成静音（或用户在设置里关了默认声音）才亮 ——
+     * 那时这一屏最该点的就是它。
+     */
+    const soundIfMuted = () => (dom.clip.muted ? ctl.sound : null)
+    /**
+     * 声音开了（第一次点屏幕被 `armSoundUnlock` 代劳开的、或者点了「开声音」本身），金框就
+     * 该撤掉：它已经写着「静音」了，还亮着等于叫人把刚开的声音再关掉。`st.soundNudge` 一并
+     * 放下：这一段的「该提醒开声」已经兑现，之后用户自己按静音是他的选择，贴回照片时不再点亮
+     * （见 onWorkerMessage 里「从平铺贴回去」那一支）。
+     */
+    const onVolume = () => {
+      if (dom.clip.muted) return
+      st.soundNudge = false
+      if (primary === ctl.sound) setPrimary(null)
+    }
+    dom.clip.addEventListener('volumechange', onVolume)
+    /**
+     * 被拦下有声自动播放时，**第一次点屏幕任意处**自动开声（设计 §2.4）。**每一段被拦时才挂**
+     * （`unlock.update(s.autoplay)`，见 paintStage 的 PLAYING 支），换片 / 重扫 / 卸载时解除：
+     * 早早挂上的话，扫描时对焦、点按钮的那几下就把这个一次性监听用掉了。
+     *
+     * 那一下手势之后能不能"之后每一段都直接有声起播"**取决于浏览器**：Chromium 会记住页面
+     * 有过用户激活（sticky activation），之后的几段通常不再被拦；WebKit（iOS Safari）不一定
+     * 认这一条。所以不指望它 —— 哪一段被拦，就在那一段重新挂一次。
+     * 点在「开声音」本身上不代劳、也不消耗（按钮带 `data-role="sound"`，见 playback.js）。
+     */
+    const unlock = soundUnlocker(dom.clip)
 
     dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, ctl, camBtn, browse), dom.meta)
     el.append(dom.canvas, dom.cam, dom.clip, dom.hud)
@@ -283,6 +321,13 @@ export default {
       // 视频装载到哪一步了、以及那一步的细节数字。前者用来判"阶段变了没有"（播放进度
       // 每秒来好几次，不判的话每次都会重写一遍 tip 并重放那颗星的动画）。
       loadStage: null, loadNote: null,
+      // 起播之后的下载那一句（`dlText`），见 `noteDl`：还在下 → 实时的「已下载 …」；下完 →
+      // 「已存到本机」说**一次**（`dlSaid`），3 秒后由 `dlTimer` 清掉。
+      dlNote: '', dlSaid: false, dlTimer: 0,
+      // 这一段是不是静音起播的（被浏览器拦下、或设置里关了默认声音），且用户还没开过声。
+      // 首次 PLAYING 时记下，「从平铺贴回去」要用同一个判据决定「开声音」要不要金框 ——
+      // 那时只看"此刻是否静音"的话，用户自己按了静音再贴回去，「开声音」就被点成了金框。
+      soundNudge: false,
       // 渲染循环每帧要用的缓冲，跨帧复用而不是每帧 `new Float32Array` —— rAF 频率下
       // 那是持续的小分配，攒起来就是 GC 停顿。`cropKey` 记着上一次算 `crop` 用的
       // 那对 aspect，比例没变就不必重跑 videoCrop（源矩形只由这两个数决定）。
@@ -314,6 +359,7 @@ export default {
      * | 一切正常 | （空） | 库/帧率/耗时/四角年龄/跟踪点/视频分辨率 |
      * | 这张没配视频 | 「这张照片还没配视频」 | `无视频` |
      * | 视频在加载 | 「视频加载中…」 | `视频加载中 rs=1` |
+     * | 边下边播 | 「已下载 3.2 / 8.1 MB」→ 下完「已存到本机，下次秒开」3 秒 | 同左 |
      * | 视频出错 | 「视频播不了」 | `视频错误 4` |
      * | 词表没训 | （空 —— 那只影响速度，不影响结果） | `无词表·全量扫描` |
      *
@@ -359,6 +405,7 @@ export default {
           if (st.filter?.correcting) parts.push('纠正滑行中')
           if (st.filter?.rejected) parts.push(`毛刺 ${st.filter.rejected}`)
           if (st.loadNote) parts.push(`${st.loadStage} ${st.loadNote}`)
+          if (st.dlNote) parts.push(st.dlNote)
           if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
           else if (v.error) parts.push(`视频错误 ${v.error.code}`)
           else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
@@ -375,6 +422,9 @@ export default {
         else if (st.loadNote) parts.push(st.loadNote)
         else if (v.readyState < 2) parts.push('视频加载中…')
         else if (v.paused) parts.push('视频已暂停')
+        // 起播之后的下载（`noteDl`）。**不进上面那条 else-if 链**：它与「已暂停」「加载中」是
+        // 同时成立的两件事 —— 暂停着照样在下，原来就是被顶掉的那一件（设计 §0 需求 3）。
+        if (st.dlNote && st.lockedPhoto.mediaUrl && !v.error) parts.push(st.dlNote)
         // 贴合准确度。**只在不稳时说话**（稳的时候这行字本身就是干扰），
         // 而且说的是"怎么办"不是数字：跟踪点少 = 角度太斜/太远/反光，
         // 这三样宾客都能自己调整。分档阈值见 fitQuality()。
@@ -453,6 +503,8 @@ export default {
       st.stopLoad = null
       st.loadStage = null
       st.loadNote = null
+      clearDlNote()
+      unlock.reset()
       ctx.progress?.(null, { hide: true })
       dom.clip.pause()
       dom.clip.removeAttribute('src')
@@ -464,7 +516,7 @@ export default {
       st.weakRun = 0; st.guideKey = ''; st.guideAt = 0
       // 下一段视频是从贴合开始的，所以平铺（含满屏）连带那个按钮的标签一起撤掉。
       exitFlat()
-      st.blendStart = 0; st.hitTip = ''
+      st.blendStart = 0; st.hitTip = ''; st.soundNudge = false
       setPrimary(null)
       tip(guideTip({}).text)
     }
@@ -475,8 +527,8 @@ export default {
      * | 位置 | 放什么 | 变化频率 |
      * |---|---|---|
      * | `#tip`（HUD 大字） | 阶段名：`正在取视频…` → `正在下载视频…` → `内点 42。` | 每阶段一次 |
-     * | `#meta`（HUD 小字） | 细节数字：`3.2 / 8.1 MB`、`本机已有，秒开` | 每 200ms |
-     * | `#bar`（顶部金条） | 百分比 / 扫描动画 / **起播后接着当播放进度** | 每帧 |
+     * | `#meta`（HUD 小字） | 细节数字：`3.2 / 8.1 MB`、`本机已有，秒开`；起播后 `已下载 …`（见 `noteDl`） | 每 200ms |
+     * | `#bar`（顶部金条） | 百分比 / 扫描动画 / **起播后亮层 = 播放进度、暗层 = 已下载** | 每帧 |
      *
      * 数字**不能**放进 tip：它有 `min-height: 40px`，文字长度每 200ms 变一次会让整块
      * 木牌高度抖动 —— 而用户正在读它。
@@ -491,16 +543,32 @@ export default {
       // 会让用户对剩余时间形成一个必然错误的预期。理由与 ui.js 的 loading() 同一条。
       // `label` 是这条金条的 `aria-label`：**必须换**，不换的话读屏会在播视频时
       // 一直念「加载识别引擎 40%」（那是引擎加载时留在上面的那句）。
-      const bar = (pct, label) =>
-        ctx.progress?.(typeof pct === 'number' ? pct * 100 : -1, { label })
+      const bar = (pct, label, extra = {}) =>
+        ctx.progress?.(typeof pct === 'number' ? pct * 100 : -1, { label, ...extra })
+      // 经局域网下的要说出来（`stageName` 的 `via`）。`via` 只在下载档的事件上有，
+      // 挂到下载任务之后每一条都带着 `dl.source`，两个都认。
+      const name = () => stageName(s.stage, { fromCache: s.fromCache, via: s.via ?? s.dl?.source })
 
       if (s.stage === Stage.PLAYING) {
-        bar(s.pct, '播放进度')
+        const dl = s.dl
+        // 暗层 = 已下载。下完了（或本机已有、`dl` 为空）就不画：那时它恒等于满格，
+        // 只是在亮层后面垫一块不说任何事的底。`total` 为 0 = 不知道总长，也不画（不编比例）。
+        bar(s.pct, '播放进度', { buffered: dl && !dl.done && dl.total ? dl.loaded / dl.total : null })
+        // 装载那一句（`3.2 / 8.1 MB`）**先**撤掉再说下载：`noteDl` 里那次 `meta()` 会立刻画，
+        // 顺序反过来的话首次 PLAYING 那一刻画出来的是「3.2 / 8.1 MB · 已下载 3.2 / 8.1 MB」，
+        // 而下面那次不带 force 的 `meta()` 落在 250ms 节流里被丢掉，重复的数字就挂在那儿。
+        if (changed) st.loadNote = null
+        noteDl(dl)
+        // 被拦成静音才挂「第一次手势开声」；同一份起播结果只处理一次（见 playback.soundUnlocker）。
+        unlock.update(s.autoplay)
         if (!changed) return
-        st.loadNote = null
         ctl.hidden = false
-        // 视频起播了：这一刻该点的是「开声音」（默认静音起播，见 onHit），不是「重新扫描」。
-        setPrimary(ctl.sound)
+        // 视频起播了。默认有声（playback.startPlayback），所以通常这一屏没有金框 —— 只有被
+        // 浏览器拦下退成静音时，该点的才是「开声音」（第一次点屏幕任意处也会代劳，见上面的 unlock）。
+        // 再查一次 `dom.clip.muted`：`autoplay` 是起播那一刻的结果，以此刻的实际状态为准。
+        // 判据记进 `st.soundNudge`：贴回照片时用同一个（见 onWorkerMessage）。
+        st.soundNudge = Boolean(s.autoplay?.muted) && dom.clip.muted
+        setPrimary(st.soundNudge ? ctl.sound : null)
         st.hitTip = `认出了 <b>${title}</b>，内点 ${inliers}。`
         tip(st.hitTip, { hit: true })
         meta()
@@ -511,6 +579,9 @@ export default {
       const terminal = s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR
       if (terminal) {
         st.loadNote = null
+        clearDlNote()
+        unlock.reset()
+        st.soundNudge = false // 坏视频不该在后续贴回时点亮「开声音」
         ctx.progress?.(null, { hide: true })
         // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
         tip(`认出了 ${title}，但${esc(s.text)}。`, { hit: true })
@@ -518,13 +589,53 @@ export default {
         // **阶段名，不是 `stageText`。** 后者在下载那一档给的是数字（`0.0 / 8.1 MB`），
         // 而那串数字此刻已经在下面那行小字里了（`st.loadNote`）—— 同一句显示两遍，
         // 且 tip 上那句读起来不知道在干什么。上面那张表说的就是这条分工。
-        tip(`认出了 <b>${title}</b>，${stageName(s.stage, { fromCache: s.fromCache }) || '正在加载'}…`, { hit: true })
-        bar(s.pct, stageName(s.stage, { fromCache: s.fromCache }) || '加载视频')
+        tip(`认出了 <b>${title}</b>，${name() || '正在加载'}…`, { hit: true })
+        bar(s.pct, name() || '加载视频')
       } else {
-        bar(s.pct, stageName(s.stage, { fromCache: s.fromCache }) || '加载视频')
+        bar(s.pct, name() || '加载视频')
       }
       // 终局（不管是不是这一秒里最新的一条）必须立刻可见：往后不会再有下一条把它盖住。
       meta(terminal)
+    }
+
+    /**
+     * 起播之后的下载那一句（HUD 小字，见 `meta`）。**还在下**：实时的「已下载 3.2 / 8.1 MB」。
+     * **下完**：「已存到本机，下次秒开」说一次、3 秒后收掉 —— 那是这次下载兑现的时刻，
+     * 值得一句；但之后每一条 PLAYING 都带着 `dl.done`，不挡的话它就永远挂在取景器底下了。
+     *
+     * 两种不说：本机已有（`fromCache`，装载那一步已经说过「本机已有，秒开」）、`dl` 为空
+     * （直连那两条例外路，不归下载任务管）。没存进本机（`cacheFailed`）**不收**：那是这段
+     * 视频下次还要重下的原因，一闪而过等于没说（ui.toast 那条「失败不要用 toast」同理）。
+     */
+    function noteDl(dl) {
+      let text = ''
+      if (dl && !dl.fromCache) {
+        if (!dl.done || dl.cacheFailed) text = dlText(dl)
+        else if (st.dlSaid) text = st.dlNote   // 说过了：留着（3 秒内）或已清空，都不再动
+        else {
+          st.dlSaid = true
+          text = dlText(dl)
+          clearTimeout(st.dlTimer)
+          st.dlTimer = setTimeout(() => {
+            st.dlTimer = 0
+            if (!st.alive) return
+            st.dlNote = ''
+            meta(true)
+          }, 3000)
+        }
+      }
+      if (text === st.dlNote) return
+      const settled = Boolean(dl?.done) || !text
+      st.dlNote = text
+      // 下载中的数字每收一块就变，走 meta 自己的 250ms 节流；「下完了」那一句必须立刻可见。
+      meta(settled)
+    }
+    /** 换片 / 重扫 / 卸载：那句话属于上一段视频，连同 3 秒的计时一起撤掉。 */
+    function clearDlNote() {
+      clearTimeout(st.dlTimer)
+      st.dlTimer = 0
+      st.dlNote = ''
+      st.dlSaid = false
     }
 
     /**
@@ -550,10 +661,13 @@ export default {
         exitFlat()
         st.blendStart = 0
         st.hitTip = ''
+        st.soundNudge = false
         st.stopLoad?.()
         st.stopLoad = null
         st.loadStage = null
         st.loadNote = null
+        clearDlNote()
+        unlock.reset()
         ctx.progress?.(null, { hide: true })
         dom.clip.pause()
         dom.clip.removeAttribute('src')
@@ -575,11 +689,16 @@ export default {
       exitFlat()
       st.blendStart = 0
       st.hitTip = ''
+      st.soundNudge = false
       dom.clip.dataset.photo = photo.id
       diagAlways(`命中 ${photo.id?.slice(0, 8)} 内点=${m.inliers} aspect=${photo.aspect ?? 'null'} → 取媒体信息`)
-      dom.clip.muted = true
+      // 不在这里定静音：默认有声，由 playback.startPlayback 决定、被拦时退静音（mp4stream 起播
+      // 那一次调它）。原来这里是 `muted = true`（默认静音起播）。
       st.stopLoad?.()
       st.loadStage = null
+      clearDlNote()
+      // 上一段的「第一次手势开声」属于上一段：这一段被拦时会在它自己的首次 PLAYING 重挂。
+      unlock.reset()
       st.stopLoad = loadPhotoVideo(dom.clip, photo.id, {
         onStage: (s) => { if (st.alive) paintStage(s, title, m.inliers) },
         onDiag: diagAlways,
@@ -651,7 +770,10 @@ export default {
           // 贴回照片上了 → 循环恢复（贴合状态下播完要接着放，见 onVideoEnded）。
           // 这里只会是 70% 平铺 —— 满屏那一档在上面就被挡掉了，走不到这儿。
           exitFlat()
-          setPrimary(ctl.sound)
+          // 与起播那一刻**同一个判据**（`st.soundNudge`，见 paintStage 的 PLAYING 支）：静音起播、
+          // 用户还没开过声，才把金框给「开声音」。只看"此刻是否静音"的话，用户自己按了静音再
+          // 贴回去，「开声音」会被点成金框 —— 像在催他把刚关的声音开回来。
+          setPrimary(st.soundNudge ? soundIfMuted() : null)
           // 把起播那一句放回去：视频已经贴回照片上了，HUD 不能还写着"跟丢了"。
           if (st.hitTip) tip(st.hitTip, { hit: true })
         }
@@ -988,6 +1110,11 @@ export default {
      *
      * 重开走 `openCam()`（权限已给过，getUserMedia 静默通过，几百毫秒黑屏）。`visSeq`
      * 挡「hidden→visible 快速切两次」：前一次重开还在 await 时后一次已经在停了。
+     *
+     * 这里只暂停得了**切走那一刻已经在播**的视频。扫到了、第一块数据还没到就锁屏的那段，
+     * 起播发生在切走之后 —— 那一下由 `mp4stream` 把关：隐藏时推迟起播，回前台才起
+     * （默认有声，不把关的话会在口袋里出声）。所以这里的 `pausedClip` 对它是 false、
+     * 回前台不重复 `play()`，起播交给 mp4stream 那边的 `visibilitychange`。
      */
     let visSeq = 0
     const onVis = async () => {
@@ -1014,8 +1141,11 @@ export default {
 
     function teardown() {
       st.alive = false
-      // **必须停**：不停的话切页之后那十几 MB 还在下，而用户以为已经离开了。
+      // 卸载函数只是**不再听**，不取消下载任务（mediaload.js：没人要了也下完落本机缓存，
+      // 下次扫到秒开）。停的是喂流、播放进度监听与 blob: 地址。
       st.stopLoad?.()
+      clearDlNote()
+      unlock.reset()
       // 顶部那条金条是**全局的**（引擎加载时也用它）。不收的话，从扫描页切到别的页
       // 之后它会带着上一段视频的播放进度停在那儿，而那一页跟它毫无关系。
       ctx.progress?.(null, { hide: true })
@@ -1025,7 +1155,8 @@ export default {
       dom.clip.removeEventListener('error', onVideoErr)
       for (const ev of videoEvents) dom.clip.removeEventListener(ev, onVideoEvent)
       dom.clip.removeEventListener('ended', onVideoEnded)
-      // 声音按钮的三个同步监听也挂在 dom.clip 上（见 ui.playerControls）。
+      dom.clip.removeEventListener('volumechange', onVolume)
+      // 播放 / 声音按钮的同步监听也挂在 dom.clip 上（见 ui.playerControls）。
       ctl.dispose()
       // **相机必须停**：不停的话相机灯一直亮、电量哗哗掉，而用户以为已经离开这一页了。
       if (st.stream) stopCamera(st.stream)

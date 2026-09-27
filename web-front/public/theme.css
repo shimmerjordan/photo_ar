@@ -138,6 +138,7 @@ img, #gate, .junimo, .warnbox::before { image-rendering: pixelated; }
 .card,
 button,
 input:not([type="file"]),
+select,
 .chip,
 .tab,
 .toast,
@@ -159,7 +160,8 @@ input:not([type="file"]),
 .warnbox,
 .letter,
 .tab.on,
-input:not([type="file"]) {
+input:not([type="file"]),
+select {
   --fg: var(--ink);
   --fg-dim: var(--ink-dim);
   --fg-bad: var(--ink-bad);
@@ -201,10 +203,24 @@ button:active:not(:disabled) { transform: translateY(3px); filter: none; }
 button:disabled { filter: grayscale(60%) brightness(70%); }
 button.ghost {
   border-image-source: url("/art/frame-night-s.png");
+  /* 夜色木上的字：四色**一起**切回夜色那一档。只切 --fg 的话，它站在桃色面板里时继承到的
+     --fg-dim / --fg-ok 还是墨色那档 —— 深棕、深绿的字落在深色木头上，几乎看不见
+     （设置页「版本」那一行的「版本」两个字就是这么暗下去的）。 */
   --fg: var(--lit);
+  --fg-dim: var(--lit-dim);
+  --fg-bad: var(--lit-bad);
+  --fg-ok: var(--gold);
 }
 button.danger { border-image-source: url("/art/frame-red-s.png"); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+/* 面板里按钮行后面还有字（说明、结果、报错）时隔开一格：不隔的话那一行字直接贴在按钮 3px 的
+   硬阴影上，读起来像是按钮的一部分。没有后续内容时不用 —— 面板自己有下内边距。
+   fix1 Finding 7：间距原来挂在 `.actions:not(:last-child)` 上，而「不是最后一个子元素」不
+   看兄弟是否可见 —— 媒体页木牌里默认 `hidden` 的 note 也算一个兄弟，于是按钮行底部平白多出
+   10px（下面明明什么都没露出来）。改成挂到后面那个真正露出来的兄弟身上（`margin-top`），
+   不用 `:has()`（仓库里一律回避，见 `.card-main` 那条的说明）：`[hidden]` 元素不会匹配
+   `:not([hidden])`，天然就没有这一份间距。 */
+.panel .actions ~ :not([hidden]) { margin-top: 10px; }
 /* 一组按钮（`ui.playerControls` 的声音 + 全屏）。`display: contents` 让那两个按钮
    直接成为 `.actions` 的弹性项 —— 否则它们挤在一个 inline 盒子里，既吃不到 gap
    也不跟着换行。`[hidden]` 那条带 !important，所以整组照样能一起收起来。 */
@@ -344,15 +360,46 @@ button.danger { border-image-source: url("/art/frame-red-s.png"); }
 
 /* ══ 照片：一张一个木相框 ══════════════════════════════════════════════ */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+/* 一张卡片 = 一个 div 木框里两个按钮：上面是「画」（缩略图 + 标题 + 徽标，点它进详情），
+   下面是缓存按钮。**按钮不能嵌套**，所以木框从原来那个整张的 `<button>` 挪到了 div 上。 */
 .card {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   padding: 0;
-  text-align: left;
   min-height: 0;
   filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%));
   transition: transform 90ms steps(3), filter 90ms steps(3);
 }
-.card:active { transform: translateY(3px); filter: none; }
+/* 「画」那一块：把 `button` 给的金框、最小高度去掉 —— 它是相框里的画，不是一块单独的木头。
+   按下的反馈仍然是它自己（下面那条），不是整张卡片一起沉：原来试过让外层 `.card` 借
+   `:has(> .card-main:active)` 一起沉，但仓库里 `:has()` 一律回避（`shell.js:211`、
+   下面 `body.fullbleed #bar` 那条同理）—— 不认它的老 WebView 上会整条失效，「画」按下去
+   连反馈都没有。「画」自己沉、缓存按钮也自己沉（`button:active` 那条本来就管），两个按钮各按
+   各的，不用去猜哪一个被按了，也就不需要 `:has()`。 */
+button.card-main {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-image: none;
+  text-align: left;
+  /* 没有边框木纹，所以也不该有 `button {}` 默认给的那圈「浮起来」硬阴影——按下时跟着
+     steps() 的节奏沉，不是硬切一下：不再单独声明 `transition`，按下与松开都走
+     `button {}` 给的那一条（转到 :active 时 filter 变 none，见下）。 */
+  filter: none;
+}
+/* 缓存按钮：夜色木（`button.ghost`）铺满卡片底部一行。`margin-top: auto` 把它压到底：同一行
+   两张卡片被网格拉成一样高，标题一行和标题加徽标两行的那张，按钮要落在同一条线上。 */
+button.card-cache { width: 100%; margin-top: auto; }
+button.card-cache.ok { color: var(--fg-ok); }
+button.card-cache.off { color: var(--fg-dim); }
+/* 「下载 42%」不可点，但它在报进度，不该像「无视频」那样压灰 —— 压灰只留给真的不可用的那一档。
+   fix1 Finding 6：原来是 `:disabled:not(.off)`，范围太宽 —— 状态还没查出来的占位「缓存」、
+   点了之后到下载任务真正建起来之间那一小段 busy，同样是「disabled 但不是 off」，也被这条
+   一起免了压灰，看着像还能点、点了却没反应。改成只认「正在下载」这一档专门的 class。 */
+button.card-cache:disabled.dl { filter: drop-shadow(0 3px 0 rgb(0 0 0 / 55%)); }
 .thumb { display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover; background: #000; }
 .card-b { padding: 4px 2px 0; display: flex; flex-direction: column; gap: 3px; }
 .card-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -367,6 +414,20 @@ button.danger { border-image-source: url("/art/frame-red-s.png"); }
 .framed { display: block; margin: 0 0 12px; filter: drop-shadow(0 3px 0 rgb(0 0 0 / 45%)); }
 .ref { display: block; width: 100%; max-height: 42vh; object-fit: contain; background: #000; }
 .ttl { font-size: 24px; line-height: 32px; margin: 0 0 12px; color: var(--gold); }
+
+/* 面板里的清单（缓存页「本机缓存的组」、设置页「单个媒体的来源」）：一条一行，标题 + 一行说明 +
+   右边一个按钮。**不套木框**，理由同下面的 `.list`：可能几十行，要当清单读；分隔线沿用 `.row2`。 */
+.entries:not(:empty) { margin-bottom: 10px; }
+.entry { display: flex; align-items: center; gap: 8px; padding: 4px 2px; border-bottom: 2px solid var(--rule); }
+.entry:last-child { border-bottom: 0; }
+.entry-b { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.entry-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entry-m { color: var(--fg-dim); word-break: break-all; }
+.entry-m .ok { color: var(--fg-ok); }
+.entry > button { flex: none; }
+/* 面板里的小节标题（设置页「高级设置」里的三块）。同样只有 12px：层次靠上面那条分隔线与间距。 */
+.sub { margin: 14px 0 6px; padding-top: 10px; border-top: 2px solid var(--rule); letter-spacing: 1px; }
+.sub:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
 
 /* ══ 列表 ══════════════════════════════════════════════════════════════
    刻意**不**给每条套木框：这一页可能有两百条，两百块木牌是两百块木牌，
@@ -395,6 +456,21 @@ input:not([type="file"]) {
 }
 input::placeholder { color: var(--ink-dim); opacity: 1; }   /* 占位符也要 4.5:1 */
 input:focus { border-image-source: url("/art/frame-gold-s.png"); }
+/* 下拉框：原生的那个带圆角和系统字，所以与输入框同一副木框。`appearance: none` 把系统的小箭头
+   也去掉了，补一个像素箭头（`.sel-arrow`：「返回」那张图标转 -90° 朝下）—— 没有箭头的话它看起来
+   就是一个输入框，没人知道能点开。 */
+select {
+  border-width: 10px;
+  border-image: url("/art/frame-s.png") 10 fill;
+  min-height: 44px;
+  padding: 0 24px 0 4px;
+  width: 100%;
+  -webkit-appearance: none;
+  appearance: none;
+}
+select:focus { border-image-source: url("/art/frame-gold-s.png"); }
+.sel { position: relative; }
+.sel-arrow { position: absolute; right: 12px; bottom: 14px; transform: rotate(-90deg); pointer-events: none; color: var(--fg); }
 label { display: block; }
 .field, .file { display: block; margin-bottom: 10px; }
 /* `:first-child` 是必须的：一个 .file 里还有「选择文件」木牌和文件名两个 span，
@@ -454,6 +530,9 @@ label { display: block; }
   overflow: hidden;
 }
 #bar[hidden] { display: none; }
+/* 给第二层（`> b`）当定位容器。全屏页上下面那条 `body.fullbleed #bar` 把它改成 absolute，
+   优先级更高、同样是定位容器，所以这一条在那里不起作用也不碍事。 */
+#bar { position: relative; }
 /* `.bar2` 是**面板内**的那一条（素材页），紧跟在按钮行下面。`#bar` 是压在相机预览上的
    那条浮层，不能有外边距 —— 所以这里只给 `.bar2`。 */
 .bar2 { margin-top: 14px; }
@@ -476,6 +555,25 @@ body.fullbleed #bar {
   transform-origin: left center;
   /* 动 transform 而不是 width：这条在相机预览之上、加载期间每 200ms 更新一次。 */
   transition: transform 180ms linear;
+}
+/* 第二层：边下边播时**已下载**到哪（app.js 的 `progress(…, {buffered})`）。同一种金、压到 .35，
+   垫在播放进度（`i`）下面 —— 亮的走在暗的里面，一眼看出"放到哪了、下到哪了"。
+   `inset: 2px` 与 `#bar` 的 padding 对齐：落在木槽里，不压住槽边。`i` 也要定位
+   （`position: relative`），两个定位元素同层按文档顺序画，app.js 把 `b` 插在 `i` 前面，
+   于是 `i` 在上。不给 `i` 定位的话，绝对定位的 `b` 会画到它上面去。
+   过渡是 `steps(3, start)`（= jump-start；写老名字是为了老 WebView），不是默认的 jump-end：
+   下载进度**每收一块就更新一次**（实测约 30 次/秒），每次更新都从当前值重起一段过渡。
+   jump-end 要等 60ms 才走第一步，更新比那更密时它一步都走不出去 —— 量过：目标 33% 时
+   画出来的是 15%，暗层一直落后一半。jump-start 起点就先走三分之一，更新再密也追得上。 */
+#bar > i { position: relative; }
+#bar > b {
+  position: absolute;
+  inset: 2px;
+  background: var(--gold);
+  opacity: .35;
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 180ms steps(3, start);
 }
 #bar.indeterminate > i { animation: sweep 1100ms steps(12) infinite; transition: none; }
 @keyframes sweep {

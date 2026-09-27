@@ -249,9 +249,14 @@ export default {
         }
 
         const pid = created?.photoId ?? created?.id
-        if (videoUp && pid && !created?.hasVideo) {
-          // createPhoto 没能一次带上视频时补一刀。**这一步不能省**：照片入库成功而
-          // 视频没配上时，扫到它不会播任何东西，而界面上看起来"成功了"。
+        // 只在视频**没随入库那一步带上**时补 attach。原来的判据是 `!created?.hasVideo`，而
+        // `POST /v1/photo`（服务端 `_create_photo`）的响应里根本没有 `hasVideo` 这个字段 ——
+        // 于是它永远为真，每次都把 `ingest_photo` 刚配好的视频再 attach 一遍：又一次 ffprobe
+        // 探测、又一次可能的转码判断，白等几秒，还多一个"第二步失败、但其实已经配上了"的误报口子。
+        // `videoPath` 带进 payload 了，`ingest_photo` 就在入库那一步探测、登记（必要时转码）并配上它，
+        // 出问题会抛 `IngestRejected`、走不到这里。剩下会走进这个分支的只有「上传那一步没拿到服务端
+        // 路径」一种：那时这一刀会被服务端拒掉、落进下面的 catch 如实报「没成」，而不是显示「成了」。
+        if (videoUp && pid && !payload.videoPath) {
           say('配视频…')
           await api.attachVideo(pid, { videoPath: videoUp.nasPath })
         }

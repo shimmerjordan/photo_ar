@@ -107,6 +107,23 @@ export const button = (label, onclick, { kind = '', iconName = null, disabled = 
  */
 export const soundLabel = (muted) => (muted ? '开声音' : '静音')
 
+/** 播放/暂停按钮的标签。同理**只能由 `video.paused` 派生**，见 [playerControls]。 */
+export const playLabel = (paused) => (paused ? '播放' : '暂停')
+
+/**
+ * 被浏览器拦下有声自动播放、退成静音之后，**用原生控件的那两页**（宾客页、试播页）说的话。
+ *
+ * 扫描页没有这一句：它有自己的「开声音」按钮，被拦时把它点成金框就够了。原生控件的页面
+ * 没有可以点亮的按钮，而静音的喇叭图标很容易被当成"这段视频没声音"。
+ * 说「视频上的喇叭」或「页面别处」而不是「任意处」：那两页的 `<video>` 标着
+ * `data-role="sound"`（原生静音键在它的 shadow DOM 里，见 view.js），点在视频上不代劳开声。
+ *
+ * 「点一下页面别处」**必须是真的**：这句话只在被拦之后出现，而「第一次手势开声」的监听也正是
+ * 那时才挂上（`playback.soundUnlocker`）；点在视频上不消耗它，滑动页面也不消耗（听的是
+ * `pointerup`，滑动时浏览器发 `pointercancel`）。所以提示在屏上时，点别处一定还有效。
+ */
+export const SOUND_BLOCKED_HINT = '浏览器先静音播放了 —— 点视频上的喇叭，或点一下页面别处，就有声音'
+
 /**
  * 进度条那一格的样子。抽成纯函数是为了能在 node 里钉住不定长那一档
  * （**不编假百分比**，理由与 [loading] 同一条）。
@@ -131,26 +148,65 @@ export function setBar(bar, pct) {
 }
 
 /**
- * 视频控件：声音 / 全屏。**状态全部从 video 元素派生**，按钮不自己记 —— 上一版的声音按钮
- * 只在 click 里改标签，重扫后视频被静音而按钮还写着「静音」。
+ * 播放器下面的**下载行 + 下载条**（宾客页、试播页）。`text` 是 `mediaload.dlText(dl)` ——
+ * 由调用方算好传进来，免得这里反过来 import mediaload（它已经 import 了这个文件）。
+ *
+ * 行：有话说才露出来（空的 `<p>` 也占一格外边距）。条：只在**还在下**时露出来 —— 下完了
+ * （或本机已有）那句「已存到本机」就够了，一条满格的条不再说任何事。`total` 为 0 = 不知道
+ * 总长，走 `setBar` 的不定长那一档（铺满压暗），不编比例。
+ */
+export function setDownloadRow(line, bar, dl, text) {
+  line.textContent = text
+  line.hidden = !text
+  const going = Boolean(dl && !dl.done)
+  bar.hidden = !going
+  if (going) setBar(bar, dl.total ? dl.loaded / dl.total : null)
+}
+
+/**
+ * 视频控件：播放/暂停 / 声音 / 全屏。**状态全部从 video 元素派生**，按钮不自己记 —— 上一版的
+ * 声音按钮只在 click 里改标签，重扫后视频被静音而按钮还写着「静音」。
  *
  * `onFullscreen` 给扫描页：那一页没有原生控件（视频是画进 GL 的一块面片，
  * `<video>` 元素本身是 1px 的隐藏元素，对它 `requestFullscreen` 会全屏一个看不见的
  * 东西），所以它自己接管 —— 换成满屏平铺。其余页面走原生全屏。
+ *
+ * 声音按钮带 `data-role="sound"`：`playback.armSoundUnlock` 靠它认出"这一下点在声音按钮上"，
+ * 那时不代劳开声（否则它先开、按钮的 click 再关，用户看到的是"点了开声音反而没声"）。
+ *
+ * 按钮用 `h()` 拼而不走 `button()`：标签要被反复改，手上直接拿着那个 `<span>` 就行
+ * （`button()` 走 innerHTML，还得每次 `querySelector` 回去找它）。
  */
 export function playerControls(video, { onFullscreen = null } = {}) {
-  const sound = button(soundLabel(video.muted), () => {
+  const ctlButton = (text, onclick, attrs = {}) => {
+    const span = h('span', { text })
+    const b = h('button', { class: 'ghost', onclick, ...attrs }, span)
+    b.labelEl = span
+    return b
+  }
+  const play = ctlButton(playLabel(video.paused), () => {
+    if (video.paused) video.play().catch(() => {})
+    else video.pause()
+  })
+  const sound = ctlButton(soundLabel(video.muted), () => {
+    // 只在**本来就在播**时补一次 play()：有的浏览器在开声那一刻会把视频停下，补一下是为了
+    // 接着放。用户暂停着的时候开声音只该开声 —— 原来这里无条件 play()，于是"暂停着想先把
+    // 声音打开"会把视频播起来，暂停白按了。
+    const wasPlaying = !video.paused
     video.muted = !video.muted
-    if (!video.muted) video.play().catch(() => {})
-  }, { kind: 'ghost' })
-  const full = button('全屏', () => onFullscreen ? onFullscreen() : video.requestFullscreen?.().catch(() => {}), { kind: 'ghost' })
-  const sync = () => { sound.querySelector('span').textContent = soundLabel(video.muted) }
-  // `emptied` / `loadstart`：换源（重扫、换照片）时 muted 会被调用方重置，
-  // 而那时不会有 `volumechange`。
-  const evs = ['volumechange', 'emptied', 'loadstart']
+    if (!video.muted && wasPlaying) video.play().catch(() => {})
+  }, { 'data-role': 'sound' })
+  const full = ctlButton('全屏', () => onFullscreen ? onFullscreen() : video.requestFullscreen?.().catch(() => {}))
+  const sync = () => {
+    play.labelEl.textContent = playLabel(video.paused)
+    sound.labelEl.textContent = soundLabel(video.muted)
+  }
+  // `emptied` / `loadstart`：换源（重扫、换照片）时 muted / paused 会被重置，
+  // 而那时不会有 `volumechange` / `pause`。
+  const evs = ['play', 'pause', 'volumechange', 'emptied', 'loadstart']
   for (const ev of evs) video.addEventListener(ev, sync)
-  const el = h('span', { class: 'ctl' }, sound, full)
-  el.sound = sound; el.full = full; el.sync = sync
+  const el = h('span', { class: 'ctl' }, play, sound, full)
+  el.play = play; el.sound = sound; el.full = full; el.sync = sync
   el.dispose = () => { for (const ev of evs) video.removeEventListener(ev, sync) }
   return el
 }

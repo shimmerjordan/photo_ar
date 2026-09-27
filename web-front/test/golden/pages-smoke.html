@@ -147,7 +147,9 @@ runPage(async () => {
   {
     win.location.hash = '#/photos'
     await new Promise((r) => setTimeout(r, 1500))
-    const card = doc.querySelector('#view .card')
+    // Task 8 fix1 Finding 1：卡片结构改了（`.card` 现在是 div，导航挂在子元素
+    // `.card-main` 按钮上），对 div 调 .click() 不会传到子按钮 —— 选择器要指到那个按钮上。
+    const card = doc.querySelector('#view .card .card-main')
     if (card) {
       card.click()
       await new Promise((r) => setTimeout(r, 1500))
