@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import stat as stat_mod
 import threading
 import time
 from dataclasses import dataclass, field
@@ -71,9 +72,11 @@ from .config import (
     ServerConfig,
 )
 from .db import (
+    FIT_MODES,
     MOUNT_KINDS,
     MOUNT_LOCAL,
     MOUNT_WEBDAV,
+    AssetInUse,
     Catalog,
     NameTaken,
     effective_fit_mode,
@@ -87,6 +90,24 @@ from .ranges import ByteRange, RangeNotSatisfiable, parse_range
 from .safepath import PathDenied, Roots
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# 库内近重复扫描（`POST /v1/admin/duplicates/scan`）的软上限，秒。
+#
+# 那一步是逐张跑 `library.conflicts`（每张几十次几何校验），几百张的库在 NAS 的
+# CPU 上可能要分钟级。超过 Cloudflare 隧道 125 秒的硬超时，浏览器拿到的是一个
+# 524 而不是任何结果 —— 所以宁可到点就停、把**已经扫出来的**那部分交出去并标
+# `truncated`，也不要为了「扫全」换来一个什么都没有的超时。60 秒给隧道留足一半余量。
+# 模块级常量而不是写死在函数里，是为了测试能把它拨成 0 来钉住截断那条路径。
+_DUP_SCAN_BUDGET_S = 60.0
+
+# 扫描结果里的那句说明，管理台原样显示（文案是 Ruling 8 定的，测试逐字钉住）。
+#
+# 不再说「漏掉的在入库闸门那一步已经查过」：这个接口主要就是给闸门**关着**时入库的
+# 照片用的，那些照片恰恰没被闸门查过 —— 那句话在最需要它的场景里是错的。
+_DUP_SCAN_NOTE = (
+    "用入库时存下的特征比对，比识别时的口径保守：列出来的一定会互相干扰；"
+    "没列出来的不保证没有（关着闸门入库的照片尤其要留意）。"
+)
 
 # 会话 cookie 的名字。浏览器那一侧唯一能用的凭证载体，理由见 `_session_cookie`。
 SESSION_COOKIE = "photoar_session"
@@ -427,6 +448,15 @@ class Server:
         # —— 否则删掉一个挂载点之后重建，会把 PHOTOAR_ROOTS 里的也一起丢掉。
         self._env_roots: dict[str, str] = dict(cfg.roots)
         self._rebuild_roots()
+        # 「全部素材」里要现算的 sha256，键是 (路径, 大小, mtime_ns)：落地目录里**还没有
+        # asset 行**的文件，以及有 asset 行、但盘上指纹已和记录对不上的文件。
+        #
+        # 「全部素材」要给每个文件一个内容哈希（同内容多份靠它认），而这些文件在库里
+        # 没有（可信的）现成哈希可取。手机视频动辄几百 MB，不缓存的话每打开一次
+        # 那一页就把整个落地目录重读一遍。键里带大小与 mtime_ns：文件被覆盖过就是
+        # 另一个键，不会拿旧哈希判「重复」。纯内存 —— 重启后第一次打开重算一遍而已。
+        # 每次列表整体换成「这次见到的那些键」，所以它不会随删掉的文件无限长大。
+        self._sha_cache: dict[tuple[str, int, int], str] = {}
 
     def _rebuild_roots(self) -> None:
         """按 `PHOTOAR_ROOTS` + 启用中的 local 挂载点，重建白名单。
@@ -813,6 +843,7 @@ class Server:
             ("GET", ("photos",), self._list_photos),
             ("POST", ("photo",), self._create_photo),
             ("GET", ("photo", "*"), self._photo_detail),
+            ("PATCH", ("photo", "*"), self._photo_patch),
             ("GET", ("photo", "*", "thumb"), self._photo_thumb),
             ("GET", ("photo", "*", "ref"), self._photo_ref),
             ("POST", ("photo", "*", "ref"), self._photo_replace_ref),
@@ -837,6 +868,9 @@ class Server:
             ("POST", ("admin", "rebuild-vocab"), self._admin_rebuild_vocab),
             ("GET", ("admin", "lookup"), self._admin_lookup),
             ("GET", ("admin", "inbox"), self._admin_inbox),
+            ("GET", ("admin", "media"), self._admin_media),
+            ("DELETE", ("admin", "media"), self._admin_media_delete),
+            ("POST", ("admin", "duplicates", "scan"), self._admin_duplicates_scan),
             ("GET", ("admin", "mounts"), self._admin_list_mounts),
             ("POST", ("admin", "mounts"), self._admin_create_mount),
             ("PATCH", ("admin", "mounts", "*"), self._admin_patch_mount),
@@ -1366,11 +1400,93 @@ class Server:
             raise HttpError(403, "forbidden", "这张照片没有授权给你")
         return photo
 
+    def _photo_patch(self, req: Request, prin: Principal, photo_id: str) -> Response:
+        """`PATCH /v1/photo/<id>`：改标题 / 打印宽度 / 贴合模式。
+
+        校验与落库分两阶段：先把整份 body 校验完，再依次调三个 setter。原因是
+        "一半字段合法就先写那一半"会造成一种更难查的状态 —— 客户端收到 400 以为
+        整个请求没生效，其实标题已经改了，下次读到的详情和它以为的不一致。
+        校验阶段只读不写，所以中途任何一个字段不合法都能安全地整体拒绝。
+
+        权限顺序 `_photo_or_404` → `_require_admin`：理由与 `_photo_delete`
+        一致（那边注释写了）——"这张跟你无关"应该比"这个操作要管理员"先说给人听。
+        """
+        self._photo_or_404(photo_id, prin)
+        self._require_admin(prin, "编辑照片")
+        doc = req.json_body()
+
+        allowed_fields = {"title", "printWidthMm", "fitMode"}
+        if not doc:
+            raise HttpError(400, "empty_patch", "至少要给一个想改的字段")
+        unknown = sorted(set(doc.keys()) - allowed_fields)
+        if unknown:
+            raise HttpError(400, "unknown_field", f"不认识这些字段：{unknown}")
+
+        has_title = "title" in doc
+        title: str | None = None
+        if has_title:
+            raw_title = doc["title"]
+            if raw_title is not None and not isinstance(raw_title, str):
+                raise HttpError(
+                    400, "bad_title", f"title 必须是字符串或 null，收到 {raw_title!r}"
+                )
+            if raw_title is not None and len(raw_title) > 200:
+                raise HttpError(
+                    400, "bad_title", f"title 不能超过 200 字，收到 {len(raw_title)} 字"
+                )
+            # 空字符串等同于没填：存 NULL，而不是让列表页显示一个看不见的标题。
+            title = raw_title or None
+
+        has_width = "printWidthMm" in doc
+        print_width_m = 0.0
+        if has_width:
+            raw_width = doc["printWidthMm"]
+            # bool 是 int 的子类（`isinstance(True, int)` 是 True），JSON 里的
+            # true/false 混进来当数字用没有任何意义，专门排掉。
+            if isinstance(raw_width, bool) or not isinstance(raw_width, (int, float)):
+                raise HttpError(
+                    400, "bad_print_width", f"printWidthMm 不是数字：{raw_width!r}"
+                )
+            print_width_m = float(raw_width) / 1000.0
+            if print_width_m < 0:
+                raise HttpError(
+                    400,
+                    "bad_print_width",
+                    f"printWidthMm 不能是负数，收到 {raw_width!r}",
+                )
+
+        has_fit = "fitMode" in doc
+        fit_mode: str | None = None
+        if has_fit:
+            fit_mode = doc["fitMode"]
+            if fit_mode is not None and fit_mode not in FIT_MODES:
+                raise HttpError(
+                    400,
+                    "bad_fit_mode",
+                    f"fitMode 只能是 {FIT_MODES} 或 null，收到 {fit_mode!r}",
+                )
+
+        if has_title:
+            self.catalog.set_photo_title(photo_id, title)
+        if has_width:
+            self.catalog.set_photo_print_width(photo_id, print_width_m)
+        if has_fit:
+            self.catalog.set_photo_fit_mode(photo_id, fit_mode)
+        return self._photo_detail(req, prin, photo_id)
+
     def _list_photos(self, req: Request, prin: Principal) -> Response:
         out = []
         # 过滤条件由 `auth.photo_filter` 算：admin 与 grant_all 的人拿到 None
         # （= 不过滤 = 与改造前逐字节相同的行为），其余人拿到自己的 user_id。
         for p in self.catalog.list_photos(user_id=photo_filter(prin)):
+            # 视频资产的取法与 `_photo_media` 一致：优先转码产物，没有就退回原始
+            # 上传的视频。管理台列表要能显示"这张配的视频有多大"，不必再多打
+            # 一次 `/media` 请求才知道。
+            video_asset_id = p["playable_asset_id"] or p["video_asset_id"]
+            video_bytes = None
+            if video_asset_id:
+                asset = self.catalog.get_asset(str(video_asset_id))
+                video_bytes = int(asset["bytes"]) if asset else None
             out.append(
                 {
                     "photoId": str(p["id"]),
@@ -1382,6 +1498,8 @@ class Server:
                     "refStale": bool(p["ref_stale"]),
                     "createdAt": int(p["created_at"]),
                     "stars": stars(int(p["self_score"])),
+                    "videoAssetId": str(video_asset_id) if video_asset_id else None,
+                    "videoBytes": video_bytes,
                 }
             )
         return json_response(200, {"photos": out, "total": len(out)})
@@ -1513,19 +1631,25 @@ class Server:
         result = integrity.verify_asset(self.catalog, asset)
         asset = self.catalog.get_asset(str(asset_id)) or asset
         resolved = self.resolver.resolve(asset)
+        body = {
+            "assetId": str(asset_id),
+            "url": resolved.url,
+            "via": resolved.via,
+            "absolute": resolved.absolute,
+            "supportsRange": resolved.supports_range,
+            "bytes": int(asset["bytes"]),
+            "durationMs": asset["duration_ms"],
+            "missing": not result.usable,
+            "integrity": result.status,
+        }
+        if prin.is_admin:
+            # 与 `_photo_detail` 同一条理由（那边的 docstring 写了）：NAS 路径
+            # 会把服务器目录结构告诉调用方，一个只被授权看这张照片的人不该
+            # 顺带知道它存在哪个目录下。
+            body["nasPath"] = str(asset["nas_path"])
         return json_response(
             200,
-            {
-                "url": resolved.url,
-                "via": resolved.via,
-                "absolute": resolved.absolute,
-                "supportsRange": resolved.supports_range,
-                "bytes": int(asset["bytes"]),
-                "durationMs": asset["duration_ms"],
-                "missing": not result.usable,
-                "nasPath": str(asset["nas_path"]),
-                "integrity": result.status,
-            },
+            body,
             # 直链有有效期（spec §10：阿里云盘约 15 分钟），这个响应绝不能
             # 被任何中间层缓存。相对路径的情况下也 no-store，省一个分支。
             **{"Cache-Control": "no-store"},
@@ -1704,27 +1828,33 @@ class Server:
         # 两道闸门与质量分下限都从热配置取，让那三个 `needs_restart=False` 的字段
         # 真的能生效（后果写在 `ingest.ingest_photo` 那几个参数的注释里）。
         values = self.config.all()
-        result = ingest.ingest_photo(
-            cfg=self.cfg,
-            catalog=self.catalog,
-            library=self.library,
-            ref_path=ref,
-            video_path=video,
-            print_width_m=print_width_m,
-            title=doc.get("title"),
-            dedup_gate=bool(values["ingest.dedup_gate"]),
-            synth_long_edge=int(values["ingest.synth_long_edge"]),
-            # 把**入库那一刻**的全局默认写进 photo.fit_mode，而不是留 NULL 跟随全局。
-            #
-            # 两种做法的差别只在一句话："以后改了全局默认，已入库的照片跟不跟着变"。
-            # 写死 = 不跟着变。选它是因为 fit_mode 决定的是"这条视频在这张照片上长
-            # 什么样"，用户为某张照片单独调过之后，改一次全局默认把它悄悄改回去是
-            # 最难解释的一类行为。db 那边的注释担心的是另一面（逐张存值会让"改全局
-            # 默认"变成"改全局默认 + 批量刷全表"），代价确实是这个：改全局只影响新
-            # 入库的照片，老照片要逐张改（`Catalog.set_photo_fit_mode`，设回 NULL
-            # 就是恢复跟随全局）。
-            fit_mode=str(values["video.fit_mode"]),
-        )
+        try:
+            result = ingest.ingest_photo(
+                cfg=self.cfg,
+                catalog=self.catalog,
+                library=self.library,
+                ref_path=ref,
+                video_path=video,
+                print_width_m=print_width_m,
+                title=doc.get("title"),
+                dedup_gate=bool(values["ingest.dedup_gate"]),
+                synth_long_edge=int(values["ingest.synth_long_edge"]),
+                # 把**入库那一刻**的全局默认写进 photo.fit_mode，而不是留 NULL 跟随全局。
+                #
+                # 两种做法的差别只在一句话："以后改了全局默认，已入库的照片跟不跟着变"。
+                # 写死 = 不跟着变。选它是因为 fit_mode 决定的是"这条视频在这张照片上长
+                # 什么样"，用户为某张照片单独调过之后，改一次全局默认把它悄悄改回去是
+                # 最难解释的一类行为。db 那边的注释担心的是另一面（逐张存值会让"改全局
+                # 默认"变成"改全局默认 + 批量刷全表"），代价确实是这个：改全局只影响新
+                # 入库的照片，老照片要逐张改（`Catalog.set_photo_fit_mode`，设回 NULL
+                # 就是恢复跟随全局）。
+                fit_mode=str(values["video.fit_mode"]),
+            )
+        except ingest.IngestRejected as exc:
+            # 只记一笔、原样再抛：响应仍由 `handle` 那一层把它变成 HTTP，一个字不变。
+            self._remember_reject(ref, exc)
+            raise
+        self._forget_reject(ref)
         return json_response(
             201,
             {
@@ -1737,6 +1867,36 @@ class Server:
                 "libraryPhotos": len(self.library),
             },
         )
+
+    def _remember_reject(self, ref: Path, exc: ingest.IngestRejected) -> None:
+        """把一次入库拒绝记进 `ingest_reject`，给「全部素材」页看（为什么要落库见
+        `db._DDL_INGEST_REJECT` 那段注释）。`POST /v1/photo` 与换参考图共用。
+
+        **`already_ingested` 不记**：它不是「这个文件进不去」，是「它早就进去了」——
+        批量导入（`batch` 模块 docstring）和 `tools/batch_ingest.py` 都把它当成功的一种，
+        重跑同一份表时每一行都会收到它。记下来的话，每重跑一次导入，所有已映射的
+        文件都会挂上一条「入库被拒」，而照片删掉之后那条记录还会继续说「已经入库了」。
+
+        写库失败只打日志、不往上抛：这笔记录是附带的，它失败不该把用户本来要看到的
+        那个 409（质量分、近重复撞了谁）换成一个 500。
+        """
+        if exc.code == "already_ingested":
+            return
+        try:
+            self.catalog.record_reject(str(ref), exc.code, exc.message, exc.detail)
+        except Exception as err:  # noqa: BLE001 —— 理由见 docstring 最后一段
+            print(f"[photoar] ⚠️ 记入库拒绝失败 path={ref}：{err}", flush=True)
+
+    def _forget_reject(self, ref: Path) -> None:
+        """入库 / 换参考图成功 → 清掉这个路径上次的拒绝记录。
+
+        同样只打日志不抛：照片**已经**建好了，这时回 500 会让调用方以为入库失败、
+        再点一次，然后收到 `already_ingested`。
+        """
+        try:
+            self.catalog.clear_reject(str(ref))
+        except Exception as err:  # noqa: BLE001
+            print(f"[photoar] ⚠️ 清入库拒绝记录失败 path={ref}：{err}", flush=True)
 
     def _photo_replace_ref(
         self, req: Request, prin: Principal, photo_id: str
@@ -1760,15 +1920,20 @@ class Server:
             raise HttpError(400, "missing_ref_path", "需要 refPath")
         ref = self.roots.resolve(str(raw))
         values = self.config.all()
-        result = ingest.replace_ref(
-            cfg=self.cfg,
-            catalog=self.catalog,
-            library=self.library,
-            photo_id=photo_id,
-            ref_path=ref,
-            dedup_gate=bool(values["ingest.dedup_gate"]),
-            synth_long_edge=int(values["ingest.synth_long_edge"]),
-        )
+        try:
+            result = ingest.replace_ref(
+                cfg=self.cfg,
+                catalog=self.catalog,
+                library=self.library,
+                photo_id=photo_id,
+                ref_path=ref,
+                dedup_gate=bool(values["ingest.dedup_gate"]),
+                synth_long_edge=int(values["ingest.synth_long_edge"]),
+            )
+        except ingest.IngestRejected as exc:
+            self._remember_reject(ref, exc)
+            raise
+        self._forget_reject(ref)
         return json_response(
             200,
             {
@@ -2672,8 +2837,13 @@ class Server:
         躺在那儿，而**管理台上任何一处都看不到它** —— 照片列表只列已入库的，挂载点浏览器
         要人自己去翻目录。用户看到的是「我传上去了，但哪儿都找不到」。
 
-        「没被用起来」= 磁盘上有这个文件，但它不是任何 asset 的路径。已经入库的照片、
-        已经配上的视频都不会出现在这里 —— 那些在照片列表里看得到。
+        「没被用起来」= 磁盘上有这个文件，**没有任何一张照片在引用它**。原来的判据是
+        "这个路径对应的 asset 行存不存在"，但 asset 行是不会因为删照片而消失的
+        （`Catalog.delete_photo` 的注释：磁盘文件与 asset 行都留着），结果是删了照片
+        或者解绑了视频之后，那个文件在照片列表（已删/已解绑，看不见了）和这个页面
+        （asset 行还在，被判定"已经用起来了"）**两边都看不见**——比它原来"卡在入库
+        半路"时还要难发现。改成"有没有照片引用它"之后，删照片、解绑视频都会让对应
+        的文件立刻重新出现在这里，而不是消失得无影无踪。
 
         只看**一层**，不递归：落地目录是平的（`/v1/upload` 只允许纯文件名），递归只会把
         用户手工放进去的目录结构也扫进来。
@@ -2702,8 +2872,13 @@ class Server:
                     # 既不是图也不是视频（`.upload-xxx` 临时文件、`.DS_Store` 之类）。
                     # 列出来只是噪声 —— 用户对它们无事可做。
                     continue
-                if self.catalog.get_asset_by_path(str(child)) is not None:
-                    continue  # 已经用起来了，在照片列表里看得到
+                asset = self.catalog.get_asset_by_path(str(child))
+                asset_id = str(asset["id"]) if asset else None
+                if asset_id:
+                    # 「有没有被用」与全部素材总表、删除素材走同一个口径。
+                    refs, videos = self._asset_users(asset_id)
+                    if refs or videos:
+                        continue  # 已经用起来了，在照片列表里看得到
                 st = child.stat()
                 out.append(
                     {
@@ -2712,11 +2887,539 @@ class Server:
                         "kind": kind,
                         "bytes": int(st.st_size),
                         "mtime": int(st.st_mtime * 1000),
+                        "assetId": asset_id,
                     }
                 )
         return json_response(
             200,
             {"dir": str(base), "files": out, "note": None},
+            **{"Cache-Control": "no-store"},
+        )
+
+    # ---- 全部素材 / 删除素材 / 库内近重复 ----
+
+    def _asset_users(
+        self, asset_id: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(把它当参考图的照片, 把它当视频的照片)。「这个素材有没有被用」的**唯一口径**。
+
+        `/v1/admin/inbox`（未入库）、`/v1/admin/media`（mapped/unused/orphan）、
+        `DELETE /v1/admin/media`（能不能删、要不要解绑）三处都走这里。分开各写一遍的
+        代价很具体：总表说「没人用」，点删除却回「在用」—— 两边的代码各自看起来都对。
+
+        当视频用 = `video_asset_id` **或** `playable_asset_id` 指向它：转码过的照片播的
+        是 data/playable 里的产物，那个产物同样「在用」，删掉它照片就播不了。
+
+        两类要分开给，因为它们的下一步完全不同：参考图在用 → 只能先删照片（删素材的
+        按钮绝不代劳，删照片会连带丢掉授权）；视频在用 → 可以解绑后再删。
+
+        判定本身在 `Catalog.asset_users`：删除要在 db 的写锁里按同一个口径再判一次，
+        口径只能有一份。
+        """
+        return self.catalog.asset_users(asset_id)
+
+    @staticmethod
+    def _ref_use_json(p: dict[str, Any]) -> dict[str, Any]:
+        """`usedAsRef` 的一项。总表与删除的 409 共用，免得两处字段各自漂。"""
+        return {"photoId": str(p["id"]), "title": p["title"]}
+
+    @staticmethod
+    def _video_use_json(p: dict[str, Any], asset_id: str) -> dict[str, Any]:
+        """`usedAsVideo` 的一项。`transcoded` = 这张照片播的是**这个** asset，而且它
+        不是源文件本身 —— 也就是说这一行是转码产物。"""
+        playable = str(p["playable_asset_id"] or "")
+        return {
+            "photoId": str(p["id"]),
+            "title": p["title"],
+            "transcoded": playable == asset_id
+            and playable != str(p["video_asset_id"] or ""),
+        }
+
+    def _upload_base(self) -> Path | None:
+        """落地目录（已解析），没配就是 None。与 `_admin_inbox` 同一个取法。"""
+        root = self.cfg.upload_dir_root
+        return self.roots.resolve(str(root)) if root else None
+
+    def _is_generated(self, path: Path) -> bool:
+        """这个路径是不是服务自己生成的转码产物（`data/playable` 下）。
+
+        两种写法都认：`ingest` 存 playable asset 时用的是**未解析**的
+        `cfg.playable_dir / <id>.mp4`，而客户端回传或 `resolve()` 过的路径是解析后的。
+        data 目录挂成符号链接时两者不同，只认一种会把真的转码产物判成「NAS 上的
+        文件」，于是删不掉。
+        """
+        dirs = {self.cfg.playable_dir, self.cfg.playable_dir.resolve()}
+        return any(d in path.parents for d in dirs)
+
+    def _in_upload_dir(self, path: Path, base: Path | None) -> bool:
+        """直接躺在落地目录那一层。只看一层，与 `_admin_inbox` 的口径一致。"""
+        return base is not None and path.parent == base
+
+    @staticmethod
+    def _file_stat(path: Path) -> os.stat_result | None:
+        """这个路径**本身**是一个普通文件时给它的 stat；不存在、是目录、是符号链接、
+        读不了，一律 None（= 总表里的「文件不在」、删除时的「不删盘」）。
+
+        用 `lstat`、把符号链接当「不在」，是为了让总表的每一行对应**一个**真实文件：
+        `_inbox/link.jpg -> _inbox/real.jpg` 如果按 `stat()`（跟随链接）算，会列成两行、
+        哈希相同、互标重复，管理员以为「删一份还剩一份」—— 而删 `link.jpg` 实际删掉的
+        是 `real.jpg`（`roots.resolve` 会把路径解析到链接目标）。符号链接不是用户传上来
+        的素材（`/v1/upload` 只会落普通文件），是有人在盘上手工摆的，服务不该替他删。
+
+        只看最后一段：路径中间的目录是符号链接没关系（`lstat` 照常跟随中间段）。
+        data 目录挂成符号链接时，转码产物的 `nas_path` 就要穿过它，那仍是一个真文件。
+        """
+        try:
+            st = path.lstat()
+        except OSError:
+            return None
+        return st if stat_mod.S_ISREG(st.st_mode) else None
+
+    @staticmethod
+    def _fingerprint_matches(st: os.stat_result, asset: dict[str, Any]) -> bool:
+        """盘上的 (大小, mtime) 与 asset 记录里入库时的指纹一致。mtime 的换算与
+        `integrity.stat_fingerprint` 一字不差（毫秒整数，理由见那里）—— 换算不一致会
+        让「变了」随机假成立，每次都多算一遍整文件哈希。"""
+        return (int(st.st_size), int(st.st_mtime * 1000)) == (
+            int(asset["bytes"]),
+            int(asset["mtime"]),
+        )
+
+    def _sha_of(
+        self,
+        path: Path,
+        st: os.stat_result,
+        fresh: dict[tuple[str, int, int], str],
+    ) -> str | None:
+        """现算一个文件的 sha256，按 `(路径, 大小, mtime_ns)` 缓存（理由见 `__init__` 里
+        `_sha_cache` 那段）。两种行要现算：落地目录里没有 asset 行的文件；有 asset 行、
+        但盘上指纹已经和记录对不上的文件（见 `_admin_media` 里哈希那段）。
+        读不了（半路被删、权限）就是 None —— 少一个哈希只是少认一组重复，不该让整张表
+        500。"""
+        key = (str(path), int(st.st_size), int(st.st_mtime_ns))
+        sha = self._sha_cache.get(key)
+        if sha is None:
+            try:
+                sha = sha256_file(path)
+            except OSError:
+                return None
+        fresh[key] = sha
+        return sha
+
+    def _admin_media(self, req: Request, prin: Principal) -> Response:
+        """统一素材总表：落地目录里的每个图片/视频文件 ∪ 每条 asset 记录，一行一个路径。
+
+        为什么要把这两个来源并成一张表：在它之前，「服务端上有哪些素材」散在四处 ——
+        照片列表（只有已入库的参考图）、视频映射（只有配上的视频）、inbox（只有
+        落地目录里没人用的）、挂载点浏览器（要自己翻）。删了照片之后留下的 asset
+        记录、转码产物、同一张图传了两份，**哪一处都看不到**。这一页要能回答「这个
+        文件是谁、谁在用、能不能删」，所以每一行都自带这三件事。
+
+        `status` 的三种：被任何照片引用 → `mapped`；在落地目录里、文件在、没人用 →
+        `unused`（传上来还没入库，或者照片删了回到这里）；其余的没人用的 asset
+        （NAS 上别处的文件、文件已经不在了）→ `orphan`，只剩一条记录。
+
+        `deletable` 只说「删盘可行」：文件在，而且在服务自己能写的地方（落地目录或
+        `data/playable`）。NAS 的只读挂载一律不删盘，只删记录。它**不**考虑有没有人
+        在用 —— 那一半看 `usedAsRef` / `usedAsVideo`，删除接口会按它们拒绝。
+        """
+        self._require_admin(prin, "查看全部素材")
+        base = self._upload_base()
+
+        # 落地目录这一层：路径 → stat。按扩展名的过滤与 `_admin_inbox` 相同，但比它多
+        # 跳过符号链接（`_file_stat` 返回 None）：链接和它的目标会被列成两行互标重复，
+        # 管理员照着「删一份」删掉的其实是唯一的那份（理由详见 `_file_stat`）。
+        # 目录、列目录和 stat 之间被删掉的文件同样落在 None 里 —— 它们都不是素材。
+        disk: dict[str, os.stat_result] = {}
+        if base is not None and base.is_dir():
+            for child in base.iterdir():
+                if fsbrowser.kind_of(child) is None:
+                    continue
+                st = self._file_stat(child)
+                if st is not None:
+                    disk[str(child)] = st
+        assets = {str(a["nas_path"]): a for a in self.catalog.list_assets()}
+        rejects = {r["path"]: r for r in self.catalog.list_rejects()}
+
+        fresh: dict[tuple[str, int, int], str] = {}
+        items: list[dict[str, Any]] = []
+        for path_s in sorted(set(disk) | set(assets), key=str.casefold):
+            path = Path(path_s)
+            asset = assets.get(path_s)
+            st = disk.get(path_s)
+            if st is None:
+                # asset 行的路径同样不跟随符号链接：入库时存的都是解析后的真路径，
+                # 现在成了链接，说明有人把原文件换掉了 —— 记录里那份内容已经不在这里。
+                st = self._file_stat(path)
+            exists = st is not None
+            in_upload = self._in_upload_dir(path, base)
+            generated = self._is_generated(path)
+
+            asset_id = str(asset["id"]) if asset else None
+            refs, videos = self._asset_users(asset_id) if asset_id else ([], [])
+            if refs or videos:
+                status = "mapped"
+            elif in_upload and exists:
+                status = "unused"
+            else:
+                status = "orphan"
+
+            if asset is not None and (st is None or self._fingerprint_matches(st, asset)):
+                # 有 asset 行、且盘上指纹没变（或文件已经不在）→ 用入库时记下的哈希：
+                # 不用为每个已入库的几百 MB 视频重读一遍，与 `upload/check` 按内容查重
+                # 用的也是同一个值。
+                sha: str | None = str(asset["sha256"])
+            elif st is not None:
+                # 没有 asset 行；或者有，但大小 / mtime 和记录对不上 —— 照片删掉之后有人
+                # 用 SMB 把同名文件换成了另一张图。这时再报旧哈希，这一行就会和「旧内容
+                # 的另一份拷贝」互标重复，管理员删掉那份拷贝，旧内容就一份都不剩了。所以
+                # 按盘上现状现算（同一套指纹缓存）。大小与 mtime 都没变的替换看不出来，
+                # 与 `integrity.verify_asset` 同一个前提。
+                sha = self._sha_of(path, st, fresh)
+            else:
+                sha = None
+
+            rej = rejects.get(path_s)
+            items.append(
+                {
+                    "path": path_s,
+                    "name": path.name,
+                    "kind": str(asset["kind"]) if asset else fsbrowser.kind_of(path),
+                    # 文件在就报盘上的现状，不在才退回记录里的最后一次指纹。
+                    "bytes": int(st.st_size) if st else int(asset["bytes"]),
+                    "mtime": int(st.st_mtime * 1000) if st else int(asset["mtime"]),
+                    "exists": exists,
+                    "inUploadDir": in_upload,
+                    "generated": generated,
+                    "deletable": exists and (in_upload or generated),
+                    "assetId": asset_id,
+                    "sha256": sha,
+                    "usedAsRef": [self._ref_use_json(p) for p in refs],
+                    "usedAsVideo": [
+                        self._video_use_json(p, str(asset_id)) for p in videos
+                    ],
+                    "status": status,
+                    "duplicateOf": [],
+                    "reject": None
+                    if rej is None
+                    else {
+                        "code": rej["code"],
+                        "message": rej["message"],
+                        "conflicts": list(rej["detail"].get("conflicts") or []),
+                        "at": rej["at"],
+                    },
+                }
+            )
+        # 只留这次见到的键：删掉/改过的文件的旧哈希随之丢掉，缓存不会无限长大。
+        self._sha_cache = fresh
+
+        by_sha: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            if item["sha256"]:
+                by_sha.setdefault(item["sha256"], []).append(item)
+        for group in by_sha.values():
+            if len(group) < 2:
+                continue
+            for item in group:
+                item["duplicateOf"] = [
+                    {"path": o["path"], "assetId": o["assetId"]}
+                    for o in group
+                    if o is not item
+                ]
+
+        counts = {"total": len(items)}
+        for st_name in ("mapped", "unused", "orphan"):
+            counts[st_name] = sum(1 for i in items if i["status"] == st_name)
+        counts["duplicate"] = sum(1 for i in items if i["duplicateOf"])
+        counts["rejected"] = sum(1 for i in items if i["reject"] is not None)
+        return json_response(
+            200,
+            {
+                "uploadDir": str(base) if base is not None else None,
+                "items": items,
+                "counts": counts,
+            },
+            **{"Cache-Control": "no-store"},
+        )
+
+    def _media_target(self, raw: str) -> Path:
+        """删除请求里没有对上 asset 记录的那个 `path` → 真实路径。
+
+        转码产物在 `data/playable` 下，不在白名单里（白名单是「用户的 NAS 目录」），
+        所以先认它；其余一律过 `self.roots.resolve` —— 越界照全服务的规矩抛
+        `PathDenied`，由 `handle` 记日志并回 403。`..`/NUL/反斜杠/相对路径在认
+        playable 之前就挡掉，理由与 `safepath` 相同：不靠 `resolve()` 的语义兜底。
+        """
+        if (
+            raw.startswith("/")
+            and "\x00" not in raw
+            and "\\" not in raw
+            and ".." not in Path(raw).parts
+        ):
+            resolved = Path(raw).resolve()
+            if self._is_generated(resolved):
+                return resolved
+        return self.roots.resolve(raw)
+
+    def _unlink(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HttpError(500, "delete_failed", f"删不掉文件 {path}：{exc}") from exc
+
+    def _asset_in_use_error(
+        self, asset_id: str, exc: AssetInUse, force: bool
+    ) -> HttpError:
+        """`delete_asset` 拒删 → 409。按**锁里**分好的类给错误码，两个字段一律带上。
+
+        - 有照片当参考图用 → `ref_in_use`（不管 force）；
+        - 否则 → `in_use`。
+
+        `usedAsRef` 与 `usedAsVideo` 两个 409 都给全：Task 9 的管理台逐字读这两个字段，
+        缺一个它拿到的是 undefined。一个素材可能同时被两类引用（并发时尤其如此），
+        都列出来管理员才知道要先处理哪几张。
+        """
+        detail = {
+            "usedAsRef": [self._ref_use_json(p) for p in exc.refs],
+            "usedAsVideo": [self._video_use_json(p, asset_id) for p in exc.videos],
+        }
+        if exc.refs:
+            return HttpError(
+                409,
+                "ref_in_use",
+                "这个文件是照片的参考图，要删它得先删掉那张照片（这里不会替你删照片）",
+                **detail,
+            )
+        if force:
+            # 带了 force 还被拒、又没有参考图引用：只可能是锁外（别的进程）刚配上，
+            # 撞了外键、整个事务已回滚 —— 一张都没解绑。再点一次会按新的引用重来。
+            message = "这段视频刚刚又被配到了照片上，没有删，也没有解绑任何照片。可以重试"
+        else:
+            message = "这段视频还配在照片上。确定要删就带上 force=1，会先从这些照片上解绑"
+        return HttpError(409, "in_use", message, **detail)
+
+    def _admin_media_delete(self, req: Request, prin: Principal) -> Response:
+        """删一个素材：`?path=` 或 `?assetId=`（都给时以 assetId 为准），可带 `force=1`。
+
+        ## 什么时候拒绝
+
+        - **被当参考图用 → 409 `ref_in_use`，带不带 force 都一样。** 要删它只能先删那张
+          照片，这里绝不代劳：删照片会连带丢掉它的全部授权（`photo_grant` 是
+          ON DELETE CASCADE），还要退役识别库里的 slot —— 那不是一个「删素材」按钮
+          该有的后果，而管理员点下去的时候未必意识到。
+        - **被当视频用、没带 force → 409 `in_use`**，列出是哪几张。带了 force 就先从
+          那些照片上解绑（与 `DELETE /v1/photo/<id>/video` 同一个结果），再删。解绑后
+          只属于它们的转码产物一起删掉（记录 + `data/playable` 里的文件）：留着的话，
+          那是一份再也不会被引用、也不会出现在任何照片上的几十 MB 文件。
+        - 两个 409 都带齐 `usedAsRef` 与 `usedAsVideo`（`_asset_in_use_error`）。
+        - **`path` 字面上是一个符号链接 → 404**，链接和目标都不动（理由在那个分支里）。
+
+        ## 删什么
+
+        删盘只在文件在落地目录或 `data/playable` 里、并且本身是个普通文件时做（总表里的
+        `deletable`，同一个 `_file_stat`）。其余位置（NAS 的只读挂载、用户自己的目录）
+        只删 asset 记录 —— 那些文件不是这个服务的，删素材记录不该删掉用户的原片。
+
+        ## 顺序与失败形态
+
+        1. `delete_asset(detach_videos=force)`：再确认引用 → 解绑 → 删行，在 db 的写锁 +
+           一个事务里做完。被拒 = 库一点没动（没有「解绑了一半再回 409」）。
+        2. 删盘。**在删行之后**：反过来先删盘的话，第 1 步被拒时会留下一张指向已删文件
+           的照片。删盘失败回 500 `delete_failed`，这时记录已经没了、文件还在落地目录
+           里，总表上它会以 `unused` 出现，可以重试。
+        3. 清理解绑出来的、已经没人用的转码产物（每一个都在锁里再判一次）。
+        4. 清掉这个路径的入库拒绝记录（文件都没了，「它为什么进不去」已经没有意义）；
+           这一步失败只打日志。
+
+        残留的窗口：第 1 步之后、第 2 步之前，另一个请求恰好把**这个文件**重新入了库
+        （没有 asset 行的纯文件，或行刚被第 1 步删掉），文件仍会被删掉、新照片指向一个
+        不存在的文件。入库与删盘之间没有共享的锁，这个窗口本来就在，这里没有扩大它。
+        """
+        self._require_admin(prin, "删除素材")
+        raw_path = req.q1("path")
+        raw_id = req.q1("assetId")
+        force = (req.q1("force") or "").lower() in ("1", "true")
+        if not raw_path and not raw_id:
+            raise HttpError(400, "bad_request", "需要 path 或 assetId")
+
+        if raw_id:
+            asset = self.catalog.get_asset(raw_id)
+            if asset is None:
+                raise HttpError(404, "not_found", f"没有这条素材记录：{raw_id}")
+        else:
+            # 先按原样找记录：总表给的 `path` 就是 asset 的 `nas_path`，而一条孤儿记录
+            # 的路径可能已经不在白名单里了（挂载点被删掉）—— 那种记录仍然要能删掉。
+            # 这一步不碰盘，删不删盘下面另按 deletable 判。
+            asset = self.catalog.get_asset_by_path(str(raw_path))
+        if asset is not None:
+            path = Path(str(asset["nas_path"]))
+        else:
+            path = self._media_target(str(raw_path))
+            if Path(str(raw_path)).is_symlink():
+                # 字面路径是一个符号链接：`_media_target` 已经把它解析成了链接**目标**，
+                # 往下走就会按目标去认记录、删盘 —— 用户点的是链接，删掉的却是它指向的
+                # 那个真文件（而且往往就是总表里「和它重复」的那一行，唯一的一份）。
+                # 两种做法里选更安全的：直接拒绝，链接和目标都不动。只 unlink 链接本身
+                # 虽然也不丢内容，但链接是有人在盘上手工摆的，不是服务落下的文件，
+                # 该由摆它的人去收。总表也不列符号链接，所以这里回「没有这个素材」。
+                # （放在白名单校验之后：越界的路径照旧 403，不先替它 lstat。）
+                raise HttpError(
+                    404,
+                    "not_found",
+                    f"没有这个素材：{raw_path} 是符号链接，不算素材（删它会删到它指向的文件），"
+                    "这里不处理",
+                )
+            asset = self.catalog.get_asset_by_path(str(path))
+            if asset is None and self._is_generated(path):
+                # 转码产物的 asset 存的是**未解析**的 `cfg.playable_dir/...`（见
+                # `_is_generated`），data 目录是符号链接时它与这里解析后的 `path` 对不上。
+                # 对不上就会被当成「没有记录的生成物」直接删盘 —— 绕过了下面「有没有
+                # 照片在播它」那道检查。所以按解析后的真实路径再认一遍。只有删转码目录
+                # 里的文件才走到这里，全表扫一遍的代价无所谓。
+                asset = next(
+                    (
+                        a
+                        for a in self.catalog.list_assets()
+                        if Path(str(a["nas_path"])).resolve() == path
+                    ),
+                    None,
+                )
+            if asset is not None:
+                path = Path(str(asset["nas_path"]))
+        asset_id = str(asset["id"]) if asset else None
+
+        base = self._upload_base()
+        # 与总表的 `deletable` 同一个判定（`_file_stat` 不认符号链接）：asset 行的路径
+        # 后来被换成了链接时，只删记录，不 unlink。
+        deletable = self._file_stat(path) is not None and (
+            self._in_upload_dir(path, base) or self._is_generated(path)
+        )
+        if asset_id is None and not deletable:
+            raise HttpError(
+                404,
+                "not_found",
+                f"没有这个素材：{path} 既没有素材记录，也不是落地目录或转码目录里的文件",
+            )
+
+        # 「再确认有没有人用 → 解绑 → 删行」整个交给 `delete_asset`，在 db 的写锁 + 一个
+        # 事务里做完（理由见它的 docstring）。这里不再先看一眼再动手：看完到动手之间
+        # 插进来一个配视频/换参考图的请求，旧写法会先解绑掉几张、再在删行那一步被拒，
+        # 回 409 时库已经被改了一半。现在被拒 = 什么都没动。
+        detached_rows: list[dict[str, Any]] = []
+        deleted_ids: list[str] = []
+        if asset_id is not None:
+            try:
+                detached_rows = self.catalog.delete_asset(asset_id, detach_videos=force)
+            except AssetInUse as exc:
+                raise self._asset_in_use_error(asset_id, exc, force) from exc
+            deleted_ids.append(asset_id)
+        detached = [str(p["id"]) for p in detached_rows]
+        stale_playables: list[str] = []
+        for p in detached_rows:
+            playable = str(p["playable_asset_id"] or "")
+            if playable and playable != asset_id and playable not in stale_playables:
+                stale_playables.append(playable)
+
+        file_deleted = False
+        if deletable:
+            self._unlink(path)
+            file_deleted = True
+
+        # 解绑下来的转码产物：只在已经没有任何照片在播它时才删。现在每张照片的产物
+        # 按自己的 photo_id 命名、互不共享，但这里不依赖那个约定 —— 哪天改成同一段
+        # 源视频只转一次、几张照片共用，这个判断照样对。
+        for pa_id in stale_playables:
+            pa = self.catalog.get_asset(pa_id)
+            if pa is None:
+                continue
+            try:
+                # 不带 detach：还有任何照片在用它（参考图或视频）就抛，锁里判的。
+                self.catalog.delete_asset(pa_id)
+            except AssetInUse:
+                continue  # 还有主 / 并发配上了：留着
+            deleted_ids.append(pa_id)
+            pa_path = Path(str(pa["nas_path"]))
+            if self._is_generated(pa_path):
+                self._unlink(pa_path)
+
+        # 文件和记录都已经删了：清拒绝记录这一步写库失败只打日志（`_forget_reject`），
+        # 回 500 会让管理员以为没删成、再点一次，然后收到一个莫名其妙的 404。
+        self._forget_reject(path)
+        return json_response(
+            200,
+            {
+                "deleted": {"file": file_deleted, "assetIds": deleted_ids},
+                "detachedPhotos": detached,
+            },
+        )
+
+    def _admin_duplicates_scan(self, req: Request, prin: Principal) -> Response:
+        """库内近重复扫描：找出**已经在库里**、会互相挤成 ambiguous 的照片对。
+
+        入库闸门（`library.conflicts`）只拦新进来的；闸门关着的时候进来的、闸门
+        补上 `query_features` 之前进来的，都还在库里互相拖累 —— 表现是两张都扫不
+        出来，而 `_photo_delete` 的 docstring 记着一次真实事故。这个接口把它们找出来，
+        管理台上逐对给删除动作。
+
+        判据与入库闸门同一个函数，只是两边都用**入库时存下的特征**（识别库里的
+        slot），不重新解码参考图、不提查询侧特征：几百张的库每张重新解码 + 提 4000
+        个特征会是分钟级的 CPU。代价是 `m` 按入库口径量，比识别时偏低（见
+        `library.conflicts` 的 docstring）：列出来的一定会互相干扰，没列出来的不保证
+        没有 —— `_DUP_SCAN_NOTE` 原样告诉用户。
+
+        `exclude=自己`：不排的话每张都和自己判成近重复。两个方向各查一次，按无序对
+        去重、保留较大的内点数。到 `_DUP_SCAN_BUDGET_S` 就停（理由见那个常量）。
+        """
+        self._require_admin(prin, "扫描库内近重复")
+        t0 = time.monotonic()
+        photos = {str(p["id"]): p for p in self.catalog.list_photos()}
+        known = {pid: int(p["self_score"]) for pid, p in photos.items()}
+        # 识别库里有、catalog 里没有的 slot 是 `check_consistency` 管的那种不一致，
+        # 这里扫出来也没有标题可显示、没有照片可删，跳过。
+        ids = [pid for pid in self.library.photo_ids() if pid in known]
+        order = {pid: i for i, pid in enumerate(ids)}
+        best: dict[frozenset[str], tuple[str, str, int]] = {}
+        scanned = 0
+        truncated = False
+        for i, pid in enumerate(ids):
+            if i and time.monotonic() - t0 >= _DUP_SCAN_BUDGET_S:
+                truncated = True
+                break
+            scanned += 1
+            feats = self.library.features_of(pid)
+            if feats is None or len(feats) == 0:
+                continue
+            for c in self.library.conflicts(feats, known[pid], known, exclude=pid):
+                if c.photo_id not in order:
+                    continue
+                key = frozenset((pid, c.photo_id))
+                prev = best.get(key)
+                if prev is None or c.inliers > prev[2]:
+                    a, b = sorted((pid, c.photo_id), key=order.__getitem__)
+                    best[key] = (a, b, int(c.inliers))
+
+        def side(pid: str) -> dict[str, Any]:
+            return {
+                "photoId": pid,
+                "title": photos[pid]["title"],
+                "selfScore": known[pid],
+            }
+
+        pairs = [
+            {"a": side(a), "b": side(b), "inliers": m}
+            for a, b, m in sorted(
+                best.values(), key=lambda t: (-t[2], order[t[0]], order[t[1]])
+            )
+        ]
+        return json_response(
+            200,
+            {
+                "pairs": pairs,
+                "scanned": scanned,
+                "elapsedMs": int((time.monotonic() - t0) * 1000),
+                "truncated": truncated,
+                "note": _DUP_SCAN_NOTE,
+            },
             **{"Cache-Control": "no-store"},
         )
 

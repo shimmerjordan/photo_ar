@@ -205,6 +205,38 @@ CREATE TABLE IF NOT EXISTS mount (
 );
 """
 
+# ---- 入库拒绝记录（纯新增的一张表，刻意**不**升 user_version）----
+#
+# 这张表不带版本号、`SCHEMA_VERSION` 也没有因为它从 3 推到 4，是有意的：它不引用、
+# 也不被任何别的表引用，上一版程序不认识它、也根本碰不到它 —— 旧镜像打开一个建过
+# 这张表的库照常工作，多出来的表只是躺在那里。升版本号唯一的效果是这个库一旦被新版
+# 打开过，退回旧镜像就会 SchemaTooNew 起不来。decisions.md §45.2 与 §46.2 两次记过
+# 同一条教训：用户为 SchemaTooNew 吃过亏，从此不为「旧程序读不错」的改动动版本号；
+# 只有旧程序会把数据读错、写坏的迁移才值得升。建表照常在 `_migrate` 里无条件执行。
+#
+# `POST /v1/photo` 与换参考图被 `ingest.IngestRejected` 拒掉时记一笔，按**路径**
+# 一行（同一路径再被拒是覆盖，只留最近那次）。
+#
+# 为什么要落库而不是只在 409 响应里说一次：拒绝发生的那一刻，人往往不在看 ——
+# 批量导入跑了几十行、手机传完就锁屏了。之后他在「全部素材」里看到一个「未入库」
+# 的文件，只能猜它为什么没进去（质量分？近重复？撞了哪一张？），而近重复那一类
+# 的下一步动作（「用它替换『X』的参考图」）恰恰需要知道撞的是哪张。
+#
+# 键是路径而不是 asset id：最常见的那几类拒绝（近重复、提不出特征）发生在
+# `upsert_asset` **之前**，被拒的文件根本没有 asset 行。
+#
+# 同一路径入库成功、或者素材被删时清掉（`clear_reject`）—— 不清的话，一个后来
+# 已经好好入了库的文件会永远挂着一条「入库被拒」。
+_DDL_INGEST_REJECT = """
+CREATE TABLE IF NOT EXISTS ingest_reject (
+  path        TEXT PRIMARY KEY,
+  code        TEXT NOT NULL,
+  message     TEXT,
+  detail_json TEXT,
+  at          INTEGER NOT NULL
+);
+"""
+
 MOUNT_LOCAL = "local"
 MOUNT_WEBDAV = "webdav"
 MOUNT_KINDS = (MOUNT_LOCAL, MOUNT_WEBDAV)
@@ -271,6 +303,32 @@ class SchemaTooNew(RuntimeError):
     """库文件的 schema 版本高于本程序。降级运行会静默写坏数据，必须拒绝启动。"""
 
 
+class AssetInUse(RuntimeError):
+    """要删的 asset 仍被某张照片引用。
+
+    HTTP 层删之前已经按同一个口径查过一遍（`app.Server._asset_users`），这个异常
+    是给两个请求交错的那一瞬留的底：刚判完没人用，另一个请求就把它配给了一张
+    照片。那时硬删会让那张照片的外键指向一条不存在的行 —— `PRAGMA foreign_keys`
+    开着的话 SQLite 会拒，但拒出来的是一句 `FOREIGN KEY constraint failed`，
+    看不出是哪张照片、为什么。
+
+    `refs` / `videos` 是抛出那一刻按 `Catalog.asset_users` 分好类的照片行：HTTP 层
+    要照它们给 `ref_in_use` 还是 `in_use`，并在 409 里逐张列出 `usedAsRef` /
+    `usedAsVideo`（管理台逐字读这两个字段）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        refs: list[dict[str, Any]] | None = None,
+        videos: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.refs = list(refs or [])
+        self.videos = list(videos or [])
+
+
 class NameTaken(ValueError):
     """用户名（规范化后）已存在。
 
@@ -335,6 +393,9 @@ class Catalog:
             # v3 的 mount 表不引用任何别的表，顺序无所谓，但跟着一起无条件执行
             # （幂等，理由见上面那段 docstring）。
             conn.executescript(_DDL_V3)
+            # 入库拒绝记录同理：独立的一张表，无条件执行；它不升 user_version
+            # （理由见 `_DDL_INGEST_REJECT` 那段注释）。
+            conn.executescript(_DDL_INGEST_REJECT)
             self._add_missing_columns(conn, "photo", _PHOTO_V2_COLUMNS)
             self._add_missing_columns(conn, "recognize_log", _LOG_V3_COLUMNS)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -452,6 +513,93 @@ class Catalog:
             dict(r)
             for r in self._conn().execute("SELECT * FROM asset ORDER BY created_at, id")
         ]
+
+    def asset_users(
+        self, asset_id: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(把它当参考图的照片, 把它当视频的照片)。「这个素材有没有被用」的**唯一口径**，
+        为什么要唯一、为什么分两类见 `app.Server._asset_users`（HTTP 层都走那里，它只是
+        转一手）。
+
+        放在 db 层而不是 HTTP 层，是因为 `delete_asset` 要在**写锁里**按同一个口径再判一次
+        —— 口径若在两层各写一份，锁里锁外迟早判得不一样。
+
+        当视频用 = `video_asset_id` **或** `playable_asset_id` 指向它：转码过的照片播的
+        是 data/playable 里的产物，那个产物同样「在用」。
+        """
+        refs: list[dict[str, Any]] = []
+        videos: list[dict[str, Any]] = []
+        for p in self.photos_referencing_asset(asset_id):
+            if str(p["ref_asset_id"]) == asset_id:
+                refs.append(p)
+            if asset_id in (
+                str(p["video_asset_id"] or ""), str(p["playable_asset_id"] or "")
+            ):
+                videos.append(p)
+        return refs, videos
+
+    def delete_asset(
+        self, asset_id: str, *, detach_videos: bool = False
+    ) -> list[dict[str, Any]]:
+        """删掉一条 asset 记录。**只删行，不碰磁盘** —— 删不删盘由调用方按
+        「文件在不在服务自己能写的目录里」决定（见 `app.Server._admin_media_delete`），
+        这里不知道也不该知道哪些目录是 NAS 只读挂载。
+
+        `detach_videos=True`（管理台的 force 删除）：把它当视频用的照片先解绑
+        （`video_asset_id` 与 `playable_asset_id` 都置空，与 `DELETE /v1/photo/<id>/video`
+        同一个结果）再删。返回被解绑的照片行 —— **解绑之前**的样子，调用方要从里面拿
+        它们原来的 `playable_asset_id` 去清理只属于它们的转码产物。
+
+        ## 为什么「再确认 → 解绑 → 删」必须在一个写锁 + 一个事务里
+
+        HTTP 层看一眼引用、再逐张解绑、最后删行的话，中间任何一个请求把它配给了另一张
+        照片（或者配成了参考图），结果是：前面几张已经解绑了、转码产物成了孤儿，最后一步
+        删行又被拒 —— 回一个 409，库却已经被改了一半。所以判断和动作都在这里、在同一个
+        写锁里做：本进程所有写照片 ↔ 素材关联的路径都要拿这把锁，锁里判的就是真相。
+
+        锁只管得住本进程。外键（`photo.*_asset_id REFERENCES asset(id)`，没有级联）是
+        最后一道：锁外（别的进程）真有写入插进来，`DELETE` 会撞外键 —— 那时整个事务
+        回滚（已解绑的照片原样恢复），按回滚后的实际引用重判一遍再抛 `AssetInUse`。
+
+        ## 什么时候抛 `AssetInUse`（什么都没改）
+
+        - 有照片把它当参考图 —— 不管 `detach_videos`。删参考图只能先删照片，这里不代劳。
+        - 有照片把它当视频，而 `detach_videos=False`。
+
+        不存在的 id 什么也不做、返回空列表（幂等，重复点删除不该 500）。
+        """
+        with self._write_lock:
+            refs, videos = self.asset_users(asset_id)
+            if refs or (videos and not detach_videos):
+                raise AssetInUse(
+                    f"asset {asset_id} 仍被照片引用"
+                    f"（参考图 {len(refs)} 张，视频 {len(videos)} 张）",
+                    refs=refs,
+                    videos=videos,
+                )
+            conn = self._conn()
+            try:
+                ts = now_ms()
+                for p in videos:
+                    conn.execute(
+                        "UPDATE photo SET video_asset_id = NULL,"
+                        " playable_asset_id = NULL, updated_at = ? WHERE id = ?",
+                        (ts, p["id"]),
+                    )
+                conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
+            except sqlite3.IntegrityError as exc:
+                conn.rollback()
+                refs, videos = self.asset_users(asset_id)
+                raise AssetInUse(
+                    f"asset {asset_id} 刚被别处配上了照片，已回滚、没有删",
+                    refs=refs,
+                    videos=videos,
+                ) from exc
+            except BaseException:
+                conn.rollback()
+                raise
+            conn.commit()
+            return videos
 
     def update_asset_fingerprint(
         self,
@@ -591,6 +739,31 @@ class Catalog:
             )
             conn.commit()
 
+    def set_photo_title(self, photo_id: str, title: str | None) -> None:
+        """改标题。`None` 存成 SQL NULL —— 空字符串由调用方（HTTP 层）先转成
+        `None` 再传进来，这里不重复判断"是不是空串"：一处做归一化，两处都要
+        改的错误就少一处。"""
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute(
+                "UPDATE photo SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now_ms(), photo_id),
+            )
+            conn.commit()
+
+    def set_photo_print_width(self, photo_id: str, print_width_m: float) -> None:
+        """改打印宽度（米）。合不合法（非负）由调用方校验——这里只管写库，
+        跟 `set_photo_fit_mode` 对 `fit_mode` 合法性的态度不一样，是因为
+        `print_width_m` 的取值范围本来就宽松（0 = 未知，任意非负数都合法），
+        没有一张"枚举表"可以对照。"""
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute(
+                "UPDATE photo SET print_width_m = ?, updated_at = ? WHERE id = ?",
+                (float(print_width_m), now_ms(), photo_id),
+            )
+            conn.commit()
+
     def set_photo_ref_stale(self, photo_id: str, stale: bool) -> None:
         with self._write_lock:
             conn = self._conn()
@@ -674,6 +847,58 @@ class Catalog:
             conn.execute("DELETE FROM photo_grant WHERE photo_id = ?", (photo_id,))
             conn.execute("DELETE FROM photo WHERE id = ?", (photo_id,))
             conn.commit()
+
+    # ---- ingest_reject ----
+
+    def record_reject(
+        self, path: str, code: str, message: str | None, detail: dict[str, Any]
+    ) -> None:
+        """记一次入库被拒。同一路径是覆盖：人要的是「它**现在**为什么进不去」，
+        不是它历次失败的流水（那是日志的活）。"""
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO ingest_reject"
+                " (path, code, message, detail_json, at) VALUES (?,?,?,?,?)",
+                (
+                    path, code, message,
+                    json.dumps(detail, ensure_ascii=False),
+                    now_ms(),
+                ),
+            )
+            conn.commit()
+
+    def clear_reject(self, path: str) -> None:
+        """幂等：没有这条记录时什么也不做。"""
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("DELETE FROM ingest_reject WHERE path = ?", (path,))
+            conn.commit()
+
+    def list_rejects(self) -> list[dict[str, Any]]:
+        """全部拒绝记录，`detail_json` 已解析成 `detail`（dict）。
+
+        解析放在这里而不是交给调用方：`detail_json` 是这张表自己的存储细节，
+        让 HTTP 层去 `json.loads` 意味着它得知道这一列是 JSON 字符串。坏掉的
+        JSON（手工改过库）退回空 dict —— 一条拒绝记录的细节缺了，不该让整张
+        素材总表 500。
+        """
+        out = []
+        for r in self._conn().execute("SELECT * FROM ingest_reject ORDER BY at, path"):
+            try:
+                detail = json.loads(r["detail_json"] or "{}")
+            except ValueError:
+                detail = {}
+            out.append(
+                {
+                    "path": str(r["path"]),
+                    "code": str(r["code"]),
+                    "message": r["message"],
+                    "detail": detail if isinstance(detail, dict) else {},
+                    "at": int(r["at"]),
+                }
+            )
+        return out
 
     # ---- recognize_log ----
 

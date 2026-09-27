@@ -142,6 +142,8 @@ def test_v1_database_upgrades_in_place(v1_db):
         assert set(_columns(v1_db, "photo")) >= {"fit_mode", "backend"}
         # v3 的素材挂载点表
         assert "mount" in _tables(v1_db)
+        # 入库拒绝记录表（纯新增，刻意没有升版本号，见下面那条 v3 测试）
+        assert "ingest_reject" in _tables(v1_db)
         assert _user_version(v1_db) == db.SCHEMA_VERSION
 
         photo = cat.get_photo(V1_PHOTO_ID)
@@ -227,6 +229,54 @@ def test_fresh_database_has_the_same_shape_as_an_upgraded_one(tmp_path, v1_db):
     upgraded.close()
     assert _columns(tmp_path / "fresh.db", "photo") == _columns(v1_db, "photo")
     assert _tables(tmp_path / "fresh.db") == _tables(v1_db)
+
+
+def test_v3_database_gets_ingest_reject_table_without_bumping_version(v1_db):
+    """v3 库打开后补上 `ingest_reject`，老数据原样在，**user_version 仍是 3**。
+
+    版本号不动是这条测试真正要钉的东西：`ingest_reject` 是一张纯新增、谁也不引用的表，
+    上一版镜像（只认到 3）根本不知道它、也碰不到它 —— 为它把 user_version 推到 4，
+    唯一的效果是这个库一旦被新版打开过，退回旧镜像就 SchemaTooNew 起不来（decisions.md
+    §45.2 / §46.2：用户为这个吃过亏，从此不为小事动版本号）。哪天真有一次旧程序会读错的
+    迁移、必须升版本时，这里的 3 要跟着有意识地改，而不是顺手。
+
+    「一个 v3 程序留下的库」是这样造出来的：先让当前代码把 v1 库升上来，再删掉这张表、
+    把版本号拨回 3。没有像 `_V1_DDL` 那样冻一份 v3 的完整 DDL —— 与当前只差这一张表，
+    而「v3 的其余部分长什么样」已经由上面那几条 v1 → 当前 的测试钉住了；再冻一份几乎
+    相同的几十行 DDL，只会多一处每次改 schema 都要同步的地方。
+    """
+    db.Catalog(v1_db).close()
+    conn = sqlite3.connect(v1_db)
+    conn.execute("DROP TABLE ingest_reject")
+    conn.execute("PRAGMA user_version=3")
+    conn.commit()
+    conn.close()
+    assert "ingest_reject" not in _tables(v1_db)
+
+    cat = db.Catalog(v1_db)
+    try:
+        assert "ingest_reject" in _tables(v1_db)
+        assert _columns(v1_db, "ingest_reject") == [
+            "path", "code", "message", "detail_json", "at"
+        ]
+        # 上一版镜像的 SCHEMA_VERSION 是 3：库的版本号只要不超过它，退回去就照常启动。
+        assert db.SCHEMA_VERSION == 3
+        assert _user_version(v1_db) == 3
+        assert cat.get_photo(V1_PHOTO_ID) is not None
+
+        # 新表立刻能用：同一路径记两次是覆盖（只留最近一次拒绝），清掉就没了。
+        cat.record_reject("/nas/x.jpg", "no_features", "提不出特征", {})
+        cat.record_reject(
+            "/nas/x.jpg", "near_duplicate", "近重复",
+            {"conflicts": [{"photoId": V1_PHOTO_ID, "inliers": 99}]},
+        )
+        rows = cat.list_rejects()
+        assert [(r["path"], r["code"]) for r in rows] == [("/nas/x.jpg", "near_duplicate")]
+        assert rows[0]["detail"]["conflicts"][0]["photoId"] == V1_PHOTO_ID
+        cat.clear_reject("/nas/x.jpg")
+        assert cat.list_rejects() == []
+    finally:
+        cat.close()
 
 
 def test_schema_from_the_future_refuses_to_open(tmp_path):

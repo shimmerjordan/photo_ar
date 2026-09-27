@@ -709,6 +709,25 @@ def test_inbox_要管理员(make_env, tmp_path):
     assert env.get("/v1/admin/inbox", as_=env.viewer()).status == 403
 
 
+def test_inbox_删了照片之后参考图回到未入库(make_env, tmp_path):
+    # asset 行本身不会因为删照片而消失（db.delete_photo 的注释：磁盘文件与 asset
+    # 行都留着），但删了照片之后再也没有 photo 引用它 —— 这时它应该重新出现在
+    # 「未入库」列表里，让人能发现「这个文件其实没人用了」，而不是两边都看不见它。
+    inbox = tmp_path / "nas" / "photos" / "_inbox"
+    env = make_env(upload_dir_root=str(inbox))
+    # 落地目录得等 make_env 建完 nas/photos 之后再建它的子目录 _inbox
+    # （make_env 自己用不带 exist_ok 的 mkdir 建 nas/photos，谁先建谁就会撞上）。
+    inbox.mkdir(parents=True)
+    ref = env.write_image("photos/_inbox/a.jpg", seed=1)
+    pid = env.ingest_ok(ref)
+    names = [f["name"] for f in env.body_json(env.get("/v1/admin/inbox"))["files"]]
+    assert "a.jpg" not in names
+    assert env.request("DELETE", f"/v1/photo/{pid}").status == 200
+    files = env.body_json(env.get("/v1/admin/inbox"))["files"]
+    row = next(f for f in files if f["name"] == "a.jpg")
+    assert row["assetId"]            # asset 行还在，但已经没人用它了
+
+
 # ------------------------------------------- 自匹配分的合成分辨率（热配置）
 
 
