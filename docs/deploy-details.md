@@ -6,6 +6,7 @@
 - [两条外网通道，各跑什么](#两条外网通道各跑什么)
 - [隧道的三条硬限制](#隧道的三条硬限制)
 - [证书不是可选项](#证书不是可选项--它同时管着相机和缓存)
+- [票据流与 /healthz 为什么开 ACAO: *](#票据流与-healthz-为什么开-access-control-allow-origin-)
 - [CDN：该缓存什么、绝对不该缓存什么](#cdn该缓存什么绝对不该缓存什么)
 - [转码与核显硬编](#转码与核显硬编)
 - [入库为什么会被拒](#入库为什么会被拒)
@@ -73,6 +74,28 @@
 
 也就是说自签证书的代价不是"有个警告要点一下"，是**每个宾客每次进页面都重下一遍引擎**。
 拿真证书的两条路见 [deploy.md 第 7 步](deploy.md)。
+
+## 票据流与 /healthz 为什么开 `Access-Control-Allow-Origin: *`
+
+「媒体数据源」（设置页高级设置，日常操作见 [usage.md](usage.md#设置页高级设置默认声音更快的地址单独换一段视频的来源)）让一个局域网 / 公网直连地址帮着取视频和原图——这两类平时靠 HttpOnly 会话 cookie 鉴权，而 cookie 天生按源隔离，带不到别的源去，也不该带。
+
+**缩略图刻意不走数据源**，照旧同源直取（`prefetch.js` 的 `prefetchThumbs`、页面上的 `<img>`）：一张几十 KB，走隧道也快；而 `<img>` 只能按地址直接取、带不了 cookie 跨源，要改走数据源就得每张先在隧道上换一张票——换票那一趟往返就比直接把图取回来还慢，数据源在这里只会添麻烦。这与设计文档 §0 第 4 条「整个后端数据可换成新地址」的字面不同，是有意的取舍：数据源加速的是大件（视频、原图），不是所有媒体请求。
+
+**票据是唯一的出路**：浏览器带着 cookie 先在**当前源**换一张票（`GET /api/ticket?path=<三类之一>`），换来的地址是 `/api/stream/<票>`，之后 `credentials:'omit'` 跨源去取——**票本身就是凭证**，谁拿到票谁能读。三条边界线：
+
+- **不带 cookie**：取流那一步不看调用方带来的 cookie，用的是发票时记下的那份凭证；泄漏一张票最多让人看一段视频，泄漏会话 token 是整个账号。
+- **10 分钟、可重复用**：视频最长 30 秒，10 分钟足够覆盖重连与拖动，又短到捡到也没用。
+- **只认三类路径**：`/v1/asset/<id>/stream`（视频）、`/v1/photo/<id>/ref`（原图）、`/v1/photo/<id>/thumb`（缩略图；服务端认，但前端眼下不为缩略图换票，理由见上）——票里钉死了具体路径，换不了别的资源。发票前会先拿调用方的凭证去上游探一次（1 字节 Range，200/206 才发），不然任何人都能拿一张票去读任意 asset。
+
+`/api/ticket` 本身**不开跨源**：发票必须同源带着 HttpOnly cookie，开了跨源就等于让任何网站都能诱导浏览器带着这个源的会话去发票。开了跨源的只有两条：`/api/stream/*`（凭证在票里）和 `/healthz`（数据源探测用它判断"这个地址通不通"，只看状态码）。`/healthz` 对带 `Origin` 头的跨源请求只回 `{"ok":true}`：它对任意来源开放、预检还带私网头，任何公网网页都能借访客的浏览器探到局域网里的这台机器，「活着」挡不住也不该挡，但上游内部地址不能让它顺带读走；不带 `Origin` 的（容器健康检查、运维 `curl`）照旧多一个 `upstream` 字段，排障用。正式响应带 `Access-Control-Allow-Origin: *` + `Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type`（`<video>` / MSE 边下边播要读这几个头才能算出续传位置，跨源默认不暴露）+ `Cross-Origin-Resource-Policy: cross-origin`；OPTIONS 预检回 204、带 `Access-Control-Allow-Headers: Range`，请求带了 `Access-Control-Request-Private-Network: true`（下面这条私网头）时再回 `Access-Control-Allow-Private-Network: true`。
+
+### LNA / 混合内容的边界：我们验不到，靠自探测 + 自动退回
+
+https 页面请求 http 的私网地址会被浏览器当**混合内容**直接拦掉；Chromium 142 起的 Local Network Access 给 `fetch()` 开了个口子（目标是私网地址 + 显式声明 `targetAddressSpace`），但**这条我们没法在开发机上端到端验证**——要验它就得真的从公网隧道页面发起一次请求，向局域网地址发起 fetch，而这台机器上没有这样的现场环境。
+
+所以设置页「测试」按钮走的是自探测：依次试三种写法（不带选项 → `targetAddressSpace:'local'` → `targetAddressSpace:'private'`），记住第一种成功的，之后照它发。运行时任何一次经数据源的请求失败，立刻退回默认地址续传（带 Range，不从头来），并把这个数据源标记「暂时不可用」60 秒——**它只应该加速，绝不能成为新的故障点**，宁可退回默认地址慢一点，也不让一次网络抖动变成播不出来。测试失败时四档提示各自对应什么、怎么修，见 [faq.md](faq.md#设了局域网数据源还是慢--测试不通过)。
+
+真正不依赖 LNA 的路，是给局域网地址本身配一张真证书——https 打 https 没有混合内容这回事，也不必等浏览器那个还在灰度推广的权限。两条路（DNS-only 记录 + DNS-01 签发 Let's Encrypt；Tailscale MagicDNS 证书）同样写在 [faq.md](faq.md#给局域网地址配一张真证书不依赖本地网络访问) 里，**同样没有端到端验证过**——已验证的只有自签证书那条路（上一节）。
 
 ## CDN：该缓存什么、绝对不该缓存什么
 
