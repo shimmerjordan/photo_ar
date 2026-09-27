@@ -116,7 +116,11 @@ describe('dlText / stageName：下载那一行说什么', () => {
   test('dlText 各档', () => {
     assert.equal(dlText(null), '')
     assert.equal(dlText({ fromCache: true, done: true }), '本机已有')
-    assert.equal(dlText({ loaded: 3355443, total: 8493465, done: false, source: 'origin' }), '已下载 3.2 / 8.1 MB')
+    // 知道总长就把百分比放在最前面：边下边播时人要一眼看出「还差多少」，
+    // 两个 MB 数要心算才得出来（真实反馈：「边下边播只看到播放进度」）。
+    assert.equal(dlText({ loaded: 3355443, total: 8493465, done: false, source: 'origin' }), '已下载 40%（3.2 / 8.1 MB）')
+    assert.equal(dlText({ loaded: 0, total: 8493465, done: false, source: 'lan' }), '经局域网 · 已下载 0%（0.0 / 8.1 MB）')
+    assert.equal(dlText({ loaded: 8493465, total: 8493465, done: false, source: 'origin' }), '已下载 100%（8.1 / 8.1 MB）')
     assert.equal(dlText({ loaded: 3355443, total: 0, done: false, source: 'lan' }), '经局域网 · 已下载 3.2 MB')
     assert.equal(dlText({ loaded: 1, total: 1, done: true, source: 'origin' }), '已存到本机，下次秒开')
     assert.match(dlText({ loaded: 1, total: 1, done: true, cacheFailed: '浏览器存储空间不够' }), /没存进本机/)

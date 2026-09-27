@@ -24,13 +24,14 @@
  * 但**大件的字节**可以换条路：家里的 NAS 在局域网里直连比隧道快一个数量级。所以这里有：
  *
  * 1. **视频默认有声音**（`prefs.soundOn`）：三处播放都照它起播，被浏览器拦了就先静音播。
- * 2. **媒体数据源**（`prefs.advanced().mediaBase`）：视频 / 原图的下载改走这个地址，页面本身
+ * 2. **媒体下载源（镜像）**（`prefs.advanced().mediaBase`，代码里叫「整站数据源」）：视频 / 原图的下载改走这个地址，页面本身
  *    不动。它**只加速、不能成为新的故障点**：连不上 mediastore 会自动退回当前地址续传，
  *    并熔断 60 秒（netsrc.js）。所以「保存」之后要 `resetTrip()` —— 不然上一个地址留下的
  *    熔断会让新地址白白晚一分钟才生效。
  * 3. **单个媒体的来源**：某一组的视频改用直链或本机文件（设计 §2.3）。
  *
- * 默认收起：这三样对绝大多数人都不用碰，摊开放在「账号」下面只会让人以为非设不可。
+ * 默认展开（2026-09-27 改）：原来默认收起，理由是「这三样多数人不用碰」；但真实反馈是
+ * 找它的人根本没找到 —— 收起的木牌上只有一个按钮，而人要找的词是「下载源 / 镜像」。
  */
 import * as api from '../api.js'
 import { thresholds } from '../recognize/consts.js'
@@ -45,7 +46,7 @@ import { icon } from '../pixelicons.js'
 import { advanced, normalizeBase, overrideOf, pickLanMode, setAdvanced, setOverride, setSoundOn, soundOn } from '../prefs.js'
 import { bytes, button, confirmDanger, h, row, section, toast, when } from '../ui.js'
 
-/** 「高级设置」展开与否。存 sessionStorage：这次会话里来回切页不用每次再点开，下次打开页面又是收起的。 */
+/** 「高级设置」展开与否。存 sessionStorage：只记「这次会话里点过收起」，下次打开页面又是默认展开。 */
 const ADV_OPEN_KEY = 'photoar.adv.open'
 
 export default {
@@ -204,7 +205,7 @@ function advancedSection({ isAlive }) {
   const body = h('div', { hidden: true })
   const toggle = h('button', { class: 'ghost', type: 'button', 'aria-expanded': 'false', onclick: () => setOpen(body.hidden) })
   const sec = section('高级设置',
-    h('p', { class: 'p dim', text: '视频默认的声音、换一个更快的媒体地址、给单独某段视频换来源。都只存在这个浏览器里。' }),
+    h('p', { class: 'p dim', text: '视频默认的声音、媒体下载源（镜像）、给单独某段视频换来源。都只存在这个浏览器里。' }),
     h('div', { class: 'actions' }, toggle),
     body)
 
@@ -229,7 +230,7 @@ function advancedSection({ isAlive }) {
   })
   const baseErr = h('p', { class: 'p bad', hidden: true })
   const baseNow = row('现在', '')
-  const onChips = h('div', { class: 'chips', role: 'group', 'aria-label': '启用媒体数据源' })
+  const onChips = h('div', { class: 'chips', role: 'group', 'aria-label': '启用媒体下载源' })
   const testBtn = button('测试', () => runTest(), { kind: 'ghost' })
   const probeLine = h('p', { class: 'p', hidden: true })
   const speedLine = h('p', { class: 'p mono', hidden: true })
@@ -526,8 +527,8 @@ function advancedSection({ isAlive }) {
     soundChips,
     h('p', { class: 'p dim', text: '浏览器不允许有声自动播放时会先静音播，点一下屏幕任意处就有声音' }),
 
-    h('h3', { class: 'sub', text: '媒体数据源' }),
-    h('label', { class: 'field', for: 'adv-base' }, h('span', { text: '地址（例如家里 NAS 的局域网地址）' }), baseIn),
+    h('h3', { class: 'sub', text: '媒体下载源（镜像）' }),
+    h('label', { class: 'field', for: 'adv-base' }, h('span', { text: '镜像地址：视频和原图改从这里下（例如家里 NAS 的局域网地址）' }), baseIn),
     baseErr,
     onChips,
     baseNow,
@@ -559,14 +560,16 @@ function advancedSection({ isAlive }) {
     toggle.textContent = open ? '收起高级设置' : '展开高级设置'
     toggle.setAttribute('aria-expanded', open ? 'true' : 'false')
     try {
-      sessionStorage.setItem(ADV_OPEN_KEY, open ? '1' : '')
-    } catch { /* 隐私模式：不记，下次进来还是收起的 */ }
+      sessionStorage.setItem(ADV_OPEN_KEY, open ? '1' : '0')
+    } catch { /* 隐私模式：不记，下次进来还是默认展开 */ }
     // 取失败了（photosP 被清成 null）就让下一次展开重试。
     if (open && (!loaded || !photosP)) { loaded = true; load() }
   }
-  let wasOpen = false
+  // **默认展开**，只有这次会话里点过「收起」才收着。原来默认收起，结果真实反馈是「设置里
+  // 没有高级设置」—— 人扫一眼设置页找「下载源」，看到的只有一个「展开高级设置」按钮。
+  let wasOpen = true
   try {
-    wasOpen = sessionStorage.getItem(ADV_OPEN_KEY) === '1'
+    wasOpen = sessionStorage.getItem(ADV_OPEN_KEY) !== '0'
   } catch { /* 同上 */ }
   setOpen(wasOpen)
   return sec

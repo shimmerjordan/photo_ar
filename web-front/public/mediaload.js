@@ -145,7 +145,12 @@ export function dlText(dl) {
   if (dl.fromCache) return '本机已有'
   if (dl.done && dl.cacheFailed) return `已下完，但没存进本机（${dl.cacheFailed}）`
   if (dl.done) return '已存到本机，下次秒开'
-  const n = dl.total ? `已下载 ${mb(dl.loaded)} / ${mb(dl.total)} MB` : `已下载 ${mb(dl.loaded)} MB`
+  // 知道总长时百分比放最前：边下边播那几秒里人要的是「还差多少」，两个 MB 数得心算。
+  // 取整后钳在 0..100（续传换源时 loaded 可能短暂追平/略超 total 的元信息估值）。
+  const pct = dl.total ? Math.min(100, Math.max(0, Math.round((dl.loaded / dl.total) * 100))) : 0
+  const n = dl.total
+    ? `已下载 ${pct}%（${mb(dl.loaded)} / ${mb(dl.total)} MB）`
+    : `已下载 ${mb(dl.loaded)} MB`
   return dl.source === 'lan' ? `经局域网 · ${n}` : n
 }
 

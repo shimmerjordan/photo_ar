@@ -629,6 +629,13 @@ body.fullbleed #bar {
 }
 #hud.hit::after { transform: scale(1); }
 #meta { color: var(--fg-dim); display: flex; gap: 10px; flex-wrap: wrap; }
+/* 扫描页的下载那一行（字 + 小条，见 scan.js 的 noteDl）。字跟 HUD 的前景色走（变量继承），
+   条沿用面板里的 `.bar2`，但贴着字 —— 面板里那 14px 的上间距在这块小木牌里太空。
+   `[hidden]` 要显式写：`display:flex` 会盖掉 hidden 属性的默认 display:none。 */
+#dlrow { display: flex; flex-direction: column; gap: 4px; }
+#dlrow[hidden] { display: none; }
+#dlrow .dl-t { margin: 0; color: var(--fg); }
+#dlrow .bar2 { margin-top: 0; }
 .gate-inline {
   position: absolute;
   inset: 0;

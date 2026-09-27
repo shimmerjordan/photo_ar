@@ -31,7 +31,7 @@ import {
 } from '../render/screenquad.js'
 import { Stage, dlText, loadPhotoVideo, stageName } from '../mediaload.js'
 import { soundUnlocker } from '../playback.js'
-import { button, esc, h, playerControls } from '../ui.js'
+import { button, esc, h, playerControls, setDownloadRow } from '../ui.js'
 import { traceRender, traceResult } from '../trace.js'
 import { QuadFilter } from '../render/quadfilter.js'
 import { thresholds } from '../recognize/consts.js'
@@ -111,6 +111,11 @@ export default {
       clip: h('video', { class: 'offscreen', playsinline: true, loop: true }),
       tip: h('div', { id: 'tip', text: '正在准备…', 'aria-live': 'polite' }),
       meta: h('div', { id: 'meta' }),
+      // 下载那一行（字 + 小进度条），与宾客页/试播页同一套 `ui.setDownloadRow`。
+      // **单独一行、带条**，而不是塞进 `#meta` 那行暗色小字：边下边播时人要一眼看出
+      // 「还在下、下到哪了」，原来那句小字 + 金条后面一层淡淡的底色，真实反馈是「只看到播放进度」。
+      dlLine: h('p', { class: 'dl-t', hidden: true, 'aria-live': 'off' }),
+      dlBar: h('div', { class: 'bar2', hidden: true }, h('i')),
     }
     const rescan = button('重新扫描', () => resetLock(), { kind: 'ghost', iconName: 'refresh' })
     /**
@@ -287,7 +292,11 @@ export default {
      */
     const unlock = soundUnlocker(dom.clip)
 
-    dom.hud = h('div', { id: 'hud' }, dom.tip, h('div', { class: 'actions' }, rescan, ctl, camBtn, browse), dom.meta)
+    // 下载那一行的容器自己也要跟着收：#hud 是 flex 列、带 gap，里面两样都藏起来时空容器
+    // 仍会多占一道缝（见 noteDl 里的 `dom.dlRow.hidden`）。
+    dom.dlRow = h('div', { id: 'dlrow', hidden: true }, dom.dlLine, dom.dlBar)
+    dom.hud = h('div', { id: 'hud' }, dom.tip, dom.dlRow,
+      h('div', { class: 'actions' }, rescan, ctl, camBtn, browse), dom.meta)
     el.append(dom.canvas, dom.cam, dom.clip, dom.hud)
 
     /**
@@ -321,7 +330,7 @@ export default {
       // 视频装载到哪一步了、以及那一步的细节数字。前者用来判"阶段变了没有"（播放进度
       // 每秒来好几次，不判的话每次都会重写一遍 tip 并重放那颗星的动画）。
       loadStage: null, loadNote: null,
-      // 起播之后的下载那一句（`dlText`），见 `noteDl`：还在下 → 实时的「已下载 …」；下完 →
+      // 下载那一行（`#dlrow`，`dlText`），见 `noteDl`：还在下 → 实时的「已下载 …」；下完 →
       // 「已存到本机」说**一次**（`dlSaid`），3 秒后由 `dlTimer` 清掉。
       dlNote: '', dlSaid: false, dlTimer: 0,
       // 这一段是不是静音起播的（被浏览器拦下、或设置里关了默认声音），且用户还没开过声。
@@ -359,7 +368,7 @@ export default {
      * | 一切正常 | （空） | 库/帧率/耗时/四角年龄/跟踪点/视频分辨率 |
      * | 这张没配视频 | 「这张照片还没配视频」 | `无视频` |
      * | 视频在加载 | 「视频加载中…」 | `视频加载中 rs=1` |
-     * | 边下边播 | 「已下载 3.2 / 8.1 MB」→ 下完「已存到本机，下次秒开」3 秒 | 同左 |
+     * | 边下边播 | 下载行「已下载 42%（3.2 / 8.1 MB）」→ 下完「已存到本机，下次秒开」3 秒 | 同左 |
      * | 视频出错 | 「视频播不了」 | `视频错误 4` |
      * | 词表没训 | （空 —— 那只影响速度，不影响结果） | `无词表·全量扫描` |
      *
@@ -405,7 +414,7 @@ export default {
           if (st.filter?.correcting) parts.push('纠正滑行中')
           if (st.filter?.rejected) parts.push(`毛刺 ${st.filter.rejected}`)
           if (st.loadNote) parts.push(`${st.loadStage} ${st.loadNote}`)
-          if (st.dlNote) parts.push(st.dlNote)
+          // 下载进度不在这里说：它有自己那一行（`#dlrow`），两处都写就是同一串数字说两遍。
           if (!st.lockedPhoto.mediaUrl) parts.push('无视频')
           else if (v.error) parts.push(`视频错误 ${v.error.code}`)
           else if (v.readyState < 2) parts.push(`视频加载中 rs=${v.readyState}`)
@@ -422,9 +431,7 @@ export default {
         else if (st.loadNote) parts.push(st.loadNote)
         else if (v.readyState < 2) parts.push('视频加载中…')
         else if (v.paused) parts.push('视频已暂停')
-        // 起播之后的下载（`noteDl`）。**不进上面那条 else-if 链**：它与「已暂停」「加载中」是
-        // 同时成立的两件事 —— 暂停着照样在下，原来就是被顶掉的那一件（设计 §0 需求 3）。
-        if (st.dlNote && st.lockedPhoto.mediaUrl && !v.error) parts.push(st.dlNote)
+        // 下载进度不在这一行：它有自己那一行（`#dlrow`，见 `noteDl`），暂停着照样在那儿涨。
         // 贴合准确度。**只在不稳时说话**（稳的时候这行字本身就是干扰），
         // 而且说的是"怎么办"不是数字：跟踪点少 = 角度太斜/太远/反光，
         // 这三样宾客都能自己调整。分档阈值见 fitQuality()。
@@ -527,7 +534,8 @@ export default {
      * | 位置 | 放什么 | 变化频率 |
      * |---|---|---|
      * | `#tip`（HUD 大字） | 阶段名：`正在取视频…` → `正在下载视频…` → `内点 42。` | 每阶段一次 |
-     * | `#meta`（HUD 小字） | 细节数字：`3.2 / 8.1 MB`、`本机已有，秒开`；起播后 `已下载 …`（见 `noteDl`） | 每 200ms |
+     * | `#dlrow`（下载行：字 + 小条） | 有下载任务时：`已下载 42%（3.2 / 8.1 MB）`，起播前后、暂停着都在（见 `noteDl`） | 每收一块 |
+     * | `#meta`（HUD 小字） | 其余细节：`本机已有，秒开`、贴合稳不稳、调试读数 | 每 200ms |
      * | `#bar`（顶部金条） | 百分比 / 扫描动画 / **起播后亮层 = 播放进度、暗层 = 已下载** | 每帧 |
      *
      * 数字**不能**放进 tip：它有 `min-height: 40px`，文字长度每 200ms 变一次会让整块
@@ -575,7 +583,10 @@ export default {
         return
       }
 
-      st.loadNote = s.text || null
+      // 起播前的下载档：有下载任务（`dl`，而且不是本机已有）时数字交给下载那一行（`noteDl`），
+      // meta 里就不再说一遍 `3.2 / 8.1 MB`；本机已有 / 直连那两条路照旧由 meta 说。
+      const dlOwnsNumbers = s.stage === Stage.DOWNLOAD && s.dl && !s.dl.fromCache
+      st.loadNote = dlOwnsNumbers ? null : (s.text || null)
       const terminal = s.stage === Stage.UNAVAILABLE || s.stage === Stage.ERROR
       if (terminal) {
         st.loadNote = null
@@ -585,13 +596,14 @@ export default {
         ctx.progress?.(null, { hide: true })
         // 失败这一句用不加粗的 title：加粗是"认出来了而且能看"的样子，而这里看不到。
         tip(`认出了 ${title}，但${esc(s.text)}。`, { hit: true })
-      } else if (changed) {
-        // **阶段名，不是 `stageText`。** 后者在下载那一档给的是数字（`0.0 / 8.1 MB`），
-        // 而那串数字此刻已经在下面那行小字里了（`st.loadNote`）—— 同一句显示两遍，
-        // 且 tip 上那句读起来不知道在干什么。上面那张表说的就是这条分工。
-        tip(`认出了 <b>${title}</b>，${name() || '正在加载'}…`, { hit: true })
-        bar(s.pct, name() || '加载视频')
       } else {
+        noteDl(s.dl)
+        if (changed) {
+          // **阶段名，不是 `stageText`。** 后者在下载那一档给的是数字（`0.0 / 8.1 MB`），
+          // 而那串数字此刻已经在下载那一行（或 meta 小字）里了 —— 同一句显示两遍，
+          // 且 tip 上那句读起来不知道在干什么。上面那张表说的就是这条分工。
+          tip(`认出了 <b>${title}</b>，${name() || '正在加载'}…`, { hit: true })
+        }
         bar(s.pct, name() || '加载视频')
       }
       // 终局（不管是不是这一秒里最新的一条）必须立刻可见：往后不会再有下一条把它盖住。
@@ -599,13 +611,17 @@ export default {
     }
 
     /**
-     * 起播之后的下载那一句（HUD 小字，见 `meta`）。**还在下**：实时的「已下载 3.2 / 8.1 MB」。
+     * 下载那一行（`#dlrow`：字 + 小进度条）。**还在下**：实时的「已下载 42%（3.2 / 8.1 MB）」+ 条，
+     * 起播前、起播后、暂停着都一直在 —— 边下边播时这正是人要看的另一半（播放进度在顶部金条上）。
      * **下完**：「已存到本机，下次秒开」说一次、3 秒后收掉 —— 那是这次下载兑现的时刻，
      * 值得一句；但之后每一条 PLAYING 都带着 `dl.done`，不挡的话它就永远挂在取景器底下了。
      *
      * 两种不说：本机已有（`fromCache`，装载那一步已经说过「本机已有，秒开」）、`dl` 为空
      * （直连那两条例外路，不归下载任务管）。没存进本机（`cacheFailed`）**不收**：那是这段
      * 视频下次还要重下的原因，一闪而过等于没说（ui.toast 那条「失败不要用 toast」同理）。
+     *
+     * 直接画、不走 `meta()` 的 250ms 节流：只改一行字和一个 transform，没有节流的必要，
+     * 而节流会让「下完了」那一句晚到或被丢掉。
      */
     function noteDl(dl) {
       let text = ''
@@ -620,22 +636,24 @@ export default {
             st.dlTimer = 0
             if (!st.alive) return
             st.dlNote = ''
-            meta(true)
+            setDownloadRow(dom.dlLine, dom.dlBar, null, '')
+            dom.dlRow.hidden = true
           }, 3000)
         }
       }
-      if (text === st.dlNote) return
-      const settled = Boolean(dl?.done) || !text
       st.dlNote = text
-      // 下载中的数字每收一块就变，走 meta 自己的 250ms 节流；「下完了」那一句必须立刻可见。
-      meta(settled)
+      // 下完之后（`done`）条收起、只留那句话；还在下时条跟着 loaded/total 走（总长未知时铺满压暗）。
+      setDownloadRow(dom.dlLine, dom.dlBar, text ? dl : null, text)
+      dom.dlRow.hidden = !text
     }
-    /** 换片 / 重扫 / 卸载：那句话属于上一段视频，连同 3 秒的计时一起撤掉。 */
+    /** 换片 / 重扫 / 卸载：那一行属于上一段视频，连同 3 秒的计时一起撤掉。 */
     function clearDlNote() {
       clearTimeout(st.dlTimer)
       st.dlTimer = 0
       st.dlNote = ''
       st.dlSaid = false
+      setDownloadRow(dom.dlLine, dom.dlBar, null, '')
+      dom.dlRow.hidden = true
     }
 
     /**
