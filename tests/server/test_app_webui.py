@@ -92,6 +92,20 @@ def test_前端的每个分区在_HTML_里都有按钮和面板(env):
         assert f'id="p-{tab}"' in html, f"{tab} 少了面板"
 
 
+def test_媒体页的四个视图_编辑对话框与手机上传入口都在发出去的页面里(env):
+    """`app.js` 按 id / `data-mapdir` 取这些节点，取不到就是 `null.addEventListener`
+    —— 整个脚本在那一行停下，**所有**页签一起失灵，而不只是媒体页少一块。
+
+    取的是服务端真正发出去的那份（而不是直接读仓库里的文件）：要确认的是浏览器
+    拿到的页面里有它们。
+    """
+    home = html_of(env, env.get("/admin", auth=False))
+    for mapdir in ("photo", "video", "files", "dups"):
+        assert f'data-mapdir="{mapdir}"' in home, f"少了「{mapdir}」视图按钮"
+    assert 'id="dlg-edit"' in home, "少了编辑照片对话框"
+    assert 'id="phone-file"' in home, "少了从手机/本机选文件的 input"
+
+
 # ---------------------------------------------------------------- 不能变成兜底
 
 

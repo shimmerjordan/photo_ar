@@ -389,7 +389,10 @@ input[type="checkbox"]:not(.sw input) { accent-color: var(--accent-fill); }
 .tbl tbody tr:last-child td { border-bottom: 0; }
 .tbl tbody tr:hover { background: var(--panel); }
 .tbl td .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-.tbl .sub { display: block; font-size: 0.75rem; color: var(--ink-3); }
+/* `overflow-wrap:anywhere`：`.sub` 里装的多是 NAS 路径与哈希文件名，一整串没有空格可断。
+ * 窄屏翻成卡片后它不折行就把整页撑出横向滚动（390 宽的手机上实测页面变 420），固定定位
+ * 的 toast 也跟着被推出屏幕。`.mediatbl .sub.mono` 那条是同一件事的局部版本，这里一并兜底。 */
+.tbl .sub { display: block; font-size: 0.75rem; color: var(--ink-3); overflow-wrap: anywhere; }
 
 @media (pointer: coarse) {
   .tbl td { padding: 11px 12px; }
@@ -749,16 +752,19 @@ dialog[open]:not(:modal) {
   z-index: 100;
 }
 
-/* ---------- 方向切换（映射页） ---------- */
+/* ---------- 方向切换（媒体页） ---------- */
 
-/* 两个视图不是「简略/详细」，而是两个不同的问题，所以做成并列的开关而不是下拉。
- * aria-pressed 承载状态，视觉只是它的呈现 —— 读屏软件不靠颜色。 */
+/* 四个视图不是「简略/详细」，而是四个不同的问题，所以做成并列的开关而不是下拉。
+ * aria-pressed 承载状态，视觉只是它的呈现 —— 读屏软件不靠颜色。
+ * 可以折行：窄屏上四个按钮加起来可能比屏幕宽，横向溢出会把「重复」藏到屏幕外面。 */
 .segbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 12px 0 4px;
 }
-.segbar .btn[aria-pressed="true"] {
+.segbar .btn[aria-pressed="true"],
+.chips.filters .btn[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--accent);
   background: #1b241c;
@@ -915,6 +921,65 @@ dialog[open]:not(:modal) {
 .chip .plus { color: var(--accent); font-size: 0.9375rem; padding: 0 2px; }
 button.chip { cursor: pointer; font: inherit; color: inherit; text-align: left; }
 button.chip:hover { border-color: var(--accent); }
+
+/* ---------- 媒体页：全部素材 / 重复 / 编辑对话框 ---------- */
+
+/* 全部素材的筛选：和视图切换同一种「按下去」的样子（上面那条选择器），只是间距跟 chips。 */
+.chips.filters { margin: 0 0 12px; }
+
+/* 路径可能比单元格宽（NAS 上的目录一层套一层）。允许任意处断开，不然整张表被一条路径撑出
+ * 横向滚动条，操作列跑到屏幕外面。 */
+.mediatbl .sub.mono { overflow-wrap: anywhere; }
+/* 反过来，大小这一列不许断：路径可以断之后浏览器会先挤窄列，「6.2 MB」会被折成两行。 */
+.mediatbl td.num { white-space: nowrap; }
+/* 窄屏翻成卡片后，没有缩略图的那一格（转码产物、文件不在了）是卡片顶上一块 40px 的空白。 */
+@media (max-width: 760px) {
+  .mediatbl td:empty { display: none; }
+}
+/* 一行素材的状态标签：状态 + 转码产物 + 重复 + 被拒可能同时有，单独一行、可以折行。 */
+.mediatbl .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.mediatbl .rej { margin-top: 6px; max-width: 64ch; }
+/* 「是『某某』的参考图，要删先删照片」这种长提示放在操作列里：标签默认不折行，会把表格撑破。 */
+.tag.wrap { white-space: normal; }
+
+/* 「重复」页的三段沿用配置页 .group 的小标题；段落说明与「没有」各一种写法。
+ * 第一段离视图切换按钮远一点：不然小标题贴着按钮，看起来像按钮的说明文字。 */
+#photos-body > .group:first-child { margin-top: 18px; }
+.group > .note { margin: 0 0 10px; font-size: 0.8125rem; color: var(--ink-3); max-width: 80ch; }
+.group > .none { margin: 0; font-size: 0.875rem; color: var(--ink-2); }
+.scanbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 0.8125rem;
+}
+
+/* 近重复对的卡片网格用 auto-fill 而不是 .cards 的 auto-fit：只有一对的时候，auto-fit 会
+ * 把那一张卡片拉满整行，两张缩略图各占半屏宽。 */
+.cards.pairs { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+/* 一对库内近重复：左 | 内点数 | 右。两边等宽，删哪张一眼能对上是哪张。 */
+.duppair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.duppair .side { display: grid; gap: 4px; justify-items: start; min-width: 0; }
+.duppair .th { width: 100%; height: auto; aspect-ratio: 4 / 3; }
+.duppair .nm { font-size: 0.875rem; overflow-wrap: anywhere; }
+.duppair .sub { font-size: 0.75rem; color: var(--ink-3); }
+.duppair .vs { align-self: center; display: grid; justify-items: center; }
+.duppair .vs .mono { font-size: 1.125rem; color: var(--warn); }
+
+/* 编辑对话框。「参考图与视频」那一栏没有对应的输入框，标题用 span，样子跟 label 一样。 */
+.field > .lbl { font-size: 0.875rem; font-weight: 550; }
+dialog .selfnote.editbox { margin-bottom: 8px; }
+.editinfo { display: flex; gap: 10px; align-items: flex-start; }
+.editinfo .meta { display: grid; gap: 4px; min-width: 0; }
+.editinfo .mono { overflow-wrap: anywhere; }
+.editacts { display: flex; gap: 6px; flex-wrap: wrap; }
 
 /* ---------- NAS 文件选择器 ---------- */
 

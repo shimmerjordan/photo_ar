@@ -167,7 +167,21 @@ const state = {
   grants: null,             // {userId, all, ids:Set, baseAll, baseIds:Set, q}
   config: null,             // {fields, values, edits:{}}
   mapping: null,            // {photos, videos, unmapped}
-  mapDir: 'photo',          // 映射页的方向：'photo' | 'video'
+  // loadPhotos 里那一批 Promise.all，还没定下来的时候放这儿：别处要用 mapping、但它还
+  // 没回来时，等它一下而不是把「还没取到」当成「库里没有」（fix1 M4）。
+  mappingPromise: null,
+  mapDir: 'photo',          // 媒体页的视图：'photo' | 'video' | 'files' | 'dups'
+  // 「全部素材」「重复」两个视图共用的 /v1/admin/media。单独取、不跟 mapping 一起等：
+  // 它要给落地目录里没入库的文件现算 sha256，第一次可能是秒级，不该拖慢照片表。
+  media: null,
+  mediaErr: null,           // 上一次取 media 失败的 ApiError；null = 没失败
+  mediaGen: 0,              // 防止上一轮的 media 回来盖掉新的（同 photosGen）
+  mediaLoading: false,
+  mediaFilter: 'all',       // 全部素材的筛选，见 MEDIA_FILTERS
+  // 库内近重复的扫描结果（+ 扫描时间 at）。要真算、几秒到一分钟，所以**不**随刷新
+  // 自动重扫；删掉一张之后只把含它的那几对剔掉。
+  dupScan: null,
+  edit: null,               // 编辑对话框里的那张：{photoId, detail, base}
   // 批量页。plan = /admin/import/parse 的结果；run = 执行进度（null = 还没跑）。
   batch: { fileName: '', plan: null, run: null, busy: false },
   mounts: null,             // {mounts, envRoots}
@@ -188,7 +202,9 @@ const state = {
 function toast(kind, message, code, sticky) {
   const box = $('toasts');
   const body = el('div', { cls: 'body' }, [
-    el('span', { text: message }),
+    // richText：后端的报错里有意用 `**…**` 标了最要命的半句（「**两张都永久识别不
+    // 出来**」），原样显示是一串星号。它只切字符串、不解析 HTML，见 richText。
+    el('span', {}, richText(message == null ? '' : message)),
     code ? el('span', { cls: 'code', text: code }) : null,
   ]);
   const x = el('button', { cls: 'x', type: 'button', 'aria-label': '关闭提示', text: '×' });
@@ -220,7 +236,8 @@ function confirm2(title, lead, lines, yesText) {
   $('dlg-confirm-lead').textContent = lead;
   const ul = $('dlg-confirm-list');
   clear(ul);
-  for (const line of lines) ul.appendChild(el('li', { text: line }));
+  // 确认框的后果清单里同样用 `**…**` 标重点（「**都留着**」），理由同 toast。
+  for (const line of lines) ul.appendChild(el('li', {}, richText(line)));
   const yes = $('dlg-confirm-yes');
   yes.textContent = yesText || '确认';
   return new Promise((resolve) => {
@@ -285,6 +302,8 @@ function showGate(msg) {
 function sessionLost() {
   if (!state.me) return;
   state.users = state.photos = state.config = state.grants = null;
+  // 素材总表与扫描结果带着 NAS 路径，换一个人登录不该还看得到上一位的那份。
+  state.media = state.dupScan = state.edit = null;
   state.photoDetail = {};
   showGate('会话已失效（过期，或者账号被停用/改了口令）。请重新登录。');
 }
@@ -391,6 +410,8 @@ $('mustchg-form').addEventListener('submit', async (ev) => {
 $('logout').addEventListener('click', async () => {
   try { await api('POST', '/auth/logout'); } catch (e) { /* 退出的失败不值得挡住用户 */ }
   state.users = state.photos = state.config = state.grants = null;
+  // 素材总表与扫描结果带着 NAS 路径，换一个人登录不该还看得到上一位的那份。
+  state.media = state.dupScan = state.edit = null;
   state.photoDetail = {};
   state.me = null;
   showGate();
@@ -583,10 +604,20 @@ function td(label, kids, cls) {
   }));
 }
 
+/**
+ * 这一会话里换过参考图的照片 → 版本号（换的时刻）。
+ *
+ * `/v1/photo/<id>/thumb` 给的是一年的 `immutable` 缓存，而换参考图是把同一个 photoId
+ * 的缩略图文件**原地覆盖** —— 同一个 URL，浏览器不会再问。不挂版本号的话，换完之后
+ * 这一页上看到的还是旧图，人会以为没换成。
+ */
+const thumbVer = {};
+
 /** 缩略图。靠 cookie 鉴权（`<img>` 带不了 Authorization 头），见文件头注释。 */
 function thumb(photoId, alt) {
+  const v = thumbVer[photoId];
   const img = el('img', {
-    cls: 'th', src: `${API}/photo/${photoId}/thumb`, alt: alt || '',
+    cls: 'th', src: `${API}/photo/${photoId}/thumb${v ? `?v=${v}` : ''}`, alt: alt || '',
     loading: 'lazy', decoding: 'async', width: 56, height: 42,
   });
   // 缩略图文件缺了会 404，浏览器默认画一个碎图标 —— 换成一句能读的话。
@@ -1412,16 +1443,27 @@ function showRestartBanner(keys) {
 async function loadPhotos() {
   const box = $('photos-body');
   skeleton(box, 5);
+  // 素材总表另起一路、不进下面的 Promise.all（理由见 state.media）。先清掉旧的：
+  // 刚删掉一个文件就刷新时，照片表先回来、总表后回来，中间那一下不能把刚删掉的那行
+  // 又画出来 —— 清掉之后那一下画的是骨架。
+  state.media = null;
+  state.mediaErr = null;
+  loadMedia();
+  // 两个方向一起取。分开按需取的话，切一次方向要等一次网络，而这两份数据加起来
+  // 就是同一批照片，来回切是这一页最常做的动作。
+  const pending = Promise.all([
+    api('GET', '/admin/mapping'),
+    api('GET', '/admin/videos'),
+    // 传上来但还没入库的素材。一起取，因为「我传上去的东西在哪」和「库里有什么」
+    // 是同一个问题的两半 —— 分成两次点击去看，人就找不到自己刚传的那个文件。
+    api('GET', '/admin/inbox').catch(() => null),
+  ]);
+  // 挂到 state 上让别处能等（fix1 M4）：/admin/media 单独取、可能比这一批先回来，这段
+  // 时间里 state.mapping 还是上一轮 reloadAfterMediaChange 置的 null——「配给照片…」
+  // 这类要读 mapping.photos 的地方不能把这当成「库里真的没有照片」。
+  state.mappingPromise = pending;
   try {
-    // 两个方向一起取。分开按需取的话，切一次方向要等一次网络，而这两份数据加起来
-    // 就是同一批照片，来回切是这一页最常做的动作。
-    const [byPhoto, byVideo, inbox] = await Promise.all([
-      api('GET', '/admin/mapping'),
-      api('GET', '/admin/videos'),
-      // 传上来但还没入库的素材。一起取，因为「我传上去的东西在哪」和「库里有什么」
-      // 是同一个问题的两半 —— 分成两次点击去看，人就找不到自己刚传的那个文件。
-      api('GET', '/admin/inbox').catch(() => null),
-    ]);
+    const [byPhoto, byVideo, inbox] = await pending;
     state.mapping = {
       photos: byPhoto.photos,
       videos: byVideo.videos,
@@ -1431,13 +1473,41 @@ async function loadPhotos() {
     renderPhotos();
   } catch (e) {
     if (e.status !== 401) failbox(box, e, loadPhotos);
+  } finally {
+    if (state.mappingPromise === pending) state.mappingPromise = null;
   }
 }
+
+/** 取 `/v1/admin/media`。回来时正停在「全部素材」「重复」上就重画。 */
+async function loadMedia() {
+  const gen = ++state.mediaGen;
+  state.mediaLoading = true;
+  try {
+    const doc = await api('GET', '/admin/media');
+    if (gen !== state.mediaGen) return;
+    state.media = doc;
+    state.mediaErr = null;
+  } catch (e) {
+    if (gen !== state.mediaGen) return;
+    if (e.status === 401) return;
+    state.media = null;
+    state.mediaErr = e;
+  } finally {
+    if (gen === state.mediaGen) state.mediaLoading = false;
+  }
+  if (state.tab === 'photos' && mediaView()) renderPhotos();
+}
+
+/** 当前视图吃不吃素材总表。 */
+const mediaView = () => state.mapDir === 'files' || state.mapDir === 'dups';
 
 document.querySelector('#p-photos .segbar').addEventListener('click', (ev) => {
   const b = ev.target.closest('button[data-mapdir]');
   if (!b) return;
   state.mapDir = b.dataset.mapdir;
+  // 正常情况下 loadPhotos 已经顺手取过了；这里兜的是「上一次取失败了」之后没点重试、
+  // 直接切过来的情况 —— 那时 media 为空也没有在取，不补一次就永远是那个错误框。
+  if (mediaView() && !state.media && !state.mediaLoading) loadMedia();
   renderPhotos();
 });
 
@@ -1446,6 +1516,18 @@ function renderPhotos() {
   clear(box);
   for (const b of document.querySelectorAll('#p-photos [data-mapdir]')) {
     b.setAttribute('aria-pressed', b.dataset.mapdir === state.mapDir ? 'true' : 'false');
+  }
+  if (mediaView()) {
+    if (!state.media) {
+      if (state.mediaErr && !state.mediaLoading) {
+        failbox(box, state.mediaErr, () => { loadMedia(); renderPhotos(); });
+      }
+      else skeleton(box, 5);
+      return;
+    }
+    if (state.mapDir === 'files') renderFiles(box);
+    else renderDups(box);
+    return;
   }
   if (!state.mapping) return;
   if (state.mapDir === 'video') renderByVideo(box);
@@ -1462,6 +1544,10 @@ function renderByPhoto(box) {
   }
 
   const rows = photos.map((p) => {
+    // 「编辑」放最前：标题 / 打印宽度 / 贴合模式只有这一个入口，而后面几个动作在对话框里
+    // 也都有，找不到的人从这里进去就能看全。
+    const edit = el('button', { cls: 'btn sm', type: 'button', text: '编辑' });
+    edit.addEventListener('click', () => openEdit(p, edit));
     const change = el('button', {
       cls: 'btn sm', type: 'button', text: p.videoPath ? '换视频' : '配视频',
     });
@@ -1498,7 +1584,7 @@ function renderByPhoto(box) {
       })),
       td('被授权', el('span', { cls: 'mono', text: String(p.grantCount) }), 'num'),
       td('入库时间', el('span', { text: fmtTime(p.createdAt) })),
-      td('操作', el('span', { cls: 'acts' }, [change, p.videoPath ? detach : null, del])),
+      td('操作', el('span', { cls: 'acts' }, [edit, change, p.videoPath ? detach : null, del])),
     ]);
   });
 
@@ -1524,8 +1610,12 @@ function renderByPhoto(box) {
  *
  * 确认框里如实写清「删了什么、没删什么」：参考图和视频文件都留在 NAS 上（同一段视频
  * 可能配给了别的照片），所以这不是"删文件"，是"从识别库里拿掉"。
+ *
+ * @param onGone 删成之后、重载列表**之前**调。编辑对话框靠它先把自己关掉，近重复扫描靠它
+ *   先把含这张的那几对剔掉 —— 放到返回之后再做，重载那一下会把已经不存在的东西再画一遍。
+ * @return 删成没有。
  */
-async function deletePhoto(p, btn) {
+async function deletePhoto(p, btn, onGone) {
   const name = p.title || p.refPath || p.photoId;
   const yes = await confirm2(
     `从库里删掉「${name}」？`,
@@ -1538,17 +1628,26 @@ async function deletePhoto(p, btn) {
     ],
     '删除',
   );
-  if (!yes) return;
+  if (!yes) return false;
   btn.disabled = true;
   try {
     await api('DELETE', `/photo/${p.photoId}`);
-    ok(`已删除「${name}」`);
-    state.mapping = null;
-    await loadPhotos();
   } catch (e) {
     btn.disabled = false;
     if (e.status !== 401) fail(e, '删除失败');
+    return false;
   }
+  // 库内近重复的扫描结果里可能有含这张照片的对：这张已经不在库里了，那些对不再成立，
+  // 不然「重复」页上那张卡片还在，点「删除左边/右边」会 404（fix1 M3）。放在 onGone
+  // 之前调用方不用担心 —— 这里统一做，pair 卡片自己不用再各自处理。
+  prunePairsFor(p.photoId);
+  if (onGone) onGone();
+  ok(`已删除「${name}」`);
+  state.mapping = null;
+  state.photos = null;
+  state.photoDetail = {};
+  await loadPhotos();
+  return true;
 }
 
 /**
@@ -1610,6 +1709,11 @@ async function useInboxFile(f, btn) {
       }
     } else {
       // 视频：一段视频可以配给多张照片，所以这里挑的是「配给哪几张」。
+      if (!state.mapping && state.mappingPromise) {
+        // mapping 还在路上（比如 reloadAfterMediaChange 刚把它置空，/admin/media 又比
+        // 它先回来）：等它一下，而不是把「还没取到」当成「库里没有照片」（fix1 M4）。
+        await state.mappingPromise.catch(() => null);
+      }
       const candidates = (state.mapping && state.mapping.photos) || [];
       if (!candidates.length) {
         toast('bad', '库里还没有照片，先入库一张再来配视频。');
@@ -1638,6 +1742,769 @@ async function useInboxFile(f, btn) {
   await loadPhotos();
 }
 
+// ============================== 编辑一张照片 ==============================
+
+/**
+ * 编辑对话框。上半截三个字段点「保存」才生效（PATCH，只发改过的）；下半截四个动作点了
+ * 立刻生效，与表格那一行上的按钮是同一套函数（两类为什么分开摆，见 index.html 里
+ * dlg-edit 的注释）。
+ *
+ * 数据现取 `GET /v1/photo/<id>`，不用表格那一行：那一行是 `/admin/mapping` 的快照，可能
+ * 是几分钟前的；「改没改」要和服务端**此刻**的值比，否则会把别人刚改的标题用旧值盖回去。
+ */
+async function openEdit(p, btn) {
+  if (btn) btn.disabled = true;
+  let detail;
+  try {
+    detail = await api('GET', `/photo/${p.photoId}`);
+  } catch (e) {
+    if (e.status !== 401) fail(e, '读不到这张照片');
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  const mm = widthMmOf(detail.printWidthM);
+  const fit = FIT_LABEL[detail.fitMode] ? detail.fitMode : 'default';
+  state.edit = {
+    photoId: p.photoId,
+    detail,
+    // 比「改没改」用的基准。标题按 trim 后的比：原标题带着文件名里的空格时，人没动它，
+    // 不该因为输入框回填再读出来的是 trim 过的就算「改了」。
+    base: { title: (detail.title || '').trim(), mm, fit },
+  };
+
+  $('dlg-edit-title').textContent = `编辑「${detail.title || '(无标题)'}」`;
+  $('dlg-edit-lead').textContent = '标题、打印宽度、贴合模式改完点「保存」；只发改过的那几项。';
+  hideFormErr($('dlg-edit-err'));
+  $('e-width-err').textContent = '';
+  $('e-title').value = detail.title || '';
+  fillWidthSelect(mm);
+  $('e-fit').value = fit;
+  // 详情给的是**生效值**（NULL 已经按全局默认解出来了），看不出这张是单独设的还是跟着
+  // 默认走的 —— 如实说，别让人以为「显示 fill」就等于「这张被钉成了 fill」。
+  $('e-fit-help').textContent = FIT_LABEL[detail.fitMode]
+    ? `现在生效的是「${detail.fitMode} · ${FIT_LABEL[detail.fitMode]}」（看不出是单独设的还是跟着默认）。` +
+      '选「跟随默认」= 以后跟着配置页的 video.fit_mode 走。'
+    : '';
+  // 上一次在这个对话框里删过照片 / 解除过视频，按钮会停在禁用上。
+  for (const id of ['e-ref', 'e-video', 'e-delete', 'e-save']) $(id).disabled = false;
+  paintEditInfo();
+  openDlg($('dlg-edit'));
+  $('e-title').focus();
+}
+
+/** 米 → 毫米，留一位小数（6 寸是 152.4 mm，取整会让它对不上任何一档又显示不出原值）。 */
+function widthMmOf(m) {
+  return Math.round((Number(m) || 0) * 10000) / 10;
+}
+
+function fillWidthSelect(mm) {
+  const sel = $('e-width');
+  if (!sel.options.length) {
+    for (const s of PRINT_SIZES) {
+      sel.appendChild(el('option', {
+        value: String(s.mm),
+        text: s.mm ? `${s.label} · ${s.mm} mm` : '不知道（交给 ARCore 自己量）',
+      }));
+    }
+    sel.appendChild(el('option', { value: 'custom', text: '自定义…' }));
+  }
+  const preset = PRINT_SIZES.some((s) => s.mm === mm);
+  sel.value = preset ? String(mm) : 'custom';
+  $('e-width-mm').value = preset ? '' : String(mm);
+  syncWidthCustom(false);
+}
+
+function syncWidthCustom(focus) {
+  const custom = $('e-width').value === 'custom';
+  $('e-width-mm').hidden = !custom;
+  // 切回预设时把自定义框清空（fix1 M2）：填过 0 或 152.45 之类不合法的值、再切回预设，
+  // 这个框只是被 hidden 藏起来，值还在。留着的话下一次直接选自定义会显得没填过，
+  // 更麻烦的是它本身就不该继续存在 —— 已经不是当前选中的宽度来源了。
+  if (!custom) $('e-width-mm').value = '';
+  if (custom && focus) $('e-width-mm').focus();
+}
+$('e-width').addEventListener('change', () => {
+  $('e-width-err').textContent = '';
+  syncWidthCustom(true);
+});
+
+/** 选中的打印宽度（毫米）。自定义那格没填对 → NaN。 */
+function editWidthMm() {
+  const v = $('e-width').value;
+  if (v !== 'custom') return Number(v);
+  const raw = $('e-width-mm').value.trim();
+  const n = Number(raw);
+  if (!raw || !Number.isFinite(n) || n <= 0) return NaN;
+  return Math.round(n * 10) / 10;
+}
+
+/** 对话框里「参考图与视频」那一块的现状，以及跟着现状变的按钮。 */
+function paintEditInfo() {
+  const d = state.edit.detail;
+  const box = $('e-info');
+  clear(box);
+  box.appendChild(el('div', { cls: 'editinfo' }, [
+    thumb(d.photoId, ''),
+    el('div', { cls: 'meta' }, [
+      el('div', {}, [
+        el('span', { cls: 'muted', text: '参考图 ' }),
+        el('span', { cls: 'mono', text: d.refPath || '(读不到路径)' }),
+        d.refMissing ? el('span', { cls: 'tag bad', text: '读不到' }) : null,
+        typeof d.stars === 'number' ? el('span', { cls: 'muted', text: ` · 可扫性 ${d.stars}/5` }) : null,
+      ]),
+      el('div', {}, [
+        el('span', { cls: 'muted', text: '视频 ' }),
+        d.videoPath
+          ? el('span', { cls: 'mono', text: d.videoPath })
+          : el('span', { cls: 'tag warn', text: '没配视频' }),
+        d.videoMissing ? el('span', { cls: 'tag bad', text: '文件读不到' }) : null,
+      ]),
+    ]),
+  ]));
+  $('e-video').textContent = d.videoPath ? '换视频' : '配视频';
+  $('e-detach').disabled = !d.videoPath;
+}
+
+/** 动作做完之后重取一次现状。表单里正在改的三个字段不动 —— 那是人还没保存的输入。 */
+async function refreshEdit() {
+  const ed = state.edit;
+  if (!ed || !$('dlg-edit').open) return;
+  try {
+    ed.detail = await api('GET', `/photo/${ed.photoId}`);
+  } catch (e) {
+    if (e.status !== 401) fail(e, '刷新这张照片的现状失败');
+    return;
+  }
+  if (state.edit === ed) paintEditInfo();
+}
+
+/** 给 attachVideoTo / detachVideoFrom / deletePhoto 的那个 photo 形状。 */
+function editPhoto() {
+  const d = state.edit.detail;
+  return { photoId: state.edit.photoId, title: d.title, refPath: d.refPath, videoPath: d.videoPath };
+}
+
+$('dlg-edit-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const ed = state.edit;
+  if (!ed) return;
+  const err = $('dlg-edit-err');
+  hideFormErr(err);
+  $('e-width-err').textContent = '';
+
+  // 只发改过的字段。全发的话，「我只改了标题」会顺手把别人刚在另一台设备上改的贴合模式
+  // 用这个对话框打开时的旧值盖回去。
+  const body = {};
+  const title = $('e-title').value.trim();
+  if (title !== ed.base.title) body.title = title;
+  const mm = editWidthMm();
+  if (Number.isNaN(mm)) {
+    $('e-width-err').textContent = '自定义宽度要填一个大于 0 的毫米数。';
+    $('e-width-mm').focus();
+    return;
+  }
+  if (mm !== ed.base.mm) body.printWidthMm = mm;
+  const fit = $('e-fit').value;
+  if (fit !== ed.base.fit) body.fitMode = fit === 'default' ? null : fit;
+
+  if (!Object.keys(body).length) {
+    closeDlg($('dlg-edit'));
+    ok('没有改动。');
+    return;
+  }
+  const save = $('e-save');
+  save.disabled = true;
+  try {
+    await api('PATCH', `/photo/${ed.photoId}`, body);
+  } catch (e) {
+    if (e.status !== 401) showFormErr(err, e);
+    return;
+  } finally {
+    save.disabled = false;
+  }
+  closeDlg($('dlg-edit'));
+  ok('已保存');
+  // 标题在授权页的勾选列表上也有，那份缓存一起作废。
+  state.photos = null;
+  state.photoDetail = {};
+  await loadPhotos();
+});
+
+$('e-ref').addEventListener('click', async () => {
+  if (!state.edit) return;
+  const p = editPhoto();
+  const ref = await pickFromMounts('image', `给「${p.title || '(无标题)'}」换一张参考图（授权、视频、标题都保留）`);
+  if (!ref) return;
+  if (await replaceRef(p, ref, $('e-ref'))) await refreshEdit();
+});
+
+$('e-video').addEventListener('click', async () => {
+  if (!state.edit) return;
+  if (await attachVideoTo([editPhoto()], $('e-video'))) await refreshEdit();
+});
+
+$('e-detach').addEventListener('click', async () => {
+  if (!state.edit) return;
+  if (await detachVideoFrom(editPhoto(), $('e-detach'))) await refreshEdit();
+});
+
+$('e-delete').addEventListener('click', async () => {
+  if (!state.edit) return;
+  // 删掉之后这个对话框就没有对象了：在重载列表**之前**关掉它，免得人对着一张已经不存在的
+  // 照片再点一次「保存」。
+  await deletePhoto(editPhoto(), $('e-delete'), () => {
+    closeDlg($('dlg-edit'));
+    state.edit = null;
+  });
+});
+
+/**
+ * 换参考图（`POST /v1/photo/<id>/ref`，photoId 不变，授权 / 视频 / 标题都留着）。
+ * 编辑对话框与「用它替换『X』的参考图」共用。
+ * @return 换成没有。
+ */
+async function replaceRef(photo, refPath, btn) {
+  const name = photo.title || '(无标题)';
+  if (btn) btn.disabled = true;
+  const t = toast('ok', `正在给「${name}」换参考图…（要跑特征提取，几十秒）`, null, true);
+  let r;
+  try {
+    r = await api('POST', `/photo/${photo.photoId}/ref`, { refPath });
+  } catch (e) {
+    if (e.status !== 401) {
+      explainRefFailure(e);
+      // 这次拒绝服务端记下来了（全部素材的「被拒」），总表跟着刷。
+      loadMedia();
+    }
+    return false;
+  } finally {
+    t.remove();
+    if (btn) btn.disabled = false;
+  }
+  thumbVer[photo.photoId] = Date.now();
+  ok(`已给「${name}」换好参考图，可扫性 ${r.stars}/5。授权、视频、标题都没动。`);
+  // 换了参考图之后，库内近重复扫描里含这张照片的对是拿旧参考图比出来的，已经不作数了
+  // （fix1 M3，和 deletePhoto 一样统一剔除，理由见那边的注释）。
+  prunePairsFor(photo.photoId);
+  state.mapping = null;
+  state.photos = null;
+  state.photoDetail = {};
+  await loadPhotos();
+  return true;
+}
+
+/** 换参考图失败。近重复要把**撞的是哪几张**说出来，理由同 explainIngestFailure。 */
+function explainRefFailure(e) {
+  if (e.code === 'near_duplicate') {
+    toast('bad', `换参考图失败：${e.message}撞的是${conflictList(e.detail.conflicts)}。`, e.code);
+    return;
+  }
+  fail(e, '换参考图失败');
+}
+
+/** 近重复的冲突清单 → 「A」（内点 123）、「B」（内点 88）。 */
+function conflictList(conflicts) {
+  const list = conflicts || [];
+  if (!list.length) return '(服务端没说是哪一张)';
+  return list.map((c) => `「${c.title || '(无标题)'}」（内点 ${c.inliers}）`).join('、');
+}
+
+/** [{title}] → 「A」、「B」。 */
+function titleList(uses) {
+  return (uses || []).map((u) => `「${u.title || '(无标题)'}」`).join('、');
+}
+
+/** 按钮上放不下整个标题（`.btn` 不折行，长标题会把操作列撑破）；全文放 title 里。 */
+function shortTitle(t, n) {
+  const s = t || '(无标题)';
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+// ============================== 全部素材 ==============================
+
+/**
+ * 「全部素材」：`/v1/admin/media`，一行一个路径 —— 落地目录里的每个文件 ∪ 库里记着的每个素材。
+ *
+ * 为什么照片表下面那段 inbox 不够：它只看得到「落地目录里没人用的」。删了照片留下的 NAS
+ * 素材记录、转码产物、同一张图传了两份、入库被拒的那张，在这一页之前**哪一处都看不到**，
+ * 也就删不掉、改不了。每一行自带「是谁 / 谁在用 / 能不能删」三件事，动作按它们给
+ * （mediaActions），做不成的动作不给按钮。
+ */
+const MEDIA_FILTERS = [
+  { key: 'all', label: '全部', count: (c) => c.total, test: () => true,
+    empty: '服务端上还没有任何素材。' },
+  { key: 'unused', label: '未入库', count: (c) => c.unused, test: (i) => i.status === 'unused',
+    empty: '没有未入库的素材 —— 传上来的都用上了。' },
+  { key: 'mapped', label: '已映射', count: (c) => c.mapped, test: (i) => i.status === 'mapped',
+    empty: '还没有任何素材被照片用上。' },
+  { key: 'dup', label: '重复', count: (c) => c.duplicate, test: (i) => i.duplicateOf.length > 0,
+    empty: '没有同内容的多份文件。' },
+  { key: 'rejected', label: '被拒', count: (c) => c.rejected, test: (i) => Boolean(i.reject),
+    empty: '没有入库被拒的素材。' },
+  { key: 'orphan', label: '孤儿', count: (c) => c.orphan, test: (i) => i.status === 'orphan',
+    empty: '没有孤儿记录。' },
+];
+
+const MEDIA_STATUS = {
+  mapped: { cls: 'tag ok', text: '已映射', title: '有照片在用它（当参考图或视频）' },
+  unused: { cls: 'tag warn', text: '未入库', title: '在落地目录里，还没有照片用它' },
+  orphan: { cls: 'tag', text: '孤儿记录',
+    title: '库里还记着它，但没有照片在用；文件在落地目录以外（NAS 上别处、转码目录），或者已经不在了' },
+};
+
+function renderFiles(box) {
+  const m = state.media;
+  const upBtn = el('button', {
+    cls: 'btn sm primary', type: 'button', text: '从手机上传素材…',
+    disabled: !m.uploadDir,
+    title: m.uploadDir ? '可以多选。只传到落地目录、不入库；传完在「未入库」里入库或配给照片。'
+      : '服务端没配落地目录（upload_dir_root），上传功能是关的',
+  });
+  upBtn.addEventListener('click', () => uploadMaterials(upBtn));
+  box.appendChild(el('div', { cls: 'head' }, [
+    el('div', {}, [el('p', { cls: 'note', text: m.uploadDir
+      ? `落地目录 ${m.uploadDir} 里的每个文件，加上库里记着的每个素材，一行一个。`
+      : '服务端没配落地目录（upload_dir_root），传不了文件；下面只有库里记着的素材。' })]),
+    el('div', { cls: 'right' }, [upBtn]),
+  ]));
+
+  const counts = m.counts || {};
+  box.appendChild(el('div', { cls: 'chips filters', role: 'group', 'aria-label': '筛选素材' },
+    MEDIA_FILTERS.map((f) => {
+      const b = el('button', {
+        cls: 'btn sm', type: 'button',
+        'aria-pressed': state.mediaFilter === f.key ? 'true' : 'false',
+        text: `${f.label} ${f.count(counts) || 0}`,
+      });
+      b.addEventListener('click', () => { state.mediaFilter = f.key; renderPhotos(); });
+      return b;
+    })));
+
+  const f = MEDIA_FILTERS.find((x) => x.key === state.mediaFilter) || MEDIA_FILTERS[0];
+  const items = m.items.filter(f.test);
+  const list = el('div', { cls: 'mediatbl' });
+  box.appendChild(list);
+  if (!items.length) {
+    // emptyBox 会先清空容器，所以给它一个自己的 div，别把上面的筛选条一起清掉。
+    emptyBox(list, f.empty, f.key === 'all'
+      ? '点右上角「从手机上传素材…」传几个，或者用「添加照片」从 NAS 上挑。' : null);
+    return;
+  }
+  list.appendChild(table([{ sr: '缩略图' }, '文件', '类型', '大小', '被谁用', '操作'], items.map((it) =>
+    el('tr', {}, [
+      td('', fileThumb(it)),
+      td('文件', [...mediaFileCell(it), it.reject ? rejectNote(it, true) : null], 'wide'),
+      td('类型', el('span', { cls: 'tag', text: KIND_TEXT[it.kind] || String(it.kind) })),
+      td('大小', el('span', { cls: 'mono', text: bytesText(it.bytes) }), 'num'),
+      td('被谁用', usedBy(it)),
+      td('操作', el('span', { cls: 'acts' }, mediaActions(it))),
+    ]))));
+}
+
+/** 文件名 + 路径 + 一排状态标签。「全部素材」与「重复」共用。 */
+function mediaFileCell(it) {
+  const st = MEDIA_STATUS[it.status] || { cls: 'tag', text: String(it.status) };
+  const dupN = it.duplicateOf.length;
+  return [
+    el('span', { text: it.name }),
+    el('span', { cls: 'sub mono', text: it.path }),
+    el('span', { cls: 'tags' }, [
+      el('span', { cls: st.cls, text: st.text, title: st.title || null }),
+      it.generated ? el('span', { cls: 'tag', text: '转码产物',
+        title: '服务端为了让手机能边下边播转出来的那一份，源视频另有一行' }) : null,
+      it.exists ? null : el('span', { cls: 'tag bad', text: '文件不在了' }),
+      dupN ? el('span', { cls: 'tag warn', text: `同内容 ${dupN + 1} 份`,
+        title: it.duplicateOf.map((d) => d.path).join('\n') }) : null,
+      it.reject ? el('span', { cls: 'tag bad', text: '入库被拒' }) : null,
+    ]),
+  ];
+}
+
+/**
+ * 上次入库被拒的原因。
+ *
+ * 措辞是「上次用它入库时失败」，**不是**「这张图有问题」：视频那一侧的失败（视频找不到、
+ * 转码失败）也记在参考图的路径上 —— 这张图本身可能完全没问题。
+ *
+ * @param withConflicts 近重复时把撞上的照片也列出来（「重复」页有单独一列放它们，就不重复说）。
+ */
+function rejectNote(it, withConflicts) {
+  const r = it.reject;
+  const kids = [el('p', { cls: 'msgline bad' }, [
+    '上次用它入库时失败：',
+    ...richText(r.message || r.code),
+    r.at ? el('span', { cls: 'muted', text: `（${ago(r.at)}）`, title: fmtTime(r.at) }) : null,
+  ])];
+  if (withConflicts && r.conflicts && r.conflicts.length) {
+    kids.push(el('p', { cls: 'msgline', text: `撞的是${conflictList(r.conflicts)}` }));
+  }
+  return el('div', { cls: 'rej' }, kids);
+}
+
+function usedBy(it) {
+  const out = [];
+  if (it.usedAsRef.length) {
+    out.push(el('div', {}, [el('span', { cls: 'muted', text: '参考图 ' }), titleList(it.usedAsRef)]));
+  }
+  if (it.usedAsVideo.length) {
+    out.push(el('div', {}, [el('span', { cls: 'muted', text: '视频 ' }), titleList(it.usedAsVideo)]));
+  }
+  if (!out.length) out.push(el('span', { cls: 'muted', text: '没人用' }));
+  return out;
+}
+
+/**
+ * 素材的缩略图。图片和视频都走 `/v1/fs/thumb`（视频取第一帧）。
+ *
+ * 两种不给：文件不在了（必然 404）；转码产物（在 data/playable 下，不在 fs 接口的白名单
+ * 里 —— 越界请求服务端按「正常客户端不会产生」记告警日志，不该让这一页每打开一次就刷一条）。
+ * 孤儿记录照给：它们多半就在 NAS 的白名单目录里（照片删了、参考图还在）；少数挂载点已经
+ * 删掉的，403 落到下面的「无预览」。
+ */
+function fileThumb(it) {
+  if (!it.exists || it.generated) return null;
+  const img = el('img', {
+    cls: 'th', src: `${API}/fs/thumb?path=${encodeURIComponent(it.path)}`, alt: '',
+    loading: 'lazy', decoding: 'async', width: 56, height: 42,
+  });
+  img.addEventListener('error', () => {
+    const ph = el('span', { cls: 'th bad', text: '无预览', title: '服务端解不出这个文件的缩略图' });
+    if (img.parentNode) img.parentNode.replaceChild(ph, img);
+  });
+  return img;
+}
+
+/**
+ * 一行素材能做什么，按状态给：
+ *
+ * - 未入库的图片：入库 / （近重复被拒过的）用它替换撞上那张的参考图 / 删除；
+ * - 未入库的视频：配给照片 / 删除；
+ * - 已映射的视频：从那几张照片解除并删除（force）；
+ * - 已映射的图片：**不给删** —— 要删它只能先删那张照片（删照片会连带丢掉授权，不能藏在
+ *   「删素材」后面，服务端同样拒绝，见 `_admin_media_delete`）；
+ * - 孤儿：删除（记录；文件在转码目录里的连文件）。
+ */
+function mediaActions(it) {
+  if (it.status === 'unused') {
+    const acts = [];
+    const use = el('button', { cls: 'btn sm primary', type: 'button',
+      text: it.kind === 'image' ? '入库' : '配给照片…' });
+    use.addEventListener('click', () => useInboxFile(it, use));
+    acts.push(use);
+    const c = it.kind === 'image' && it.reject && it.reject.code === 'near_duplicate'
+      ? (it.reject.conflicts || [])[0] : null;
+    if (c) {
+      const rep = el('button', { cls: 'btn sm', type: 'button',
+        text: `用它替换「${shortTitle(c.title, 10)}」的参考图`,
+        title: `用它替换「${c.title || '(无标题)'}」的参考图` });
+      rep.addEventListener('click', () => replaceFromReject(it, c, rep));
+      acts.push(rep);
+    }
+    acts.push(deleteMediaBtn(it, '删除', false));
+    return acts;
+  }
+  if (it.status === 'mapped') {
+    if (it.usedAsRef.length) {
+      return [el('span', { cls: 'tag warn wrap',
+        text: `是${titleList(it.usedAsRef)}的参考图，要删先删照片` })];
+    }
+    const n = it.usedAsVideo.length;
+    return [deleteMediaBtn(it, `从 ${n} 张照片解除并删除`, true)];
+  }
+  return [deleteMediaBtn(it, it.deletable ? '删除' : '删除记录', false)];
+}
+
+function deleteMediaBtn(it, label, force) {
+  const b = el('button', { cls: 'btn sm danger', type: 'button', text: label });
+  b.addEventListener('click', () => deleteMedia(it, b, force));
+  return b;
+}
+
+function mediaByPath(path) {
+  return (state.media && state.media.items.find((i) => i.path === path)) || null;
+}
+
+/**
+ * 删一个素材（`DELETE /v1/admin/media`）。确认框按**这一行的实际情况**写后果：删盘还是
+ * 只删记录、要从哪几张照片上解绑、同内容的另外几份还在不在。
+ *
+ * 有 assetId 就按它删而不是按 path：同一个路径在「列表拉下来」和「点删除」之间被换成了
+ * 另一个文件时，按 id 删的仍然是列表上那一条。
+ */
+async function deleteMedia(it, btn, force) {
+  const uses = it.usedAsVideo;
+  const lines = [];
+  if (force) {
+    lines.push(`先从这 ${uses.length} 张照片上解除这段视频：${titleList(uses)}。` +
+      '它们以后扫到时**不会播任何东西**，直到重新配一段。');
+    lines.push(it.generated
+      ? '这是转码产物：删掉它等于让这些照片不再配视频。源视频文件不动，想恢复就重新配一次（会重新转码）。'
+      : '只属于这些照片的转码产物一起删掉。');
+  }
+  if (it.deletable) {
+    lines.push(`文件会从服务器的${it.generated ? '转码目录' : '落地目录'}里删掉，**不可撤销**。`);
+  } else if (it.exists) {
+    lines.push('NAS 上的文件不动，只是管理台不再记着它。');
+  } else {
+    lines.push('文件已经不在了，这里只删掉那条记录。');
+  }
+  if (it.duplicateOf.length) {
+    // 「同内容多份」里删一份之前，确认另外那几份**文件还在**：另外几份全是「文件不在了」
+    // 的记录时，删掉这份就是删掉这个内容在服务端上唯一的一份。
+    const alive = it.duplicateOf.map((d) => mediaByPath(d.path)).filter((o) => o && o.exists);
+    lines.push(alive.length
+      ? `同样内容还有 ${alive.length} 份在：${alive.map((o) => o.path).join('、')}。`
+      : '同样内容的另外几份，文件都已经不在了 —— 删掉这份，服务端上就**一份都不剩了**。');
+  }
+  if (it.reject) lines.push('它上次入库失败的记录一起清掉。');
+  const title = force
+    ? `从 ${uses.length} 张照片解除并删除「${it.name}」？`
+    : (it.deletable ? `删除「${it.name}」？` : `删掉「${it.name}」这条记录？`);
+  const yes = await confirm2(title, it.path, lines, force ? '解除并删除' : '删除');
+  if (!yes) return;
+
+  btn.disabled = true;
+  const q = it.assetId ? `assetId=${encodeURIComponent(it.assetId)}` : `path=${encodeURIComponent(it.path)}`;
+  let r;
+  try {
+    r = await api('DELETE', `/admin/media?${q}${force ? '&force=1' : ''}`);
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status === 401) return;
+    if (e.code === 'ref_in_use' || e.code === 'in_use') {
+      toast('bad', `没删：${e.message}。在用它的 —— ${inUseText(e.detail)}`, e.code);
+      // 列表上的「谁在用」已经过时了（不然不会给出这个按钮），刷一下。
+      reloadAfterMediaChange();
+    } else {
+      fail(e, '删除失败');
+    }
+    return;
+  }
+  const n = r.detachedPhotos.length;
+  ok(`已删除「${it.name}」` + (n ? `，并从 ${n} 张照片上解除了这段视频` : '') +
+     (r.deleted.file ? '。' : '（只删了记录，文件没动）。'));
+  reloadAfterMediaChange();
+}
+
+/** 409 `ref_in_use` / `in_use` 带回来的「谁在用」。两个字段服务端都给，这里都说。 */
+function inUseText(d) {
+  const parts = [];
+  if (d.usedAsRef && d.usedAsRef.length) parts.push(`参考图：${titleList(d.usedAsRef)}`);
+  if (d.usedAsVideo && d.usedAsVideo.length) parts.push(`视频：${titleList(d.usedAsVideo)}`);
+  return parts.join('；') || '(服务端没列出来)';
+}
+
+/** 素材变了（删了、传了、换了）：照片表、映射、授权页那份照片清单都可能跟着变。 */
+function reloadAfterMediaChange() {
+  state.mapping = null;
+  state.photos = null;
+  state.photoDetail = {};
+  loadPhotos();
+}
+
+/** 入库被判近重复的那张 → 拿它去替换撞上的那张的参考图。 */
+async function replaceFromReject(it, c, btn) {
+  const name = c.title || '(无标题)';
+  const yes = await confirm2(
+    `用它替换「${name}」的参考图？`,
+    '原照片的授权、视频、标题都保留，只换识别用的图。',
+    [
+      `新参考图：${it.path}`,
+      '常见的情形：先入库的是手机翻拍的糊图，这张是后来的扫描件。',
+      `要重新跑特征提取，几十秒。换完它就是「${name}」的参考图，不再算未入库。`,
+      '原来那张参考图的文件不删，想换回去随时可以（按照片 → 编辑 → 换参考图）。',
+    ],
+    '替换',
+  );
+  if (!yes) return;
+  await replaceRef({ photoId: c.photoId, title: c.title }, it.path, btn);
+}
+
+/** 「从手机上传素材…」：可以多选，只传不入库（传完在「未入库」里入库或配给照片）。 */
+async function uploadMaterials(btn) {
+  // 先禁用再弹选择框：同步的，不耽误「用户刚点过」那一刻（见 handOffToDevice）。
+  btn.disabled = true;
+  let paths;
+  try {
+    paths = await uploadFromDevice('any', { multiple: true });
+  } finally {
+    btn.disabled = false;
+  }
+  // 取消，或者一个都没传成（每个失败的原因已经各自报过了）。
+  if (!paths || !paths.length) return;
+  ok(`${paths.length} 个文件已经在服务端了。图片点「入库」，视频点「配给照片…」。`);
+  // 停在「已映射」「孤儿」这类筛选上的话，刚传上来的那几个正好被筛掉，人会以为没传上。
+  if (state.mediaFilter !== 'all') state.mediaFilter = 'unused';
+  reloadAfterMediaChange();
+}
+
+// ============================== 重复 ==============================
+
+/**
+ * 「重复」：三种不同的「多余」放在一页，因为人问的是同一个问题 ——「哪些是多余的、删哪个」。
+ *
+ * 1. **同内容多份**：sha256 一样的几个文件。只占空间，不影响识别（入库按内容去重，同一份
+ *    内容进不了库两次）。已映射的那份标出来、不给删。
+ * 2. **入库时被判重复**：闸门拦下来的那张（拒绝记录）。它没进库，也不影响识别；要么删掉，
+ *    要么拿它替换撞上的那张的参考图。
+ * 3. **库内近重复**：已经**在库里**、会互相挤成 ambiguous 的两张 —— 只有这一种真的让照片
+ *    扫不出来。要真算（扫描），所以要点一下，而且不随刷新自动重扫。
+ */
+function renderDups(box) {
+  renderSameContent(box, state.media.items);
+  renderRejectedDups(box, state.media.items);
+  renderScan(box);
+}
+
+/** 「重复」页的一段：沿用配置页 `.group` 的小标题。返回段落容器。 */
+function dupSection(box, title, note) {
+  const sec = el('div', { cls: 'group' }, [
+    el('h3', { text: title }),
+    note ? el('p', { cls: 'note', text: note }) : null,
+  ]);
+  box.appendChild(sec);
+  return sec;
+}
+
+function renderSameContent(box, items) {
+  const groups = new Map();
+  for (const it of items) {
+    if (!it.sha256 || !it.duplicateOf.length) continue;
+    if (!groups.has(it.sha256)) groups.set(it.sha256, []);
+    groups.get(it.sha256).push(it);
+  }
+  const sec = dupSection(box, '同内容多份', groups.size
+    ? `${groups.size} 组。同一张图 / 同一段视频在服务端放了好几份：只占空间，不影响识别。在用的那份不给删。`
+    : null);
+  if (!groups.size) {
+    sec.appendChild(el('p', { cls: 'none', text: '没有同内容的多份文件。' }));
+    return;
+  }
+  for (const [sha, g] of groups) {
+    sec.appendChild(el('section', { cls: 'card' }, [
+      el('div', { cls: 'head' }, [el('div', {}, [
+        el('h3', { text: `同一${g[0].kind === 'video' ? '段视频' : '张图'}，${g.length} 份` }),
+        el('p', { cls: 'note mono', text: `sha256 ${sha.slice(0, 16)}…` }),
+      ])]),
+      el('div', { cls: 'mediatbl' }, [table([{ sr: '缩略图' }, '文件', '大小', '被谁用', '操作'], g.map((it) =>
+        el('tr', {}, [
+          td('', fileThumb(it)),
+          td('文件', mediaFileCell(it), 'wide'),
+          td('大小', el('span', { cls: 'mono', text: bytesText(it.bytes) }), 'num'),
+          td('被谁用', usedBy(it)),
+          td('操作', el('span', { cls: 'acts' }, [it.status === 'mapped'
+            ? el('span', { cls: 'tag ok', text: '在用，不给删' })
+            : deleteMediaBtn(it, it.deletable ? '删除这份' : '删除记录', false)])),
+        ])))]),
+    ]));
+  }
+}
+
+function renderRejectedDups(box, items) {
+  const rows = items.filter((i) => i.reject && i.reject.code === 'near_duplicate');
+  const sec = dupSection(box, '入库时被判重复', rows.length
+    ? '入库闸门拦下来的：和库里某张几乎相同，没有进库（所以不影响识别）。' +
+      '要么删掉；要么拿它替换撞上的那张的参考图 —— 比如先入库的是翻拍的糊图，这张是后来的扫描件。'
+    : null);
+  if (!rows.length) {
+    sec.appendChild(el('p', { cls: 'none', text: '没有入库时被判成近重复的素材。' }));
+    return;
+  }
+  sec.appendChild(el('div', { cls: 'mediatbl' }, [table([{ sr: '缩略图' }, '文件', '撞上的照片', '操作'], rows.map((it) =>
+    el('tr', { cls: 'warn' }, [
+      td('', fileThumb(it)),
+      td('文件', [...mediaFileCell(it), rejectNote(it, false)], 'wide'),
+      td('撞上的照片', el('div', { cls: 'chips' }, (it.reject.conflicts || []).map((c) =>
+        el('span', { cls: 'chip', title: c.title || '' }, [
+          thumb(c.photoId, ''),
+          el('span', { cls: 'nm', text: c.title || '(无标题)' }),
+          el('span', { cls: 'tag', text: `内点 ${c.inliers}` }),
+        ])))),
+      td('操作', el('span', { cls: 'acts' }, mediaActions(it))),
+    ])))]));
+}
+
+function renderScan(box) {
+  const s = state.dupScan;
+  const btn = el('button', { cls: 'btn sm primary', type: 'button', text: s ? '重新扫描' : '扫描' });
+  btn.addEventListener('click', () => runDupScan(btn));
+  const sec = dupSection(box, '库内近重复',
+    '已经在库里、会互相挤成「两张都认不出来」的照片对。入库闸门只拦新进来的；闸门关着时进来的、' +
+    '或者更早进来的，只能在这里找。要把全库两两比一遍，照片多的话要几十秒。' +
+    '删哪张：留自匹配分高的那张（它更好认）。');
+  sec.appendChild(el('div', { cls: 'scanbar' }, [
+    btn,
+    s ? el('span', { cls: 'muted', text:
+      `上次扫描 ${fmtTime(s.at)}：比了 ${s.scanned} 张，用时 ${nf1(s.elapsedMs / 1000)} 秒。` }) : null,
+  ]));
+  if (!s) return;
+  if (s.truncated) {
+    const total = state.mapping ? state.mapping.photos.length : null;
+    sec.appendChild(el('p', { cls: 'msgline warn', text:
+      `只比了${total ? `库里 ${total} 张中的` : ''}前 ${s.scanned} 张就到了时间上限，后面的这次没比到。` +
+      '列出来的这些照样可信。' }));
+  }
+  if (!s.pairs.length) {
+    const empty = el('div');
+    sec.appendChild(empty);
+    // 服务端的 note 原样给：它说的是「没列出来的不保证没有」，这句话只有服务端说得准。
+    emptyBox(empty, '没找到库内近重复。', s.note);
+    return;
+  }
+  sec.appendChild(el('p', { cls: 'note', text: s.note }));
+  sec.appendChild(el('div', { cls: 'cards pairs' }, s.pairs.map(dupPairCard)));
+}
+
+/**
+ * 剔掉「库内近重复」扫描结果里含这张照片的对（fix1 M3）。删照片、换参考图都会调用它——
+ * 不管是从这张卡片上、还是从「按照片」视图、编辑对话框删的/换的，扫描结果里的旧对都
+ * 已经不成立了，留着的话点「删除左边/右边」会对着一张已经变了（或没了）的照片，报 404
+ * 或者删错内容。
+ */
+function prunePairsFor(photoId) {
+  if (!state.dupScan) return;
+  state.dupScan.pairs = state.dupScan.pairs.filter(
+    (x) => x.a.photoId !== photoId && x.b.photoId !== photoId);
+}
+
+function dupPairCard(pr) {
+  const side = (s, label) => {
+    const del = el('button', { cls: 'btn sm danger', type: 'button', text: label });
+    del.addEventListener('click', () => deletePhoto({ photoId: s.photoId, title: s.title }, del));
+    return el('div', { cls: 'side' }, [
+      thumb(s.photoId, s.title || ''),
+      el('span', { cls: 'nm', text: s.title || '(无标题)' }),
+      el('span', { cls: 'sub mono', text: `自匹配 ${s.selfScore}` }),
+      del,
+    ]);
+  };
+  return el('section', { cls: 'card duppair' }, [
+    side(pr.a, '删除左边'),
+    el('div', { cls: 'vs', title: '两张之间的匹配内点数：越高越像' }, [
+      el('span', { cls: 'mono', text: String(pr.inliers) }),
+      el('span', { cls: 'sub', text: '内点' }),
+    ]),
+    side(pr.b, '删除右边'),
+  ]);
+}
+
+async function runDupScan(btn) {
+  btn.disabled = true;
+  const t = toast('ok', '正在扫描…（把全库两两比一遍，照片多的话要几十秒）', null, true);
+  try {
+    const r = await api('POST', '/admin/duplicates/scan');
+    state.dupScan = Object.assign({}, r, { at: Date.now() });
+    ok(r.pairs.length ? `找到 ${r.pairs.length} 对库内近重复。` : '扫完了，没找到库内近重复。');
+  } catch (e) {
+    if (e.status !== 401) fail(e, '扫描失败');
+  } finally {
+    t.remove();
+    btn.disabled = false;
+  }
+  if (state.tab === 'photos' && state.mapDir === 'dups') renderPhotos();
+}
+
 // ============================== NAS 文件选择器 ==============================
 
 /**
@@ -1658,11 +2525,14 @@ function pickPath(wantKind, title) {
 
   return new Promise((resolve) => {
     let done = false;
-    const finish = (v) => {
+    const finish = (v, opts) => {
       if (done) return;
       done = true;
       $('dlg-pick').removeEventListener('cancel', onCancel);
-      closeDlg(d);
+      // 手机上传交回来的那一次不关对话框（fix1 Important #1）：这个 dialog 是共用的
+      // `dlg-pick`，上传期间人可能已经在别的行开了新一轮选择，这时候关它等于把
+      // 那一轮当成取消。见 handOffToDevice 的注释。
+      if (!(opts && opts.skipClose)) closeDlg(d);
       resolve(v);
     };
     const onCancel = () => finish(null);
@@ -1671,6 +2541,7 @@ function pickPath(wantKind, title) {
     // 所以这里还要盯一次 close 事件，否则点取消之后这个 Promise 永远悬着，
     // 而调用方 `await` 在那儿不动 —— 界面看起来是「按钮没反应」。
     d.addEventListener('close', onCancel, { once: true });
+    const fromDevice = handOffToDevice(d, onCancel, wantKind, finish);
 
     const go = async (path) => {
       clear(list);
@@ -1696,6 +2567,8 @@ function pickPath(wantKind, title) {
       }
 
       clear(list);
+      // 只在第一层（白名单根列表）给：进了某个目录之后，人要的是那个目录里的东西。
+      if (!body.path) list.appendChild(deviceEntry(wantKind, fromDevice));
       if (!body.entries.length) {
         list.appendChild(el('div', { cls: 'empty' }, [el('p', { text: '这个目录是空的。' })]));
         return;
@@ -1803,12 +2676,15 @@ function renderByVideo(box) {
   }
 }
 
-/** 给一批照片配同一段视频。`photos` 里每项要有 photoId 与 title。 */
+/**
+ * 给一批照片配同一段视频。`photos` 里每项要有 photoId 与 title。
+ * @return 配成了几张（编辑对话框据此决定要不要刷新它自己那块现状）。
+ */
 async function attachVideoTo(photos, btn) {
   const path = await pickPath('video', photos.length === 1
     ? `给「${photos[0].title || photos[0].photoId}」挑视频`
     : `给 ${photos.length} 张照片挑同一段视频`);
-  if (!path) return;
+  if (!path) return 0;
   btn.disabled = true;
   let done = 0;
   const failed = [];
@@ -1832,6 +2708,7 @@ async function attachVideoTo(photos, btn) {
   // 照片页的「有视频/无视频」标记跟着变了，缓存作废。
   state.photos = null;
   state.photoDetail = {};
+  return done;
 }
 
 /** 把这段视频再配给别的照片（视频侧的操作方向）。 */
@@ -1937,18 +2814,20 @@ async function detachVideoFrom(photo, btn) {
     ],
     '解除关联',
   );
-  if (!yes) return;
+  if (!yes) return false;
   btn.disabled = true;
   try {
     await api('DELETE', `/photo/${photo.photoId}/video`);
-    ok('已解除关联。');
-    state.photos = null;
-    state.photoDetail = {};
-    await loadPhotos();
   } catch (e) {
     fail(e, '解除关联失败');
     btn.disabled = false;
+    return false;
   }
+  ok('已解除关联。');
+  state.photos = null;
+  state.photoDetail = {};
+  await loadPhotos();
+  return true;
 }
 
 // ============================== 批量 ==============================
@@ -2560,6 +3439,14 @@ $('add-photo').addEventListener('click', async () => {
  * 而人真正要知道的是「那张照片现在配的是哪段视频」，好接着决定要不要换。
  */
 async function explainIngestFailure(e, refPath, videoPath) {
+  if (e.code === 'near_duplicate') {
+    // 同一个道理的另一半：光说「几乎相同」不够，人要知道**撞的是哪一张**才能决定
+    // 是删那张、还是拿这张去替换那张的参考图（后者在「全部素材」「重复」里有按钮 ——
+    // 这次拒绝已经记下来了，不用再传一遍）。
+    toast('bad', `入库失败：${e.message}撞的是${conflictList(e.detail.conflicts)}。` +
+      '想用这张替换那张的参考图，去「全部素材」或「重复」里点「用它替换…」。', e.code);
+    return;
+  }
   if (e.code !== 'already_ingested') {
     fail(e, '入库失败');
     return;
@@ -2617,33 +3504,37 @@ function pickFromMounts(wantKind, title) {
 
   return new Promise((resolve) => {
     let done = false;
-    const finish = (v) => {
+    const finish = (v, opts) => {
       if (done) return;
       done = true;
       d.removeEventListener('cancel', onCancel);
-      closeDlg(d);
+      // 手机上传交回来的那一次不关对话框（fix1 Important #1，理由同 pickPath）。
+      if (!(opts && opts.skipClose)) closeDlg(d);
       resolve(v);
     };
     const onCancel = () => finish(null);
     d.addEventListener('cancel', onCancel);
     d.addEventListener('close', onCancel, { once: true });
+    const fromDevice = handOffToDevice(d, onCancel, wantKind, finish);
 
-    /** 第一层：挑一个来源。 */
+    /** 第一层：挑一个来源。「从手机/本机」永远排第一个，挂载点读不出来时也在。 */
     const showSources = async () => {
       clear(crumbs);
       clear(list);
-      list.appendChild(el('div', { cls: 'skel' }));
+      list.appendChild(deviceEntry(wantKind, fromDevice));
+      const wait = el('div', { cls: 'skel' });
+      list.appendChild(wait);
       let doc;
       try {
         doc = state.mounts || (state.mounts = await api('GET', '/admin/mounts'));
       } catch (e) {
-        clear(list);
+        wait.remove();
         list.appendChild(el('div', { cls: 'failbox' }, [
           el('div', { cls: 'msg' }, [el('span', { text: e.message })]),
         ]));
         return;
       }
-      clear(list);
+      wait.remove();
       const sources = [
         ...(doc.envRoots || []).map((r) => ({ kind: 'root', name: r.name, path: r.path })),
         ...doc.mounts.filter((m) => m.enabled).map((m) => ({ kind: 'mount', mount: m, name: m.name })),
@@ -2806,6 +3697,321 @@ async function fetchFromMount(mount, rel) {
   } finally {
     if (t) t.remove();
   }
+}
+
+// ============================== 从手机 / 本机上传 ==============================
+
+/**
+ * 管理台所有「挑文件」的地方原来都只能浏览服务端上的路径（挂载点、PHOTOAR_ROOTS）。婚礼
+ * 当天刚拍的素材在手机里，而那时人手上只有手机 —— 这一段给每个选择器多一个来源：从手机
+ * 相册 / 这台电脑直接传到服务端的落地目录，拿回服务端路径，接着原来的流程走（入库、配视频、
+ * 换参考图都不用知道文件是从哪来的）。
+ *
+ * 流程与 web-front 的「素材」页（`web-front/public/pages/media.js` 的 `upOne`）一致：
+ * 本地算 sha256 → `upload/check` 判重（内容已在就复用，同名同内容复用，同名不同内容换
+ * 建议名）→ XHR 原始字节上传带进度。
+ */
+
+/**
+ * 把浏览器给的文件名清成服务端肯收的样子。
+ *
+ * ⚠️ **必须与 web-front `public/api.js` 的 `uploadName` 逐条一致**（那边的注释也指着这里）：
+ * 正反斜杠都切、trim、去掉前导点、空了用 `upload.bin`。两边落地的是同一个目录，同一个文件
+ * 从两处传，清出来的名字不一样的话，按名字判重就认不出它们是同一个。
+ *
+ * 为什么要清：服务端 `_upload` 在这条路上是「拒」不是「洗」—— 名字带路径、以点开头、空，
+ * 一律 400（理由见 app.py 的 `_safe_upload_name`）。所以清洗的责任在客户端。
+ */
+function uploadName(raw) {
+  const base = String(raw == null ? '' : raw).split(/[/\\]/).pop().trim().replace(/^\.+/, '');
+  return base || 'upload.bin';
+}
+
+/**
+ * 服务端按**扩展名**认图片/视频（`fsbrowser.IMAGE_EXT` / `VIDEO_EXT`），这里是同一份清单，
+ * 改那边要改这边。认不出的文件传上去也没用：它不会出现在任何列表上，白占一块盘。
+ */
+const DEVICE_EXT = {
+  image: ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif', '.tif', '.tiff'],
+  video: ['.mp4', '.mov', '.m4v', '.mkv', '.avi', '.webm', '.3gp', '.mts', '.m2ts'],
+};
+
+function kindOfName(name) {
+  const m = /\.[^.]+$/.exec(name);
+  const ext = m ? m[0].toLowerCase() : '';
+  if (DEVICE_EXT.image.includes(ext)) return 'image';
+  if (DEVICE_EXT.video.includes(ext)) return 'video';
+  return null;
+}
+
+// 比这大的文件不在浏览器里算哈希：`crypto.subtle.digest` 没有流式接口，得把整个文件读进
+// 内存，手机上几百 MB 的视频会让浏览器直接把页面杀掉。那种文件只按名字判重（服务端落地
+// 时同名同内容照样认得出，见 `_upload`）。
+const HASH_MAX_BYTES = 512 * 1024 * 1024;
+
+/**
+ * 本地算 sha256，十六进制小写。算不了返回 null，调用方跳过按内容判重直接传。
+ *
+ * `crypto.subtle` 只在安全上下文（https / localhost）里有 —— 家里局域网直接用 http 打开
+ * 管理台时它是 undefined。不先判一下的话，整个上传会挂在一句和「你在用 http」看不出
+ * 任何关系的 TypeError 上（web-front 那边踩过同一个坑）。
+ */
+async function sha256Hex(file) {
+  if (!window.crypto || !window.crypto.subtle || file.size > HASH_MAX_BYTES) return null;
+  const d = await window.crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const mbText = (n) => nf1(n / 1048576);
+
+// 上一次还没结束的系统文件选择。新的一次开始时把它当「取消」结掉：不然它挂在 input 上的
+// change 监听还在，下一次选中文件时两个流程一起往下走，同一个文件传两遍。
+let devicePickPending = null;
+
+/**
+ * 弹系统的文件选择框，等人选完。返回 File 数组；取消返回 null。
+ *
+ * **必须在点击的那一刻同步调用**（中间不能先 await 别的）：浏览器只在「用户刚点过」的瞬时
+ * 激活里允许弹文件选择框，过了就静默不弹。
+ *
+ * 「取消」怎么知道：支持的浏览器（Chrome 113+ / Safari 16.4+ / Firefox 91+）在 input 上
+ * 发 `cancel`；更老的不发，只能靠「选择框关掉 → 窗口重新拿到焦点 → 等一会儿还是没有
+ * change」来猜。等一会儿是因为安卓上 change 可能比 focus 晚到一点。只在先看到过 blur
+ * 之后才认 focus：不然一个跟选择框无关的 focus 会把正在进行的选择当成取消。
+ *
+ * **这个「等一会儿」的兜底只在不支持 `cancel` 事件的浏览器上才装**（fix1 M1）：支持
+ * `cancel` 的浏览器上，兜底纯粹是多余的猜测，而且猜错的场景恰恰是真实选择——安卓选
+ * 云端 / 大文件时 `change` 可能比焦点回来晚超过 1 秒，兜底会先把它当成取消，
+ * `finish(null)` 之后用户选的文件就静默丢了。`cancel` 事件本身已经足够可靠，装了这层
+ * 猜测只有坏处没有好处。
+ */
+function pickDeviceFiles(wantKind, multiple) {
+  const input = $('phone-file');
+  if (devicePickPending) devicePickPending(null);
+  input.accept = wantKind === 'video' ? 'video/*'
+    : (wantKind === 'image' ? 'image/*' : 'image/*,video/*');
+  input.multiple = Boolean(multiple);
+  // 清空：同一个文件连着选两次时 value 没变，浏览器不发 change。
+  input.value = '';
+  // 有模态对话框开着时（比如编辑对话框里点「换参考图」），对话框外面的整页都是 inert 的。
+  // Chrome 实测 inert 的 input 照样弹选择框（2026-09 无头 Chrome 验过），但手机 Safari 等
+  // 没验证过 —— 挪进最上面那个开着的对话框里，不 inert 就没有这个问题。它是 hidden 的，
+  // 放在哪儿都不占版面，挪一下没有代价。
+  const host = Array.from(document.querySelectorAll('dialog[open]')).pop() || document.body;
+  if (input.parentNode !== host) host.appendChild(input);
+
+  let finish = null;
+  const picked = new Promise((resolve) => {
+    let blurred = false;
+    let timer = 0;
+    const onChange = () => finish(input.files && input.files.length ? Array.from(input.files) : null);
+    const onCancel = () => finish(null);
+    const onBlur = () => { blurred = true; };
+    const onFocus = () => {
+      if (!blurred) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (!input.files || !input.files.length) finish(null);
+      }, 1000);
+    };
+    finish = (files) => {
+      if (devicePickPending !== finish) return;
+      devicePickPending = null;
+      clearTimeout(timer);
+      input.removeEventListener('change', onChange);
+      input.removeEventListener('cancel', onCancel);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('focus', onFocus);
+      // File 对象已经拿在手里了，清掉 input 不影响它们。
+      input.value = '';
+      resolve(files);
+    };
+    devicePickPending = finish;
+    input.addEventListener('change', onChange);
+    input.addEventListener('cancel', onCancel);
+    // 只在不支持 cancel 事件时才装这对 blur/focus 兜底，理由见上面的函数注释（fix1 M1）。
+    if (!('oncancel' in input)) {
+      window.addEventListener('blur', onBlur);
+      window.addEventListener('focus', onFocus);
+    }
+  });
+  input.click();
+  return picked;
+}
+
+/**
+ * 从手机相册 / 这台电脑挑文件传到服务端的落地目录。
+ *
+ * @param wantKind `'image'` / `'video'` / `'any'`。决定选择框的 `accept`（手机上
+ *   `image/*` 直接打开相册），也决定挑错类型的文件被拦下来。
+ * @param opts `{multiple}`：只有「全部素材」那个「从手机上传素材…」是多选。
+ * @return 服务端路径数组（按选择的顺序，没传成的不在里面）；取消返回 null。
+ */
+async function uploadFromDevice(wantKind, opts) {
+  // 第一句就是弹选择框 —— 前面不许有 await（理由见 pickDeviceFiles）。
+  const files = await pickDeviceFiles(wantKind, opts && opts.multiple);
+  if (!files) return null;
+  const out = [];
+  for (let i = 0; i < files.length; i++) {
+    const tag = files.length > 1 ? `（${i + 1}/${files.length}）` : '';
+    const path = await uploadDeviceFile(files[i], wantKind, tag);
+    if (path) out.push(path);
+  }
+  return out;
+}
+
+/** 传一个文件，返回服务端路径；没传成返回 null（原因已经用提示条说了）。 */
+async function uploadDeviceFile(file, wantKind, tag) {
+  const clean = uploadName(file.name);
+  const kind = kindOfName(clean);
+  if (!kind) {
+    toast('bad', `「${file.name}」没传：服务端按扩展名认图片和视频，认不出这个文件。`);
+    return null;
+  }
+  if (wantKind !== 'any' && kind !== wantKind) {
+    toast('bad', `「${file.name}」没传：这里要挑${KIND_TEXT[wantKind]}，它是${KIND_TEXT[kind]}。`);
+    return null;
+  }
+  // 一个不自动消失的进度条：大视频要传几十秒，4 秒就消失的「正在上传」会让人以为传完了。
+  const t = toast('ok', `正在检查「${file.name}」是不是已经传过…${tag}`, null, true);
+  const say = (s) => {
+    const span = t.querySelector('.body > span');
+    if (span) span.textContent = s;
+  };
+  try {
+    let sha = null;
+    try { sha = await sha256Hex(file); } catch (e) { sha = null; /* 算不了就只按名字判重 */ }
+
+    let name = clean;
+    const check = async (n) => {
+      try {
+        return await api('POST', '/upload/check', { name: n, sha256: sha || undefined, bytes: file.size });
+      } catch (e) {
+        if (e.status === 401) throw e;
+        // 判重没做成不该挡住上传，但**必须说出来**：web-front 那边这里曾经是个空 catch，
+        // 结果接口签名对不上这件事被它整个吞掉，判重从来没工作过而界面上一切正常。
+        toast('bad', `判重没做成（${e.message}），直接传「${file.name}」。`, e.code);
+        return null;
+      }
+    };
+    let known = await check(name);
+
+    // 内容已经在服务端了（名字可能完全不同 —— 相册第二次导出同一张照片就是这样），先看这条。
+    // `missing` 的不能复用：库里有记录但文件没了，拿它去入库会在特征提取那一步失败。
+    const hit = known && (known.matches || []).find((m) => m.path && !m.missing);
+    if (hit) {
+      ok(`「${file.name}」服务端已经有了（${hit.path}），没再传。`);
+      return hit.path;
+    }
+    // 同名：同内容 → 直接用那个文件；不同内容 → 换服务端给的建议名。不换的话服务端要先把
+    // 整个文件收下来、落临时文件比完哈希才 409，几十 MB 白传。建议名本身也可能已经被占了
+    // （`a-2.jpg` 也在），所以按建议名再问一次，最多问 5 轮。
+    for (let i = 0; known && known.nameTaken && i < 5; i++) {
+      if (known.sameContent && known.existingPath) {
+        ok(`「${file.name}」已经在落地目录里了，没再传。`);
+        return known.existingPath;
+      }
+      if (!known.suggestedName) break;
+      name = known.suggestedName;
+      known = await check(name);
+    }
+    if (name !== clean) toast('ok', `落地目录里已有同名但内容不同的文件，「${file.name}」改名传成 ${name}。`);
+
+    say(`上传 ${name}${tag}…`);
+    const r = await xhrUpload(file, name, (loaded, total) => {
+      say(`上传 ${name}${tag} ${mbText(loaded)}/${mbText(total)} MB`);
+    });
+    if (r && r.reused) ok(`「${file.name}」服务端已经有一份一模一样的，直接用了那份。`);
+    return (r && r.path) || null;
+  } catch (e) {
+    if (e.status !== 401) fail(e, `「${file.name}」没传成`);
+    return null;
+  } finally {
+    t.remove();
+  }
+}
+
+/**
+ * 原始字节 POST 到 `/v1/upload?name=`，带上传进度。
+ *
+ * 用 XHR 而不是 fetch 的理由与 web-front `api.upload` 一样：**fetch 没有上传进度**，而
+ * 几十 MB 的视频没有进度条等于卡死。请求体是文件本身、不是 multipart —— 服务端 `_upload`
+ * 是 `stream_to(dst)` 原样落盘，发 FormData 落下来的会是一个夹着 multipart 边界的坏文件。
+ *
+ * 失败抛 ApiError，message 用服务端那句原文（413 `upload_via_tunnel` 会说清楚是隧道的
+ * 上限、该怎么绕）；隧道自己回的 413 不是 JSON，就把响应原文的开头照实给出来。
+ */
+function xhrUpload(file, name, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API}/upload?name=${encodeURIComponent(name)}`);
+    // 凭证仍然只靠会话 cookie（见文件头）。同源本来就会带，写明是为了哪天管理台换了源也
+    // 不会悄悄变成「上传一律 401」。
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      let doc = null;
+      try { doc = JSON.parse(xhr.responseText); } catch (e) { /* 不是 JSON，下面照原文报 */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(doc);
+        return;
+      }
+      if (xhr.status === 401 && state.me) sessionLost();
+      const raw = String(xhr.responseText || '').trim().slice(0, 200);
+      reject(new ApiError(
+        xhr.status,
+        (doc && doc.error) || `http_${xhr.status}`,
+        (doc && doc.message) || (raw ? `HTTP ${xhr.status}：${raw}` : `HTTP ${xhr.status}`),
+        doc || {},
+      ));
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'network',
+      '上传中断：网络断了，或者请求体超过了通道的上限（经 Cloudflare 访问时单个文件 95MB）。'));
+    xhr.send(file);
+  });
+}
+
+/** 选择器第一层最前面那一项。`fpick dir` 的样子：它是一个「来源」，和挂载点并列。 */
+function deviceEntry(wantKind, onClick) {
+  const b = el('button', {
+    cls: 'fpick dir', type: 'button',
+    title: '手机上会打开相册；电脑上是普通的选文件。传到服务端的落地目录。',
+  }, [
+    el('span', { cls: 'ic', text: '📱' }),
+    el('span', { cls: 'nm', text: '从手机/本机选一个文件上传' }),
+    el('span', { cls: 'sz', text: KIND_TEXT[wantKind] || '图片或视频' }),
+  ]);
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+/**
+ * 选择器（`pickPath` / `pickFromMounts`）里点了「从手机/本机」：先关掉选择器、再弹系统的
+ * 文件选择，传完把服务端路径交给选择器自己的 `finish`。
+ *
+ * 先关再弹：两个叠着的话，手机上从相册回来时还停在一个已经没用的选择器上，桌面上模态
+ * dialog 也会挡住焦点。关之前先摘掉选择器的 close/cancel 监听 —— 否则「关它」这一下
+ * 会被当成用户点了取消，Promise 先 resolve(null)，调用方以为什么都没挑。
+ *
+ * **上传完成后调用 `finish` 时不再关对话框**（fix1 Important #1）：`d` 是共用的
+ * `dlg-pick`，上传可能要几十秒，这期间人完全可能在另一行又开了一轮新的选择（同一个
+ * `d`）。如果 `finish` 还是无条件 `closeDlg(d)`，上传一结束就会把那一轮新选择的对话框
+ * 关掉，并被它自己的 `close` 监听当成取消 —— A 传完，B 的选择却被吞了。这里的对话框
+ * 已经在上面一行同步关过了，`finish` 那一次不需要、也不应该再关一次。
+ */
+function handOffToDevice(d, onCancel, wantKind, finish) {
+  return () => {
+    d.removeEventListener('cancel', onCancel);
+    d.removeEventListener('close', onCancel);
+    closeDlg(d);
+    // uploadFromDevice 的第一步就是同步弹选择框，还在这次点击的瞬时激活里。
+    uploadFromDevice(wantKind)
+      .then((paths) => finish((paths && paths[0]) || null, { skipClose: true }))
+      .catch(() => finish(null, { skipClose: true }));
+  };
 }
 
 // ============================== 起飞 ==============================

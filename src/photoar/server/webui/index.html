@@ -205,18 +205,22 @@
       <div class="head">
         <div>
           <h2>媒体</h2>
-          <p class="note">库里有什么、各自配了哪段视频。入库走 App 与批量导入。</p>
+          <p class="note">库里有什么、各自配了哪段视频、传上来的素材与重复。素材可以从 NAS 选，也可以从手机/电脑直接传。</p>
         </div>
         <div class="right">
           <button class="btn sm" type="button" data-reload="photos">刷新</button>
           <button class="btn sm primary" type="button" id="add-photo">添加照片</button>
         </div>
       </div>
-      <!-- 方向切换。两个视图不是「详细/简略」，而是两个不同的问题：
-           按照片 = 「这张配了吗」，按视频 = 「这段视频影响谁」。 -->
+      <!-- 视图切换。四个视图不是「详细/简略」，而是四个不同的问题：
+           按照片 = 「这张配了吗」，按视频 = 「这段视频影响谁」，
+           全部素材 = 「服务端上这个文件是谁、谁在用、能不能删」，
+           重复 = 「哪些东西是多余的、会互相拖累识别」。 -->
       <div class="segbar" role="group" aria-label="看的方向">
         <button class="btn sm" type="button" data-mapdir="photo" aria-pressed="true">按照片</button>
         <button class="btn sm" type="button" data-mapdir="video" aria-pressed="false">按视频</button>
+        <button class="btn sm" type="button" data-mapdir="files" aria-pressed="false">全部素材</button>
+        <button class="btn sm" type="button" data-mapdir="dups" aria-pressed="false">重复</button>
       </div>
       <div id="photos-body"></div>
     </section>
@@ -400,6 +404,71 @@
     </div>
   </div>
 </dialog>
+
+<!-- ---------- 编辑一张照片的映射 ---------- -->
+<!-- 上半截是「改了点保存才生效」的三个字段（标题 / 打印宽度 / 贴合模式，走
+     PATCH /v1/photo/<id>，只发改过的）；下半截那排按钮是**点了立刻生效**的动作
+     （换参考图、换视频、解除、删除），与表格那一行上的按钮是同一套函数。
+     两类分开摆，是因为「我点了换视频，但没点保存，到底换了没有」是一个不该有的问题。 -->
+<dialog id="dlg-edit" aria-labelledby="dlg-edit-title">
+  <!-- novalidate：自定义宽度的校验全部交给 app.js 自己做（editWidthMm）。原生校验会连
+       hidden 的 #e-width-mm 一起校验，而隐藏的控件浏览器又聚不了焦去报错 —— 结果是
+       选了「自定义…」填错、再切回预设时，点保存悄无声息地没反应（fix1 M2）。 -->
+  <form id="dlg-edit-form" novalidate>
+    <h3 id="dlg-edit-title">编辑照片</h3>
+    <p class="lead" id="dlg-edit-lead"></p>
+
+    <div class="formerr" id="dlg-edit-err" role="alert" hidden></div>
+
+    <div class="field">
+      <label for="e-title">标题</label>
+      <input id="e-title" type="text" maxlength="200" spellcheck="false">
+      <span class="help">留空 = 不要标题（列表上显示「无标题」）。</span>
+    </div>
+
+    <div class="field">
+      <label for="e-width">打印宽度</label>
+      <select id="e-width"></select>
+      <!-- step 0.1：app.js 按 0.1 mm 存取（6 寸 = 152.4 mm）。写成 step=1 的话，一张存着
+           152.4 的照片回填进来之后，浏览器的原生校验会把整个表单的「保存」都拦下。 -->
+      <input id="e-width-mm" type="number" min="0.1" max="5000" step="0.1" inputmode="decimal"
+             aria-label="自定义打印宽度（毫米）" placeholder="毫米，比如 180" hidden>
+      <span class="help">照片印出来的<b>横向</b>宽度。填了扫的时候一认出来就能贴上；不知道就选「不知道」。</span>
+      <span class="err" id="e-width-err"></span>
+    </div>
+
+    <div class="field">
+      <label for="e-fit">贴合模式</label>
+      <select id="e-fit">
+        <option value="default">跟随默认（配置页的 video.fit_mode）</option>
+        <option value="fill">裁切填满 fill</option>
+        <option value="fit">完整留边 fit</option>
+      </select>
+      <span class="help" id="e-fit-help"></span>
+    </div>
+
+    <div class="field">
+      <span class="lbl">参考图与视频（点了立刻生效，不用点保存）</span>
+      <div class="selfnote editbox" id="e-info"></div>
+      <div class="editacts">
+        <button class="btn sm" type="button" id="e-ref">换参考图</button>
+        <button class="btn sm" type="button" id="e-video">换视频</button>
+        <button class="btn sm danger" type="button" id="e-detach">解除视频</button>
+        <button class="btn sm danger" type="button" id="e-delete">删除照片</button>
+      </div>
+    </div>
+
+    <div class="foot">
+      <button class="btn" type="button" data-close>取消</button>
+      <button class="btn primary" type="submit" id="e-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 从手机相册 / 电脑选文件。藏起来、由 app.js 的 uploadFromDevice 点它：
+     每个「挑文件」的入口按要的类型临时改 accept（手机上 image/* 直接弹相册）。
+     一个共用的 input 而不是每处一个：同一时刻只会有一个系统文件选择框。 -->
+<input type="file" id="phone-file" hidden>
 
 <!-- ---------- 危险操作二次确认 ---------- -->
 <dialog id="dlg-confirm" aria-labelledby="dlg-confirm-title">
