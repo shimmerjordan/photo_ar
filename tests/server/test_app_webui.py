@@ -104,6 +104,16 @@ def test_媒体页的四个视图_编辑对话框与手机上传入口都在发�
         assert f'data-mapdir="{mapdir}"' in home, f"少了「{mapdir}」视图按钮"
     assert 'id="dlg-edit"' in home, "少了编辑照片对话框"
     assert 'id="phone-file"' in home, "少了从手机/本机选文件的 input"
+    # 「添加照片」的两个入口必须并排摆在页头：本机那个藏在 NAS 浏览器第一项里时，
+    # 用户点「添加照片」先看到一串 NAS 目录，以为只能从 NAS 选（真实反馈过）。
+    assert 'id="add-photo-device"' in home, "少了「从手机/电脑添加照片」入口"
+    assert 'id="add-photo"' in home, "少了「从 NAS 添加照片」入口"
+
+
+def test_管理台顶栏有回扫描页的入口(env):
+    """管理台是从网页版「管理」页新开出来的，没有这个入口就只能手改地址栏回去。"""
+    home = html_of(env, env.get("/admin", auth=False))
+    assert 'id="to-scan"' in home and 'href="/#/scan"' in home
 
 
 # ---------------------------------------------------------------- 不能变成兜底

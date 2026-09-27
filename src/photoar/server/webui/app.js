@@ -1667,6 +1667,11 @@ function renderInbox(box) {
     const use = el('button', { cls: 'btn sm primary', type: 'button',
       text: f.kind === 'image' ? '入库' : '配给照片…' });
     use.addEventListener('click', () => useInboxFile(f, use));
+    // 删除走「全部素材」那一套（同一个确认框、同一个接口）。这一段原来只有「入库 / 配给」，
+    // 而它是「按照片」这个**默认视图**里唯一能看到未入库文件的地方 —— 删除只做在
+    // 「全部素材」里，人在这里找不到它，就以为未入库的删不掉。
+    const del = el('button', { cls: 'btn sm danger', type: 'button', text: '删除' });
+    del.addEventListener('click', () => deleteInboxFile(f, del));
     return el('tr', {}, [
       td('文件', [
         el('span', { text: f.name }),
@@ -1675,7 +1680,7 @@ function renderInbox(box) {
       td('类型', el('span', { cls: 'tag', text: f.kind === 'image' ? '图片' : '视频' })),
       td('大小', el('span', { cls: 'mono', text: bytesText(f.bytes) }), 'num'),
       td('上传时间', el('span', { text: fmtTime(f.mtime) })),
-      td('操作', el('span', { cls: 'acts' }, [use])),
+      td('操作', el('span', { cls: 'acts' }, [use, del])),
     ]);
   });
 
@@ -2088,7 +2093,7 @@ function renderFiles(box) {
   if (!items.length) {
     // emptyBox 会先清空容器，所以给它一个自己的 div，别把上面的筛选条一起清掉。
     emptyBox(list, f.empty, f.key === 'all'
-      ? '点右上角「从手机上传素材…」传几个，或者用「添加照片」从 NAS 上挑。' : null);
+      ? '点右上角「从手机上传素材…」传几个，或者用页头的「从手机/电脑添加照片」「从 NAS 添加照片」。' : null);
     return;
   }
   list.appendChild(table([{ sr: '缩略图' }, '文件', '类型', '大小', '被谁用', '操作'], items.map((it) =>
@@ -2223,6 +2228,38 @@ function deleteMediaBtn(it, label, force) {
 
 function mediaByPath(path) {
   return (state.media && state.media.items.find((i) => i.path === path)) || null;
+}
+
+/**
+ * 从「按照片」视图底下那一段删一个未入库文件。
+ *
+ * 先确保手上有素材总表（`/admin/media`）：默认视图从不取它，而 inbox 接口不带「同内容还有
+ * 几份」「上次入库被拒」这两样 —— 不补的话确认框会少说「同样内容还有 N 份在」「失败记录
+ * 一起清掉」，而那恰恰是删之前最该知道的（「全部素材」里删同一个文件是说全的）。
+ * 取不到（网络 / 权限）就按 inbox 的定义删：它仍然是落地目录里没人用的文件，删法不变。
+ */
+async function deleteInboxFile(f, btn) {
+  btn.disabled = true;
+  try {
+    if (!mediaByPath(f.path)) await loadMedia();
+  } finally {
+    btn.disabled = false;
+  }
+  await deleteMedia(inboxAsMediaItem(f), btn, false);
+}
+
+/**
+ * inbox 的一行 → `deleteMedia` 要的那种素材行。
+ *
+ * 「全部素材」取过了就用那一份（它带着同内容重复、上次入库被拒的原因，确认框能说得更全）；
+ * 没取过就按 inbox 的定义补齐：落地目录里、没有任何照片在用 —— 所以能删盘、没人要解绑。
+ */
+function inboxAsMediaItem(f) {
+  return mediaByPath(f.path) || {
+    path: f.path, name: f.name, kind: f.kind, bytes: f.bytes, mtime: f.mtime,
+    assetId: f.assetId || null, status: 'unused', inUploadDir: true, deletable: true,
+    exists: true, generated: false, usedAsRef: [], usedAsVideo: [], duplicateOf: [], reject: null,
+  };
 }
 
 /**
@@ -3411,7 +3448,27 @@ function askPrintSize() {
 $('add-photo').addEventListener('click', async () => {
   const ref = await pickFromMounts('image', '挑一张照片');
   if (!ref) return;
-  const video = await pickFromMounts('video', '挑配它的那段视频（可以取消跳过）');
+  await addPhotoWithRef(ref);
+});
+
+/**
+ * 「从手机/电脑添加照片」：直接弹系统的文件选择框（手机上就是相册），传到落地目录，
+ * 然后走与「从 NAS 添加」完全相同的后半程（挑视频 → 打印尺寸 → 入库）。
+ *
+ * **第一句就必须是弹选择框**，前面不能有 await：浏览器只在用户点击的那一下里允许
+ * `input.click()`（见 pickDeviceFiles）。挑视频那一步的选择器第一项同样是「从手机/本机」，
+ * 所以照片和视频都能从手机来。
+ */
+$('add-photo-device').addEventListener('click', async () => {
+  const paths = await uploadFromDevice('image');
+  const ref = paths && paths[0];
+  if (!ref) return;
+  await addPhotoWithRef(ref);
+});
+
+/** 两个「添加照片」入口共用的后半程：挑视频（可跳过）→ 打印尺寸 → 入库。 */
+async function addPhotoWithRef(ref) {
+  const video = await pickFromMounts('video', '挑配它的那段视频（第一项可以从手机/电脑选；取消 = 跳过）');
   const widthMm = await askPrintSize();
   if (widthMm === null) return;   // 取消 = 整个动作取消
   const body = { refPath: ref };
@@ -3430,7 +3487,7 @@ $('add-photo').addEventListener('click', async () => {
   state.mapping = null;
   state.photos = null;
   await loadPhotos();
-});
+}
 
 /**
  * 入库失败时，把「这个文件在库里已经是什么」查出来说清楚。

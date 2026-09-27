@@ -117,6 +117,9 @@
       <div class="who">
         <span class="tag ok" id="me-role"></span>
         <span class="name" id="me-name"></span>
+        <!-- 回到网页版的扫描页。同源（web-front 反代着 /admin），所以同一条会话、不用再登。
+             只在合并容器里有意义：PHOTOAR_WEB=0 那种只起后端的部署里 / 是 404。 -->
+        <a class="btn sm" id="to-scan" href="/#/scan">回扫描页</a>
         <button class="btn sm" id="logout" type="button">登出</button>
       </div>
     </div>
@@ -209,7 +212,10 @@
         </div>
         <div class="right">
           <button class="btn sm" type="button" data-reload="photos">刷新</button>
-          <button class="btn sm primary" type="button" id="add-photo">添加照片</button>
+          <!-- 两个入口并排，而不是把「本机」藏在 NAS 浏览器的第一项里：那样点「添加照片」
+               先看到的是一串 NAS 目录，人会以为只能从 NAS 选。 -->
+          <button class="btn sm primary" type="button" id="add-photo-device">从手机/电脑添加照片</button>
+          <button class="btn sm" type="button" id="add-photo">从 NAS 添加照片</button>
         </div>
       </div>
       <!-- 视图切换。四个视图不是「详细/简略」，而是四个不同的问题：
